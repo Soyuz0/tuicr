@@ -302,6 +302,7 @@ pub fn format_remote_thread_lines(
     theme: &Theme,
     thread: &crate::forge::remote_comments::RemoteReviewThread,
     muted: bool,
+    forge_name: &str,
 ) -> Vec<Line<'static>> {
     let (badge_fg, border_fg, body_fg) = if muted {
         (theme.fg_dim, theme.fg_dim, theme.fg_dim)
@@ -318,7 +319,12 @@ pub fn format_remote_thread_lines(
     let border_style = Style::default().fg(border_fg);
     let body_style = Style::default().fg(body_fg);
 
-    let line_info = match thread.line.map(LineRange::single) {
+    let line_info = match thread.line.map(|end| {
+        thread.start_line.map_or_else(
+            || LineRange::single(end),
+            |start| LineRange::new(start, end),
+        )
+    }) {
         Some(range) if range.is_single() => format!("L{} ", range.start),
         Some(range) => format!("L{}-L{} ", range.start, range.end),
         None => String::new(),
@@ -332,7 +338,7 @@ pub fn format_remote_thread_lines(
     while let Some(comment) = iter.next() {
         let author = comment.author.as_deref().unwrap_or("unknown");
         if is_first {
-            let mut badge_text = format!("[github @{author}");
+            let mut badge_text = format!("[{} @{author}", forge_name.to_ascii_lowercase());
             if thread.is_resolved {
                 badge_text.push_str(" resolved");
             } else if thread.is_outdated {
@@ -378,6 +384,7 @@ pub fn format_remote_thread_lines(
 pub fn format_remote_review_summary_lines(
     theme: &Theme,
     summary: &crate::forge::remote_comments::RemoteReviewSummary,
+    forge_name: &str,
 ) -> Vec<Line<'static>> {
     let badge_fg = theme.diff_hunk_header;
     let border_fg = theme.diff_hunk_header;
@@ -388,7 +395,7 @@ pub fn format_remote_review_summary_lines(
     let body_style = Style::default().fg(body_fg);
 
     let author = summary.author.as_deref().unwrap_or("unknown");
-    let mut badge_text = format!("[github @{author}");
+    let mut badge_text = format!("[{} @{author}", forge_name.to_ascii_lowercase());
     if let Some(state_label) = summary.state.badge_label() {
         badge_text.push(' ');
         badge_text.push_str(state_label);

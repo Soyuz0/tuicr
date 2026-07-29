@@ -1836,6 +1836,7 @@ Match host github-work
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: body.to_string(),
             comment_id: format!("cid-{line}"),
         }

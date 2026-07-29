@@ -1,6 +1,6 @@
 # tuicr
 
-**A code review TUI with vim keybindings. Export to GitHub, GitLab, or clipboard.**
+**A code review TUI with vim keybindings. Export to GitHub, GitLab, Azure DevOps, or clipboard.**
 
 [![Crates.io](https://img.shields.io/crates/v/tuicr)](https://crates.io/crates/tuicr)
 [![License](https://img.shields.io/crates/l/tuicr)](./LICENSE)
@@ -16,10 +16,10 @@
 - GitHub-style continuous diff in the terminal. Scroll through every changed file in one stream.
 - PR-style comments at the line, range, file, and review level. 
 - Review tracking at file or hunk granularity, persisted across sessions.
-- Three export targets: push a real review to GitHub or GitLab, copy structured markdown to your
+- Push real reviews to GitHub, GitLab, or Azure DevOps, copy structured markdown to your
   clipboard, or pipe to stdout.
-- Works with git, jj, and mercurial. Reviews uncommitted changes, commit ranges, or any GitHub PR
-  or GitLab MR.
+- Works with git, jj, and mercurial. Reviews uncommitted changes, commit ranges, GitHub PRs,
+  GitLab MRs, or Azure Repos PRs.
 
 ## Install
 
@@ -80,6 +80,8 @@ tuicr pr 125                # GitHub PR
 tuicr mr 125                # GitLab MR
 tuicr tui pr 125            # GitHub PR via explicit TUI subcommand
 tuicr tui mr 125            # GitLab MR via explicit TUI subcommand
+tuicr ado 125               # Azure DevOps PR from an Azure Repos checkout
+tuicr tui ado 125           # Azure PR via explicit TUI subcommand
 tuicr --stdout              # Pipe the review to stdout
 tuicr review list           # List saved local review sessions
 tuicr update                # Update the active installation
@@ -87,7 +89,7 @@ tuicr update 0.18.0         # Install a known-good version
 ```
 
 Inside tuicr, navigate with `j`/`k`, press `c` to comment, then `y` to copy the review or
-`:submit` to push it to GitHub or GitLab. When opening a GitHub PR or GitLab MR you've reviewed
+`:submit` to push it to GitHub, GitLab, or Azure DevOps. When opening a GitHub PR or GitLab MR you've reviewed
 before, tuicr preselects commits newer than your latest submitted review when that metadata is
 available; commits already covered by that review are marked with `✓` in the inline selector.
 Auto-detects git, jj, or mercurial.
@@ -101,6 +103,7 @@ Auto-detects git, jj, or mercurial.
 | Vim keybindings | ✅ | ❌ | partial¹ | ❌ | ❌ |
 | Push inline review to GitHub | ✅ | ❌ | ❌ | partial² | ❌ |
 | Push inline review to GitLab | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Push inline review to Azure DevOps | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Agent-ready markdown export | ✅ | via CLI skill | ❌ | ❌ | ❌ |
 | git | ✅ | ✅ | ✅ | ❌ | ✅ |
 | jj | ✅ | ✅ | ✅ | ❌ | ❌ |
@@ -129,6 +132,15 @@ Requires `gh` authenticated to the repo.
 discussion notes. Review-level comments become the summary. Requires `glab` authenticated to the
 host. Request changes needs your account to be an assigned reviewer. Only Draft is GitHub-only
 here. See [docs/GITLAB.md](docs/GITLAB.md) for setup, self-hosted instances, and troubleshooting.
+
+### To Azure DevOps
+
+Install Azure CLI and its `azure-devops` extension, then authenticate with `az login` or
+`az devops login`. `:submit` offers Comment, Approve, and Request changes; Request changes maps to
+Azure's `wait-for-author` vote and Draft is hidden. Azure submission uses separate thread and vote
+calls, so confirmed successes are locked individually when a later call fails. See
+[docs/AZURE_DEVOPS.md](docs/AZURE_DEVOPS.md) for setup, remote formats, permissions, exact commands,
+retry behavior, testing, and known limitations.
 
 ### To your coding agent
 
@@ -251,7 +263,7 @@ A first-session cheatsheet. Press `?` inside tuicr for the full reference.
 | `R` | Toggle hunk reviewed |
 | `y` | Copy review to clipboard |
 | `:edit` | Open focused file in `$EDITOR` |
-| `:submit` | Push review to GitHub or GitLab |
+| `:submit` | Push review to GitHub, GitLab, or Azure DevOps |
 | `Tab` in `:` prompt | Complete or cycle commands |
 | `?` | Toggle full help |
 

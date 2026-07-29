@@ -47,8 +47,8 @@ src/
 │   └── jj/              # Jujutsu backend (always compiled)
 │       └── mod.rs       # JjBackend: uses jj CLI, parses with diff_parser::GitStyle
 │
-├── forge/               # Remote forge integration (GitHub PR and GitLab MR review)
-│   ├── mod.rs           # Detect and parse GitHub/GitLab remotes
+├── forge/               # Remote forge integration (GitHub, GitLab, Azure DevOps)
+│   ├── mod.rs           # Detect and parse supported forge remotes
 │   ├── traits.rs        # ForgeBackend trait, ForgeRepository, PullRequestTarget,
 │   │                    # PullRequestDetails, PrSessionKey, CreateReviewRequest,
 │   │                    # GhCreateReviewResponse, ForgeFileLinesRequest
@@ -65,10 +65,16 @@ src/
 │   │   ├── review_threads.rs # GraphQL query for existing review threads
 │   │   ├── review_metadata.rs # GraphQL review commit metadata for since-last-review scoping
 │   │   └── submit.rs    # build_review_payload, create_review wiring
-│   └── gitlab/          # GitLab backend via `glab` CLI
-│       ├── mod.rs       # GitLabGlabBackend export
-│       ├── glab.rs      # ForgeBackend impl and glab command runner
-│       └── models.rs    # GitLab API response models
+│   ├── gitlab/          # GitLab backend via `glab` CLI
+│   │   ├── mod.rs       # GitLabGlabBackend export
+│   │   ├── glab.rs      # ForgeBackend impl and glab command runner
+│   │   └── models.rs    # GitLab API response models
+│   └── azure_devops/    # Azure Repos backend via `az` + azure-devops extension
+│       ├── mod.rs       # AzureDevOpsBackend: ForgeBackend implementation
+│       ├── az.rs        # Injectable az runner + actionable errors
+│       ├── models.rs    # Azure CLI/REST models and thread conversion
+│       ├── remote.rs    # Azure remote and full PR URL parsing
+│       └── submit.rs    # Non-atomic thread creation and vote-last submission
 │
 ├── model/
 │   ├── mod.rs
@@ -176,7 +182,7 @@ Repository-managed agent integrations:
 
 ## Forge integration
 
-Forge review (`tuicr pr <target>`, `tuicr mr <target>`, or their explicit `tuicr tui` forms) is the only feature in `src/forge/`. GitHub operations shell out to `gh`; GitLab operations shell out to `glab`.
+Forge review (`tuicr pr <target>`, `tuicr mr <target>`, `tuicr ado <target>`, or their explicit `tuicr tui` forms) is the only feature in `src/forge/`. GitHub operations shell out to `gh`, GitLab to `glab`, and Azure DevOps to `az` with the `azure-devops` extension.
 
 ### ForgeBackend trait
 
@@ -192,6 +198,7 @@ Forge review (`tuicr pr <target>`, `tuicr mr <target>`, or their explicit `tuicr
 - `list_review_threads` — existing forge comments + resolved/outdated state.
 - `fetch_file_lines` — remote context expansion in the diff view.
 - `create_review` — POST a review with inline comments via `CreateReviewRequest`.
+- `create_review_detailed` — provider-aware result for non-atomic submission; Azure reports per-comment success and vote failure so retry submits only remaining drafts.
 
 ### Async pattern
 
@@ -252,6 +259,12 @@ These are non-obvious things the implementation chain hit. Worth preserving for 
 12. **`cd` into the worktree before running `cargo`.** `cargo` resolves `Cargo.toml` from `pwd`. Running gates from the wrong worktree silently exercises the wrong tree.
 
 13. **Comments are commit-scoped via `Comment::commit_id`.** When the inline commit selector shows exactly one commit, `App::save_comment` stamps that commit's SHA on the comment. Comments with `commit_id = Some(sha)` are hidden when a different commit (or a subset not containing `sha`) is selected; `commit_id = None` (legacy, review-level, or made against the full cumulative diff) is always visible. The filter runs in `rebuild_annotations`, both diff renderers, the comment navigator (via filtered annotations), and the submit preflight. `App::comment_visible(&Comment)` is the single predicate. `AnnotatedLine::LineComment`/`FileComment` `comment_idx` is the **absolute** index into the stored `Vec`/`HashMap` value — `delete_comment_at_cursor` and `enter_edit_mode` must look it up directly, not re-count by side.
+
+14. **Azure resource names come from `az devops invoke` discovery.** Match the documented Git route template, then pass the discovered `resourceName`; do not hard-code guessed resource GUIDs or names.
+
+15. **Azure submission is not atomic.** Post the summary and independent threads first, stop at the first failed thread, and apply `approve` or `wait-for-author` last. Lock only confirmed local IDs. Azure Draft is unsupported and hidden.
+
+16. **Azure diff loading is immutable but checkout-backed.** Exact source/target objects are read locally; missing objects use `git fetch --no-tags --no-write-fetch-head` without checkout/ref changes. Documented iteration changes do not provide a safe universal unified-patch fallback.
 
 ### Keeping Docs Updated
 

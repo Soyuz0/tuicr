@@ -136,7 +136,7 @@ In command mode,
 | `:submit comment` | Submit a Comment review |
 | `:submit approve` | Submit an Approve review |
 | `:submit request-changes` | Submit a Request-changes review |
-| `:submit draft` | Submit a Draft review (pending on GitHub) |
+| `:submit draft` | Submit a Draft review (hidden when unsupported, including Azure DevOps) |
 | `:set wrap` | Enable line wrap in diff view |
 | `:set wrap!` | Toggle line wrap in diff view |
 | `:set commits` | Show inline commit selector |
@@ -154,8 +154,8 @@ In command mode,
 | `?` | Toggle help |
 | `q` | Quick quit |
 
-`draft` applies to GitHub only. `comment`, `approve`, and `request-changes` work on both GitHub and
-GitLab MRs.
+`comment`, `approve`, and `request-changes` work on GitHub, GitLab, and Azure DevOps. Azure maps
+request changes to `wait-for-author`; Draft is unavailable and hidden for Azure PRs.
 
 ## Commit selection / review target selector
 
@@ -172,7 +172,7 @@ GitLab MRs.
 ## Inline commit selector
 
 Shown at the top of the diff when reviewing multiple commits. Focus it with `<leader>k` or `Tab`.
-When opening a GitHub PR or GitLab MR you have reviewed before, tuicr may preselect only commits
+When opening a forge PR/MR you have reviewed before, tuicr may preselect only commits
 newer than your latest submitted review; commits already covered by that review are marked with
 `✓`. Use `Space` / `Enter` here to expand or adjust the range.
 

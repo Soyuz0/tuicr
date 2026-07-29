@@ -66,6 +66,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "[ISSUE] boom".to_string(),
             comment_id: "test-comment-id".to_string(),
         }
@@ -118,6 +119,7 @@ mod tests {
             start_line: Some(15),
             start_side: Some(GhSide::Left),
             old_path: None,
+            file_level: false,
             body: "ranged".to_string(),
             comment_id: "test-comment-id".to_string(),
         };
@@ -145,6 +147,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: String::new(),
             comment_id: "test-comment-id".to_string(),
         };

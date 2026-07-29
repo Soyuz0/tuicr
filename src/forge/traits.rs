@@ -12,14 +12,26 @@ use crate::model::{DiffLine, FileStatus};
 pub enum ForgeKind {
     GitHub,
     GitLab,
+    AzureDevOps,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AzureDevOpsRepositoryIdentity {
+    pub organization: String,
+    pub organization_url: String,
+    pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgeRepository {
     pub kind: ForgeKind,
     pub host: String,
     pub owner: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_devops: Option<AzureDevOpsRepositoryIdentity>,
 }
 
 impl ForgeRepository {
@@ -33,6 +45,7 @@ impl ForgeRepository {
             host: host.into(),
             owner: owner.into(),
             name: name.into(),
+            azure_devops: None,
         }
     }
 
@@ -46,6 +59,60 @@ impl ForgeRepository {
             host: host.into(),
             owner: owner.into(),
             name: name.into(),
+            azure_devops: None,
+        }
+    }
+
+    pub fn azure_devops(
+        host: impl Into<String>,
+        organization: impl Into<String>,
+        organization_url: impl Into<String>,
+        project: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        let organization = organization.into();
+        let project = project.into();
+        Self {
+            kind: ForgeKind::AzureDevOps,
+            host: host.into(),
+            owner: format!("{organization}/{project}"),
+            name: name.into(),
+            azure_devops: Some(AzureDevOpsRepositoryIdentity {
+                organization,
+                organization_url: organization_url.into(),
+                project,
+                repository_id: None,
+            }),
+        }
+    }
+
+    pub fn azure_devops_identity(&self) -> Option<&AzureDevOpsRepositoryIdentity> {
+        self.azure_devops.as_ref()
+    }
+
+    pub fn with_repository_id(mut self, repository_id: impl Into<String>) -> Self {
+        if let Some(identity) = self.azure_devops.as_mut() {
+            identity.repository_id = Some(repository_id.into());
+        }
+        self
+    }
+
+    /// Compare stable repository coordinates while ignoring provider-side IDs
+    /// that may not have been resolved yet when a local remote was parsed.
+    pub fn same_repository(&self, other: &Self) -> bool {
+        if self.kind != other.kind || !self.name.eq_ignore_ascii_case(&other.name) {
+            return false;
+        }
+        match (self.azure_devops.as_ref(), other.azure_devops.as_ref()) {
+            (Some(left), Some(right)) => {
+                left.organization.eq_ignore_ascii_case(&right.organization)
+                    && left.project.eq_ignore_ascii_case(&right.project)
+            }
+            (None, None) => {
+                self.host.eq_ignore_ascii_case(&other.host)
+                    && self.owner.eq_ignore_ascii_case(&other.owner)
+            }
+            _ => false,
         }
     }
 
@@ -54,6 +121,14 @@ impl ForgeRepository {
     }
 
     pub fn display_name(&self) -> String {
+        if self.kind == ForgeKind::AzureDevOps
+            && let Some(identity) = &self.azure_devops
+        {
+            return format!(
+                "{}/{}/{}",
+                identity.organization, identity.project, self.name
+            );
+        }
         if self.host == "github.com" || self.host == "gitlab.com" {
             self.slug()
         } else {
@@ -62,11 +137,26 @@ impl ForgeRepository {
     }
 }
 
+impl PartialEq for ForgeRepository {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_repository(other)
+    }
+}
+
+impl Eq for ForgeRepository {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestTarget {
     pub repository: Option<ForgeRepository>,
     pub number: u64,
     pub original: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PullRequestTargetKind {
+    #[default]
+    Auto,
+    AzureDevOps,
 }
 
 impl PullRequestTarget {
@@ -324,6 +414,39 @@ pub struct GhCreateReviewResponse {
     pub state: String,
 }
 
+/// A comment confirmed as posted by a backend whose review submission spans
+/// multiple remote calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedReviewComment {
+    pub local_comment_id: String,
+    pub remote_thread_id: String,
+    pub remote_comment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSubmissionFailure {
+    pub local_comment_id: Option<String>,
+    pub operation: String,
+    pub message: String,
+}
+
+/// Detailed result for non-atomic forge submissions. Successfully posted
+/// comments are reported even when later comments or the final vote fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialReviewSubmission {
+    pub posted_comments: Vec<PostedReviewComment>,
+    pub summary_posted: bool,
+    pub vote_applied: bool,
+    pub failures: Vec<ReviewSubmissionFailure>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewSubmissionOutcome {
+    Atomic(GhCreateReviewResponse),
+    NonAtomic(PartialReviewSubmission),
+}
+
 /// Request to create a review against a PR. The payload is the forge-agnostic
 /// shape of the JSON body the backend will POST; downstream the GitHub
 /// backend reshapes it via `build_review_payload` and writes it on stdin.
@@ -433,6 +556,22 @@ pub trait ForgeBackend {
         pr: &PullRequestDetails,
         request: CreateReviewRequest<'_>,
     ) -> Result<GhCreateReviewResponse>;
+
+    /// Detailed submission hook for providers that create comments and votes
+    /// through separate remote operations. Existing atomic backends inherit
+    /// the compatibility wrapper.
+    fn create_review_detailed(
+        &self,
+        pr: &PullRequestDetails,
+        request: CreateReviewRequest<'_>,
+    ) -> Result<ReviewSubmissionOutcome> {
+        self.create_review(pr, request)
+            .map(ReviewSubmissionOutcome::Atomic)
+    }
+
+    fn supports_submit_event(&self, _event: SubmitEvent) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -476,6 +615,37 @@ mod tests {
         );
         // when/then
         assert_eq!(key.short_head(), "abc");
+    }
+
+    #[test]
+    fn azure_repository_identity_ignores_resolution_id_and_remote_host_form() {
+        let unresolved = ForgeRepository::azure_devops(
+            "dev.azure.com",
+            "org",
+            "https://dev.azure.com/org",
+            "project",
+            "repo",
+        );
+        let resolved = ForgeRepository::azure_devops(
+            "org.visualstudio.com",
+            "org",
+            "https://org.visualstudio.com",
+            "project",
+            "repo",
+        )
+        .with_repository_id("repo-guid");
+        assert_eq!(unresolved, resolved);
+    }
+
+    #[test]
+    fn legacy_repository_json_without_azure_identity_still_deserializes() {
+        let json = r#"{"kind":"git_hub","host":"github.com","owner":"owner","name":"repo"}"#;
+        let repository: ForgeRepository = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            repository,
+            ForgeRepository::github("github.com", "owner", "repo")
+        );
+        assert!(repository.azure_devops.is_none());
     }
 
     #[test]

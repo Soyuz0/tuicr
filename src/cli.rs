@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
+use crate::forge::traits::PullRequestTargetKind;
 use crate::theme::{AppearanceArg, ThemeArg};
 
 /// CLI arguments consumed by the rest of the binary.
@@ -30,6 +31,8 @@ pub struct CliArgs {
     pub all_files: bool,
     /// Direct PR target from `tuicr pr <target>`.
     pub pr_target: Option<String>,
+    /// Whether a direct target uses existing auto-detection or explicit ADO.
+    pub pr_target_kind: PullRequestTargetKind,
     /// Override the GitHub repo used for PR operations.
     pub repo_url: Option<String>,
     /// Non-interactive review session operation.
@@ -44,7 +47,7 @@ pub struct CliArgs {
 #[command(
     name = "tuicr",
     version,
-    about = "A code review TUI with vim keybindings. Export to GitHub or clipboard.",
+    about = "A code review TUI with vim keybindings. Submit to supported forges or export locally.",
     after_help = "Press ? in the application for keybinding help.",
     disable_help_subcommand = true
 )]
@@ -140,6 +143,8 @@ enum Subcmd {
     /// Review a GitHub pull request or GitLab merge request.
     #[command(visible_alias = "mr")]
     Pr(PrCommand),
+    /// Review an Azure DevOps pull request.
+    Ado(PrCommand),
     /// Inspect or update persisted review sessions.
     Review {
         #[command(subcommand)]
@@ -169,11 +174,13 @@ enum TuiSubcmd {
     /// Review a GitHub pull request or GitLab merge request in the TUI.
     #[command(visible_alias = "mr")]
     Pr(PrCommand),
+    /// Review an Azure DevOps pull request in the TUI.
+    Ado(PrCommand),
 }
 
 #[derive(Args, Debug, Clone, Default)]
 struct PrCommand {
-    /// PR target: <number>, <owner/repo#N>, or a PR URL.
+    /// PR target: a positive number, forge coordinate, or provider PR/MR URL.
     target: String,
 
     #[command(flatten)]
@@ -275,37 +282,75 @@ pub enum LineSideArg {
 
 impl From<Cli> for CliArgs {
     fn from(cli: Cli) -> Self {
-        let (options, pr_target, review_command, update_version, update_command) = match cli.command
-        {
-            Some(Subcmd::Tui(command)) => match command.command {
-                Some(TuiSubcmd::Pr(pr)) => (
-                    cli.tui_options.merge(command.options).merge(pr.options),
+        let (options, pr_target, pr_target_kind, review_command, update_version, update_command) =
+            match cli.command {
+                Some(Subcmd::Tui(command)) => match command.command {
+                    Some(TuiSubcmd::Pr(pr)) => (
+                        cli.tui_options.merge(command.options).merge(pr.options),
+                        Some(pr.target),
+                        PullRequestTargetKind::Auto,
+                        None,
+                        None,
+                        false,
+                    ),
+                    Some(TuiSubcmd::Ado(pr)) => (
+                        cli.tui_options.merge(command.options).merge(pr.options),
+                        Some(pr.target),
+                        PullRequestTargetKind::AzureDevOps,
+                        None,
+                        None,
+                        false,
+                    ),
+                    None => (
+                        cli.tui_options.merge(command.options),
+                        None,
+                        PullRequestTargetKind::Auto,
+                        None,
+                        None,
+                        false,
+                    ),
+                },
+                Some(Subcmd::Pr(pr)) => (
+                    cli.tui_options.merge(pr.options),
                     Some(pr.target),
+                    PullRequestTargetKind::Auto,
                     None,
                     None,
                     false,
+                ),
+                Some(Subcmd::Ado(pr)) => (
+                    cli.tui_options.merge(pr.options),
+                    Some(pr.target),
+                    PullRequestTargetKind::AzureDevOps,
+                    None,
+                    None,
+                    false,
+                ),
+                Some(Subcmd::Review { command }) => (
+                    TuiOptions::default(),
+                    None,
+                    PullRequestTargetKind::Auto,
+                    Some(command),
+                    None,
+                    false,
+                ),
+                Some(Subcmd::Update { version }) => (
+                    TuiOptions::default(),
+                    None,
+                    PullRequestTargetKind::Auto,
+                    None,
+                    version,
+                    true,
                 ),
                 None => (
-                    cli.tui_options.merge(command.options),
+                    cli.tui_options,
                     None,
+                    PullRequestTargetKind::Auto,
                     None,
                     None,
                     false,
                 ),
-            },
-            Some(Subcmd::Pr(pr)) => (
-                cli.tui_options.merge(pr.options),
-                Some(pr.target),
-                None,
-                None,
-                false,
-            ),
-            Some(Subcmd::Review { command }) => {
-                (TuiOptions::default(), None, Some(command), None, false)
-            }
-            Some(Subcmd::Update { version }) => (TuiOptions::default(), None, None, version, true),
-            None => (cli.tui_options, None, None, None, false),
-        };
+            };
         Self {
             theme: options.theme,
             appearance: options.appearance,
@@ -317,6 +362,7 @@ impl From<Cli> for CliArgs {
             file_path: options.file_path,
             all_files: options.all_files,
             pr_target,
+            pr_target_kind,
             repo_url: options.repo_url,
             review_command,
             update_command,
@@ -357,6 +403,12 @@ impl TuiOptions {
 
 impl Cli {
     fn try_into_args(self) -> std::result::Result<CliArgs, clap::Error> {
+        if self.ado_uses_repo_url() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "`--repo-url` is GitHub-only and cannot be used with `tuicr ado`; pass a full Azure DevOps PR URL or run from the Azure Repos checkout",
+            ));
+        }
         match (
             self.tui_options.has_any_explicit_value(),
             self.non_tui_command_name(),
@@ -376,6 +428,20 @@ impl Cli {
             Some(Subcmd::Review { .. }) => Some("review"),
             Some(Subcmd::Update { .. }) => Some("update"),
             _ => None,
+        }
+    }
+
+    fn ado_uses_repo_url(&self) -> bool {
+        let root = self.tui_options.repo_url.is_some();
+        match &self.command {
+            Some(Subcmd::Ado(command)) => root || command.options.repo_url.is_some(),
+            Some(Subcmd::Tui(command)) => match &command.command {
+                Some(TuiSubcmd::Ado(ado)) => {
+                    root || command.options.repo_url.is_some() || ado.options.repo_url.is_some()
+                }
+                _ => false,
+            },
+            _ => false,
         }
     }
 }
@@ -734,6 +800,44 @@ mod tests {
     fn should_parse_tui_mr_alias_like_pr() {
         let parsed = parse_for_test(&["tuicr", "tui", "mr", "125"]).expect("parse should succeed");
         assert_eq!(parsed.pr_target, Some("125".to_string()));
+    }
+
+    #[test]
+    fn should_parse_explicit_azure_devops_target() {
+        let parsed = parse_for_test(&["tuicr", "ado", "125"]).expect("parse should succeed");
+        assert_eq!(parsed.pr_target, Some("125".to_string()));
+        assert_eq!(parsed.pr_target_kind, PullRequestTargetKind::AzureDevOps);
+    }
+
+    #[test]
+    fn should_parse_nested_explicit_azure_devops_target() {
+        let target = "https://dev.azure.com/org/project/_git/repo/pullrequest/125";
+        let parsed =
+            parse_for_test(&["tuicr", "tui", "ado", target]).expect("parse should succeed");
+        assert_eq!(parsed.pr_target.as_deref(), Some(target));
+        assert_eq!(parsed.pr_target_kind, PullRequestTargetKind::AzureDevOps);
+    }
+
+    #[test]
+    fn should_keep_pr_and_mr_on_auto_target_detection() {
+        for command in ["pr", "mr"] {
+            let parsed = parse_for_test(&["tuicr", command, "125"]).unwrap();
+            assert_eq!(parsed.pr_target_kind, PullRequestTargetKind::Auto);
+        }
+    }
+
+    #[test]
+    fn should_reject_github_repo_override_for_azure_command() {
+        let error = parse_for_test(&[
+            "tuicr",
+            "ado",
+            "125",
+            "--repo-url",
+            "https://github.com/owner/repo",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        assert!(error.to_string().contains("GitHub-only"));
     }
 
     #[test]

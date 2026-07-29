@@ -96,6 +96,9 @@ pub struct InlineComment {
     /// positions need both `old_path` and `new_path`; GitHub uses only
     /// `path`.
     pub old_path: Option<PathBuf>,
+    /// True when the source comment targets the whole file rather than the
+    /// mapper-selected fallback line.
+    pub file_level: bool,
     pub body: String,
     /// Source `Comment.id` this inline was derived from. Used after a
     /// successful submit to flip the comment's lifecycle state. INTERNAL —
@@ -227,6 +230,7 @@ pub fn map_comment(
                     start_line: None,
                     start_side: None,
                     old_path,
+                    file_level: true,
                     body: build_inline_body(comment, true, config),
                     comment_id: comment.id.clone(),
                 })
@@ -259,6 +263,7 @@ pub fn map_comment(
                 start_line: None,
                 start_side: None,
                 old_path,
+                file_level: false,
                 body: build_inline_body(comment, false, config),
                 comment_id: comment.id.clone(),
             }),
@@ -352,6 +357,7 @@ fn map_range(
             start_line: None,
             start_side: None,
             old_path,
+            file_level: false,
             body: build_inline_body(comment, false, config),
             comment_id: comment.id.clone(),
         });
@@ -365,6 +371,7 @@ fn map_range(
         start_line: Some(range.start),
         start_side: Some(side.into()),
         old_path,
+        file_level: false,
         body: build_inline_body(comment, false, config),
         comment_id: comment.id.clone(),
     })

@@ -1,0 +1,12 @@
+{
+  "id": 70,
+  "status": "active",
+  "comments": [
+    {
+      "id": 1,
+      "parentCommentId": 0,
+      "content": "Fixture comment",
+      "commentType": "text"
+    }
+  ]
+}

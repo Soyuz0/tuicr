@@ -1,0 +1,14 @@
+{
+  "count": 1,
+  "value": [
+    {
+      "commitId": "1111111111111111111111111111111111111111",
+      "comment": "Fixture commit\n\nBody",
+      "author": {
+        "name": "Fixture Author",
+        "email": "fixture@example.invalid",
+        "date": "2026-01-01T00:00:00Z"
+      }
+    }
+  ]
+}

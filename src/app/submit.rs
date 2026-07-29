@@ -30,6 +30,18 @@ impl App {
             self.set_warning(":submit only applies in PR mode");
             return;
         };
+        if self
+            .forge_backend
+            .as_deref()
+            .is_some_and(|backend| !backend.supports_submit_event(event))
+        {
+            self.set_warning(format!(
+                "{} does not support {} submissions",
+                self.forge_display_name(),
+                event.human_label()
+            ));
+            return;
+        }
         if pr.is_read_only() {
             let reason = pr.read_only_reason().unwrap_or("read only");
             self.set_warning(format!("Cannot submit: PR is {reason}"));
@@ -112,8 +124,15 @@ impl App {
         // bare "LGTM" approval. Every other event needs at least one local
         // draft comment or a review-level comment, otherwise there's
         // nothing to submit.
-        let bare_allowed = matches!(event, crate::forge::submit::SubmitEvent::Approve);
-        if !bare_allowed && total_local_drafts == 0 && self.session.review_comments.is_empty() {
+        let bare_allowed = matches!(event, crate::forge::submit::SubmitEvent::Approve)
+            || (pr.key.repository.kind == crate::forge::traits::ForgeKind::AzureDevOps
+                && event == crate::forge::submit::SubmitEvent::RequestChanges);
+        let has_review_drafts = self
+            .session
+            .review_comments
+            .iter()
+            .any(|comment| !comment.is_locked());
+        if !bare_allowed && total_local_drafts == 0 && !has_review_drafts {
             self.set_warning("Nothing to submit — no local-draft comments");
             return;
         }
@@ -153,9 +172,23 @@ impl App {
         self.input_mode = InputMode::SubmitActionPicker;
     }
 
+    pub fn supported_submit_picker_events(
+        &self,
+    ) -> Vec<(&'static str, crate::forge::submit::SubmitEvent)> {
+        SUBMIT_PICKER_EVENTS
+            .iter()
+            .copied()
+            .filter(|(_, event)| {
+                self.forge_backend
+                    .as_deref()
+                    .is_none_or(|backend| backend.supports_submit_event(*event))
+            })
+            .collect()
+    }
+
     /// Move the action-picker cursor down by one row, wrapping at the end.
     pub fn submit_picker_cursor_down(&mut self) {
-        let total = SUBMIT_PICKER_EVENTS.len();
+        let total = self.supported_submit_picker_events().len();
         if total > 0 {
             self.submit_picker_cursor = (self.submit_picker_cursor + 1) % total;
         }
@@ -163,7 +196,7 @@ impl App {
 
     /// Move the action-picker cursor up by one row, wrapping at the start.
     pub fn submit_picker_cursor_up(&mut self) {
-        let total = SUBMIT_PICKER_EVENTS.len();
+        let total = self.supported_submit_picker_events().len();
         if total > 0 {
             self.submit_picker_cursor = (self.submit_picker_cursor + total - 1) % total;
         }
@@ -172,10 +205,8 @@ impl App {
     /// Confirm the action picker selection: dispatch into preflight with the
     /// chosen event and `skip_confirm = true`.
     pub fn submit_picker_confirm(&mut self) {
-        let Some(event) = SUBMIT_PICKER_EVENTS
-            .get(self.submit_picker_cursor)
-            .map(|(_, ev)| *ev)
-        else {
+        let events = self.supported_submit_picker_events();
+        let Some(event) = events.get(self.submit_picker_cursor).map(|(_, ev)| *ev) else {
             self.cancel_submit_action_picker();
             return;
         };
@@ -305,17 +336,16 @@ impl App {
             .collect();
         let summary_comment_ids: Vec<String> =
             summary_items.iter().map(|i| i.comment.id.clone()).collect();
-        let review_comment_ids: Vec<String> = self
+        let review_comments = self
             .session
             .review_comments
             .iter()
-            .map(|c| c.id.clone())
-            .collect();
-        let body = build_review_body(
-            &self.session.review_comments,
-            &summary_items,
-            &self.forge_config,
-        );
+            .filter(|comment| !comment.is_locked())
+            .cloned()
+            .collect::<Vec<_>>();
+        let review_comment_ids: Vec<String> =
+            review_comments.iter().map(|c| c.id.clone()).collect();
+        let body = build_review_body(&review_comments, &summary_items, &self.forge_config);
 
         // Save the session BEFORE the network call — keeps the user's
         // local-draft work durable if anything goes sideways below.
@@ -328,6 +358,7 @@ impl App {
             review_comment_ids,
             moved_to_summary_count: summary_items.len(),
             head_sha_snapshot: state.commit_id.clone(),
+            pr_head_sha_snapshot: pr.key.head_sha.clone(),
             repository: pr.key.repository.clone(),
             pr_number: pr.key.number,
             started_at: Instant::now(),
@@ -345,7 +376,8 @@ impl App {
 
         let repository = in_flight.repository.clone();
         let pr_number = in_flight.pr_number;
-        let head_sha = in_flight.head_sha_snapshot.clone();
+        let head_sha = in_flight.pr_head_sha_snapshot.clone();
+        let reviewed_pr_head = in_flight.pr_head_sha_snapshot.clone();
         let event = in_flight.event;
         let mappable = in_flight.mappable.clone();
         let commit_id = state.commit_id.clone();
@@ -360,8 +392,12 @@ impl App {
                 pr_number.to_string(),
             );
             let result = match backend.get_pull_request(target) {
+                Ok(details) if details.head_sha != reviewed_pr_head => Err(format!(
+                    "Pull request advanced from `{reviewed_pr_head}` to `{}`; reload before submitting",
+                    details.head_sha
+                )),
                 Ok(details) => backend
-                    .create_review(
+                    .create_review_detailed(
                         &details,
                         CreateReviewRequest {
                             event,
@@ -408,9 +444,17 @@ impl App {
         let Some(in_flight) = in_flight else {
             return;
         };
+        let active_matches = matches!(
+            &self.diff_source,
+            DiffSource::PullRequest(active)
+                if active.key.repository == repository
+                    && active.key.number == pr_number
+                    && active.key.head_sha == head_sha
+        );
         let stale = in_flight.repository != repository
             || in_flight.pr_number != pr_number
-            || in_flight.head_sha_snapshot != head_sha;
+            || in_flight.pr_head_sha_snapshot != head_sha
+            || !active_matches;
         if stale {
             self.set_message("Discarded stale submit result (PR was reloaded)".to_string());
             return;
@@ -426,6 +470,7 @@ impl App {
             DiffSource::PullRequest(pr) => match pr.key.repository.kind {
                 crate::forge::traits::ForgeKind::GitHub => "GitHub",
                 crate::forge::traits::ForgeKind::GitLab => "GitLab",
+                crate::forge::traits::ForgeKind::AzureDevOps => "Azure DevOps",
             },
             _ => "forge",
         }
@@ -439,11 +484,11 @@ impl App {
     pub fn finish_pr_submit(
         &mut self,
         in_flight: SubmitInFlightState,
-        result: std::result::Result<crate::forge::traits::GhCreateReviewResponse, String>,
+        result: std::result::Result<crate::forge::traits::ReviewSubmissionOutcome, String>,
     ) {
         use crate::forge::submit::SubmitEvent;
 
-        let response = match result {
+        let outcome = match result {
             Ok(r) => r,
             Err(e) => {
                 self.set_error(format!("Submit failed: {e}"));
@@ -451,7 +496,24 @@ impl App {
             }
         };
 
-        self.apply_submit_success(&in_flight, &response);
+        let (response, partial_error, non_atomic) = match outcome {
+            crate::forge::traits::ReviewSubmissionOutcome::Atomic(response) => {
+                self.apply_submit_success(&in_flight, &response);
+                (Some(response), None, None)
+            }
+            crate::forge::traits::ReviewSubmissionOutcome::NonAtomic(partial) => {
+                self.apply_partial_submit_success(&in_flight, &partial);
+                let partial_error = (!partial.failures.is_empty()).then(|| {
+                    partial
+                        .failures
+                        .iter()
+                        .map(|failure| format!("{}: {}", failure.operation, failure.message))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                });
+                (None, partial_error, Some(partial))
+            }
+        };
 
         // Post-submit save — captures the lifecycle transitions.
         let _ = self.save_current_session_merging_external();
@@ -459,28 +521,56 @@ impl App {
         let inline_count = in_flight.mappable.len();
         let summary_count = in_flight.moved_to_summary_count;
         let forge_name = self.forge_display_name();
-        let message = match in_flight.event {
-            SubmitEvent::Draft => {
-                let pr_url = match &self.diff_source {
-                    DiffSource::PullRequest(pr) => pr.url.clone(),
-                    _ => String::new(),
-                };
-                if pr_url.is_empty() {
-                    format!(
-                        "Pushed pending {forge_name} review #{}: {} inline, {} moved to summary",
-                        response.id, inline_count, summary_count,
-                    )
+        if let Some(error) = partial_error {
+            self.set_error(format!(
+                "Submit partially completed: {} comment(s) posted; {error}. Retry submits only remaining local drafts.",
+                self.count_locked_submit_comments(&in_flight)
+            ));
+            self.refetch_pr_threads();
+            return;
+        }
+        let message = if let Some(non_atomic) = non_atomic {
+            let vote = if in_flight.event == SubmitEvent::Comment {
+                "vote unchanged"
+            } else if non_atomic.vote_applied {
+                "vote applied"
+            } else {
+                "no vote applied"
+            };
+            format!(
+                "Submitted {forge_name} review: {} inline thread(s), summary {}, {vote}",
+                non_atomic.posted_comments.len(),
+                if non_atomic.summary_posted {
+                    "posted"
                 } else {
-                    format!(
-                        "Pushed pending {forge_name} review #{}: {} inline, {} moved to summary — Finish it in {forge_name}: {}",
-                        response.id, inline_count, summary_count, pr_url,
-                    )
+                    "empty"
+                },
+            )
+        } else {
+            let response_id = response.as_ref().map_or(0, |response| response.id);
+            match in_flight.event {
+                SubmitEvent::Draft => {
+                    let pr_url = match &self.diff_source {
+                        DiffSource::PullRequest(pr) => pr.url.clone(),
+                        _ => String::new(),
+                    };
+                    if pr_url.is_empty() {
+                        format!(
+                            "Pushed pending {forge_name} review #{}: {} inline, {} moved to summary",
+                            response_id, inline_count, summary_count,
+                        )
+                    } else {
+                        format!(
+                            "Pushed pending {forge_name} review #{}: {} inline, {} moved to summary — Finish it in {forge_name}: {}",
+                            response_id, inline_count, summary_count, pr_url,
+                        )
+                    }
                 }
+                _ => format!(
+                    "Submitted {forge_name} review #{}: {} inline, {} moved to summary",
+                    response_id, inline_count, summary_count,
+                ),
             }
-            _ => format!(
-                "Submitted {forge_name} review #{}: {} inline, {} moved to summary",
-                response.id, inline_count, summary_count,
-            ),
         };
         if in_flight.event != SubmitEvent::Draft {
             self.mark_pr_commits_reviewed_through(&in_flight.head_sha_snapshot);
@@ -544,6 +634,81 @@ impl App {
             }
         }
         self.rebuild_annotations();
+    }
+
+    fn apply_partial_submit_success(
+        &mut self,
+        in_flight: &SubmitInFlightState,
+        partial: &crate::forge::traits::PartialReviewSubmission,
+    ) {
+        use crate::model::comment::CommentLifecycleState;
+
+        let posted = partial
+            .posted_comments
+            .iter()
+            .map(|comment| (comment.local_comment_id.as_str(), comment))
+            .collect::<std::collections::HashMap<_, _>>();
+        let summary_ids = partial.summary_posted.then(|| {
+            in_flight
+                .summary_comment_ids
+                .iter()
+                .chain(in_flight.review_comment_ids.iter())
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>()
+        });
+        let apply = |comment: &mut crate::model::Comment| {
+            if let Some(remote) = posted.get(comment.id.as_str()) {
+                comment.lifecycle_state = CommentLifecycleState::Submitted;
+                comment.remote_review_id = Some(remote.remote_thread_id.clone());
+                comment.remote_comment_id = remote.remote_comment_id.clone();
+            } else if summary_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(comment.id.as_str()))
+            {
+                comment.lifecycle_state = CommentLifecycleState::Submitted;
+            }
+        };
+        for comment in &mut self.session.review_comments {
+            apply(comment);
+        }
+        for review in self.session.files.values_mut() {
+            for comment in &mut review.file_comments {
+                apply(comment);
+            }
+            for comments in review.line_comments.values_mut() {
+                for comment in comments {
+                    apply(comment);
+                }
+            }
+        }
+        self.rebuild_annotations();
+    }
+
+    fn count_locked_submit_comments(&self, in_flight: &SubmitInFlightState) -> usize {
+        let ids = in_flight
+            .mappable
+            .iter()
+            .map(|comment| comment.comment_id.as_str())
+            .chain(in_flight.summary_comment_ids.iter().map(String::as_str))
+            .chain(in_flight.review_comment_ids.iter().map(String::as_str))
+            .collect::<std::collections::HashSet<_>>();
+        self.session
+            .review_comments
+            .iter()
+            .chain(
+                self.session
+                    .files
+                    .values()
+                    .flat_map(|review| review.file_comments.iter()),
+            )
+            .chain(
+                self.session
+                    .files
+                    .values()
+                    .flat_map(|review| review.line_comments.values().flatten()),
+            )
+            .filter(|comment| ids.contains(comment.id.as_str()) && comment.is_locked())
+            .count()
     }
 
     /// Drop locked (`Submitted`/`PushedDraft`) comments from the session.

@@ -805,7 +805,7 @@ impl App {
             let visibility = self.session.remote_comments_visibility;
             if !matches!(visibility, PrCommentsVisibility::Hide) {
                 for thread in &self.forge_review_threads {
-                    if thread.line.is_some() {
+                    if thread.line.is_some() || (!thread.path.is_empty() && !thread.is_outdated) {
                         continue;
                     }
                     if visibility.render_decision(thread).is_none() {
@@ -844,6 +844,21 @@ impl App {
         let mut content_lines = 0;
         let mut comment_lines = 0;
 
+        let path_str = path.to_string_lossy();
+        let visibility = self.session.remote_comments_visibility;
+        comment_lines += self
+            .forge_review_threads
+            .iter()
+            .filter(|thread| {
+                thread.line.is_none()
+                    && !thread.is_outdated
+                    && !thread.path.is_empty()
+                    && thread.path == *path_str
+                    && visibility.render_decision(thread).is_some()
+            })
+            .map(crate::forge::remote_comments::thread_display_lines)
+            .sum::<usize>();
+
         // Pre-aggregate remote-thread rows by (line, side) for this file. Must
         // mirror the filter/anchor logic in build_remote_thread_index — the
         // rebuild_annotations renderer uses the same filter, and the two must
@@ -851,8 +866,6 @@ impl App {
         let remote_thread_rows: HashMap<(u32, LineSide), usize> = {
             use crate::forge::remote_comments::{RemoteCommentSide, thread_display_lines};
             let mut map: HashMap<(u32, LineSide), usize> = HashMap::new();
-            let path_str = path.to_string_lossy();
-            let visibility = self.session.remote_comments_visibility;
             for thread in &self.forge_review_threads {
                 if thread.path != *path_str {
                     continue;

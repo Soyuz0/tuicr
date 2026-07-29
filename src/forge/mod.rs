@@ -5,6 +5,7 @@
 //! instead of shelling out to forge-specific tools directly.
 #![allow(dead_code)]
 
+pub mod azure_devops;
 pub mod canonical;
 pub mod context;
 pub mod github;
@@ -19,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use git2::Repository;
 
+use crate::forge::azure_devops::remote::parse_azure_devops_remote_url;
 use crate::forge::github::gh::parse_github_remote_url;
 use crate::forge::gitlab::glab::parse_gitlab_remote_url;
 use crate::forge::traits::ForgeRepository;
@@ -102,7 +104,9 @@ fn remote_urls(repo_root: &Path) -> Vec<String> {
 /// to GitHub, which accepts any host (covers github.com and GHE hosts whose
 /// hostname does not literally contain "github").
 fn parse_any_remote_url(url: &str) -> Option<ForgeRepository> {
-    parse_gitlab_remote_url(url).or_else(|| parse_github_remote_url(url))
+    parse_azure_devops_remote_url(url)
+        .or_else(|| parse_gitlab_remote_url(url))
+        .or_else(|| parse_github_remote_url(url))
 }
 
 /// Detect the forge repository for the local checkout at `repo_root`.
@@ -118,7 +122,11 @@ pub fn detect_forge_repository(repo_root: &Path) -> Option<ForgeRepository> {
 pub fn local_checkout_for_repo(root: &Path, target_repo: &ForgeRepository) -> Option<PathBuf> {
     remote_urls(root)
         .iter()
-        .any(|url| parse_any_remote_url(url).as_ref() == Some(target_repo))
+        .any(|url| {
+            parse_any_remote_url(url)
+                .as_ref()
+                .is_some_and(|repo| repo.same_repository(target_repo))
+        })
         .then(|| root.to_path_buf())
 }
 
@@ -140,6 +148,19 @@ mod tests {
             detect_forge_repository(dir.path()),
             Some(ForgeRepository::github("github.com", "agavra", "tuicr"))
         );
+    }
+
+    #[test]
+    fn detects_azure_devops_repository_before_github_fallback() {
+        let dir = init_repo_with_origin(
+            "git@ssh.dev.azure.com:v3/neutral-org/neutral-project/neutral-repo",
+        );
+        let detected = detect_forge_repository(dir.path()).unwrap();
+        assert_eq!(detected.kind, crate::forge::traits::ForgeKind::AzureDevOps);
+        let identity = detected.azure_devops_identity().unwrap();
+        assert_eq!(identity.organization, "neutral-org");
+        assert_eq!(identity.project, "neutral-project");
+        assert_eq!(detected.name, "neutral-repo");
     }
 
     #[test]

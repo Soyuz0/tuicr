@@ -112,6 +112,10 @@ pub struct RemoteReviewThread {
     pub path: String,
     /// Anchor line on the chosen side. `None` for fully-outdated threads.
     pub line: Option<u32>,
+    /// First line for a multi-line range. `None` for single-line, file-level,
+    /// review-level, and outdated threads.
+    #[serde(default)]
+    pub start_line: Option<u32>,
     pub side: RemoteCommentSide,
     pub is_resolved: bool,
     pub is_outdated: bool,
@@ -258,6 +262,7 @@ mod tests {
             id: id.to_string(),
             path: path.to_string(),
             line,
+            start_line: None,
             side: RemoteCommentSide::Right,
             is_resolved,
             is_outdated,

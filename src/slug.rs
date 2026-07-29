@@ -8,6 +8,7 @@
 //!
 //! - Local: `[<owner>/]<repo>@<anchor>/<source>`
 //! - PR:    `gh:<owner>/<repo>/pr/<number>`
+//! - Azure: `ado:<organization>/<project>/<repo>/pr/<number>`
 //!
 //! Where `<anchor>` is either a sanitized branch/bookmark name (no `/`) or
 //! `~<short-sha>` for detached / anonymous heads, and `<source>` is one of the
@@ -50,6 +51,7 @@ pub struct LocalSlug {
 pub struct PrSlug {
     pub forge: ForgeKind,
     pub owner: String,
+    pub project: Option<String>,
     pub repo: String,
     pub number: u64,
 }
@@ -110,7 +112,21 @@ impl fmt::Display for PrSlug {
         let kind = match self.forge {
             ForgeKind::GitHub => "gh",
             ForgeKind::GitLab => "gl",
+            ForgeKind::AzureDevOps => "ado",
         };
+        if self.forge == ForgeKind::AzureDevOps {
+            use crate::forge::azure_devops::remote::percent_encode_path_component;
+            let project = self.project.as_deref().unwrap_or_default();
+            return write!(
+                f,
+                "{}:{}/{}/{}/pr/{}",
+                kind,
+                percent_encode_path_component(&self.owner),
+                percent_encode_path_component(project),
+                percent_encode_path_component(&self.repo),
+                self.number,
+            );
+        }
         write!(
             f,
             "{}:{}/{}/pr/{}",
@@ -179,6 +195,7 @@ impl FromStr for Slug {
             let forge = match kind {
                 "gh" => ForgeKind::GitHub,
                 "gl" => ForgeKind::GitLab,
+                "ado" => ForgeKind::AzureDevOps,
                 other => return Err(SlugParseError::UnknownForge(other.to_string())),
             };
             return parse_pr(forge, rest).map(Slug::Pr);
@@ -188,6 +205,28 @@ impl FromStr for Slug {
 }
 
 fn parse_pr(forge: ForgeKind, rest: &str) -> Result<PrSlug, SlugParseError> {
+    if forge == ForgeKind::AzureDevOps {
+        use crate::forge::azure_devops::remote::percent_decode_path_component;
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() != 5 || parts[3] != "pr" {
+            return Err(SlugParseError::InvalidShape(rest.to_string()));
+        }
+        let decode = |value: &str| {
+            percent_decode_path_component(value)
+                .filter(|decoded| !decoded.is_empty())
+                .ok_or_else(|| SlugParseError::InvalidShape(rest.to_string()))
+        };
+        let number = parts[4]
+            .parse()
+            .map_err(|_| SlugParseError::InvalidPrNumber(parts[4].to_string()))?;
+        return Ok(PrSlug {
+            forge,
+            owner: decode(parts[0])?,
+            project: Some(decode(parts[1])?),
+            repo: decode(parts[2])?,
+            number,
+        });
+    }
     let parts: Vec<&str> = rest.split('/').collect();
     if parts.len() != 4 || parts[2] != "pr" || parts[0].is_empty() || parts[1].is_empty() {
         return Err(SlugParseError::InvalidShape(rest.to_string()));
@@ -198,6 +237,7 @@ fn parse_pr(forge: ForgeKind, rest: &str) -> Result<PrSlug, SlugParseError> {
     Ok(PrSlug {
         forge,
         owner: parts[0].to_string(),
+        project: None,
         repo: parts[1].to_string(),
         number,
     })
@@ -317,9 +357,20 @@ pub fn short_sha(sha: &str) -> String {
 
 impl From<&PrSessionKey> for Slug {
     fn from(key: &PrSessionKey) -> Self {
+        let (owner, project) = key
+            .repository
+            .azure_devops_identity()
+            .map(|identity| {
+                (
+                    identity.organization.clone(),
+                    Some(identity.project.clone()),
+                )
+            })
+            .unwrap_or_else(|| (key.repository.owner.clone(), None));
         Slug::Pr(PrSlug {
             forge: key.repository.kind,
-            owner: key.repository.owner.clone(),
+            owner,
+            project,
             repo: key.repository.name.clone(),
             number: key.number,
         })
@@ -349,7 +400,15 @@ impl RepoCoordinate {
                 repo: local.repo.clone(),
             },
             Slug::Pr(pr) => Self {
-                owner: Some(pr.owner.clone()),
+                owner: Some(match pr.project.as_deref() {
+                    Some(project) => {
+                        crate::forge::azure_devops::remote::percent_encode_path_component(&format!(
+                            "{}/{project}",
+                            pr.owner
+                        ))
+                    }
+                    None => pr.owner.clone(),
+                }),
                 repo: pr.repo.clone(),
             },
         }
@@ -358,6 +417,18 @@ impl RepoCoordinate {
     /// The coordinate of a local checkout, from its `origin` remote (falling
     /// back to the directory name with no owner).
     pub fn from_repo_path(repo_path: &Path) -> Option<Self> {
+        if let Some(repository) = crate::forge::detect_forge_repository(repo_path)
+            && repository.kind == ForgeKind::AzureDevOps
+        {
+            return Some(Self {
+                owner: Some(
+                    crate::forge::azure_devops::remote::percent_encode_path_component(
+                        &repository.owner,
+                    ),
+                ),
+                repo: repository.name,
+            });
+        }
         let (owner, repo) = resolve_owner_repo(repo_path).ok()?;
         Some(Self { owner, repo })
     }
@@ -369,6 +440,21 @@ impl RepoCoordinate {
     /// `.git` is stripped.
     pub fn parse(input: &str) -> Option<Self> {
         let trimmed = input.trim();
+        if let Ok(slug @ Slug::Pr(_)) = trimmed.parse::<Slug>() {
+            return Some(Self::from_slug(&slug));
+        }
+        if let Some(repository) =
+            crate::forge::azure_devops::remote::parse_azure_devops_remote_url(trimmed)
+        {
+            return Some(Self {
+                owner: Some(
+                    crate::forge::azure_devops::remote::percent_encode_path_component(
+                        &repository.owner,
+                    ),
+                ),
+                repo: repository.name,
+            });
+        }
         let without_forge = trimmed.strip_prefix("forge:").unwrap_or(trimmed);
         let without_scheme = without_forge
             .split_once("://")
@@ -443,6 +529,13 @@ pub fn resolve_owner_repo(repo_path: &Path) -> Result<(Option<String>, String), 
 fn origin_owner_repo(repo: &Repository) -> Option<(String, String)> {
     let remote = repo.find_remote("origin").ok()?;
     let url = remote.url()?;
+    if let Some(repository) = crate::forge::azure_devops::remote::parse_azure_devops_remote_url(url)
+    {
+        return Some((
+            crate::forge::azure_devops::remote::percent_encode_path_component(&repository.owner),
+            repository.name,
+        ));
+    }
     parse_remote_owner_repo(url)
 }
 
@@ -620,10 +713,32 @@ mod tests {
         let slug = PrSlug {
             forge: ForgeKind::GitHub,
             owner: "agavra".to_string(),
+            project: None,
             repo: "tuicr".to_string(),
             number: 125,
         };
         assert_eq!(slug.to_string(), "gh:agavra/tuicr/pr/125");
+    }
+
+    #[test]
+    fn should_roundtrip_encoded_azure_devops_pr_slug() {
+        let key = PrSessionKey::new(
+            ForgeRepository::azure_devops(
+                "dev.azure.com",
+                "org name",
+                "https://dev.azure.com/org%20name",
+                "project/area",
+                "repo #1",
+            ),
+            125,
+            "abcdef",
+        );
+        let slug = Slug::from(&key);
+        assert_eq!(
+            slug.to_string(),
+            "ado:org%20name/project%2Farea/repo%20%231/pr/125"
+        );
+        assert_eq!(slug.to_string().parse::<Slug>().unwrap(), slug);
     }
 
     // ---------- Round-trip ----------
@@ -651,6 +766,7 @@ mod tests {
     fn should_roundtrip_pr_slug() {
         assert_roundtrip("gh:agavra/tuicr/pr/125");
         assert_roundtrip("gh:org/svc/pr/9999");
+        assert_roundtrip("ado:org/project/repo/pr/125");
     }
 
     // ---------- Parse errors ----------
@@ -994,6 +1110,23 @@ mod tests {
             RepoCoordinate::from_slug(&pr),
             coord(Some("slatedb"), "slatedb")
         );
+    }
+
+    #[test]
+    fn azure_checkout_and_pr_slug_share_repository_coordinate() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = Repository::init(dir.path()).unwrap();
+        repository
+            .remote(
+                "origin",
+                "https://dev.azure.com/neutral-org/neutral-project/_git/neutral-repo",
+            )
+            .unwrap();
+        let checkout = RepoCoordinate::from_repo_path(dir.path()).unwrap();
+        let pr: Slug = "ado:neutral-org/neutral-project/neutral-repo/pr/7"
+            .parse()
+            .unwrap();
+        assert_eq!(checkout, RepoCoordinate::from_slug(&pr));
     }
 
     #[test]

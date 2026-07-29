@@ -623,6 +623,7 @@ fn make_in_flight(
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "x".to_string(),
             comment_id: (*id).to_string(),
         })
@@ -634,6 +635,7 @@ fn make_in_flight(
         review_comment_ids: Vec::new(),
         moved_to_summary_count,
         head_sha_snapshot: head_sha.to_string(),
+        pr_head_sha_snapshot: "abcdef0123".to_string(),
         repository: ForgeRepository::github("github.com", "agavra", "tuicr"),
         pr_number: 125,
         started_at: Instant::now(),
@@ -678,7 +680,12 @@ fn should_mark_reviewed_commits_after_successful_submit() {
     let in_flight = make_in_flight(SubmitEvent::Comment, &[], "deadbeef02", 0);
     let response = make_response(123, "https://example.com/r", "COMMENTED");
 
-    app.finish_pr_submit(in_flight, Ok(response));
+    app.finish_pr_submit(
+        in_flight,
+        Ok(crate::forge::traits::ReviewSubmissionOutcome::Atomic(
+            response,
+        )),
+    );
 
     assert!(!app.is_commit_reviewed_by_viewer(0));
     assert!(app.is_commit_reviewed_by_viewer(1));
@@ -697,7 +704,12 @@ fn should_not_mark_reviewed_commits_after_draft_submit() {
     let in_flight = make_in_flight(SubmitEvent::Draft, &[], "abcdef0123", 0);
     let response = make_response(123, "https://example.com/r", "PENDING");
 
-    app.finish_pr_submit(in_flight, Ok(response));
+    app.finish_pr_submit(
+        in_flight,
+        Ok(crate::forge::traits::ReviewSubmissionOutcome::Atomic(
+            response,
+        )),
+    );
 
     assert!(!app.is_commit_reviewed_by_viewer(0));
     assert!(!app.is_commit_reviewed_by_viewer(1));
@@ -724,6 +736,57 @@ fn should_flip_comments_to_submitted_and_stamp_review_id_on_success() {
     let saved = &review.line_comments.get(&11).unwrap()[0];
     assert_eq!(saved.lifecycle_state, CommentLifecycleState::Submitted);
     assert_eq!(saved.remote_review_id.as_deref(), Some("987654"));
+}
+
+#[test]
+fn should_lock_only_confirmed_comments_after_partial_submit() {
+    let mut app = make_pr_app_with_single_modified_file("src/lib.rs");
+    let first = line_comment(LineSide::New, Some(11), None);
+    let second = line_comment(LineSide::New, Some(12), None);
+    let first_id = first.id.clone();
+    let second_id = second.id.clone();
+    add_line_comment(&mut app, "src/lib.rs", 11, first);
+    add_line_comment(&mut app, "src/lib.rs", 12, second);
+    let in_flight = make_in_flight(
+        SubmitEvent::Comment,
+        &[first_id.as_str(), second_id.as_str()],
+        "abcdef0123",
+        0,
+    );
+    let partial = crate::forge::traits::PartialReviewSubmission {
+        posted_comments: vec![crate::forge::traits::PostedReviewComment {
+            local_comment_id: first_id,
+            remote_thread_id: "thread-1".to_string(),
+            remote_comment_id: Some("comment-1".to_string()),
+        }],
+        summary_posted: false,
+        vote_applied: false,
+        failures: vec![crate::forge::traits::ReviewSubmissionFailure {
+            local_comment_id: Some(second_id),
+            operation: "comment".to_string(),
+            message: "remote failure".to_string(),
+        }],
+        html_url: String::new(),
+    };
+
+    app.finish_pr_submit(
+        in_flight,
+        Ok(crate::forge::traits::ReviewSubmissionOutcome::NonAtomic(
+            partial,
+        )),
+    );
+
+    let review = app.session.files.get(&PathBuf::from("src/lib.rs")).unwrap();
+    let posted = &review.line_comments[&11][0];
+    let remaining = &review.line_comments[&12][0];
+    assert_eq!(posted.lifecycle_state, CommentLifecycleState::Submitted);
+    assert_eq!(posted.remote_review_id.as_deref(), Some("thread-1"));
+    assert_eq!(posted.remote_comment_id.as_deref(), Some("comment-1"));
+    assert_eq!(remaining.lifecycle_state, CommentLifecycleState::LocalDraft);
+    assert!(app.message.as_ref().is_some_and(|message| {
+        message.content.contains("partially completed")
+            && message.content.contains("remaining local drafts")
+    }));
 }
 
 #[test]
@@ -913,7 +976,12 @@ fn should_emit_success_message_with_review_id_and_counts_for_published_submit() 
     );
     let response = make_response(123456, "https://example.com/r", "COMMENTED");
     // when
-    app.finish_pr_submit(in_flight, Ok(response));
+    app.finish_pr_submit(
+        in_flight,
+        Ok(crate::forge::traits::ReviewSubmissionOutcome::Atomic(
+            response,
+        )),
+    );
     // then
     let msg = app.message.as_ref().expect("info message");
     assert_eq!(msg.message_type, MessageType::Info);
@@ -936,7 +1004,12 @@ fn should_emit_draft_message_with_pr_url_for_draft_submit() {
         "PENDING",
     );
     // when
-    app.finish_pr_submit(in_flight, Ok(response));
+    app.finish_pr_submit(
+        in_flight,
+        Ok(crate::forge::traits::ReviewSubmissionOutcome::Atomic(
+            response,
+        )),
+    );
     // then
     let msg = app.message.as_ref().expect("info message");
     assert!(msg.content.contains("Pushed pending GitHub review #999"));
@@ -996,7 +1069,9 @@ fn should_discard_stale_submit_result_when_head_sha_changed() {
         repository: ForgeRepository::github("github.com", "agavra", "tuicr"),
         pr_number: 125,
         head_sha: "DIFFERENT_HEAD".to_string(),
-        result: Ok(make_response(42, "u", "COMMENTED")),
+        result: Ok(crate::forge::traits::ReviewSubmissionOutcome::Atomic(
+            make_response(42, "u", "COMMENTED"),
+        )),
     })
     .unwrap();
     drop(tx);
@@ -1034,7 +1109,9 @@ fn should_apply_result_via_poll_when_head_sha_matches() {
         repository: ForgeRepository::github("github.com", "agavra", "tuicr"),
         pr_number: 125,
         head_sha: "abcdef0123".to_string(),
-        result: Ok(make_response(123, "u", "COMMENTED")),
+        result: Ok(crate::forge::traits::ReviewSubmissionOutcome::Atomic(
+            make_response(123, "u", "COMMENTED"),
+        )),
     })
     .unwrap();
     drop(tx);

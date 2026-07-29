@@ -2449,6 +2449,7 @@ fn sample_thread(line: u32, body: &str, resolved: bool, outdated: bool) -> Remot
         id: "T".to_string(),
         path: "src/lib.rs".to_string(),
         line: Some(line),
+        start_line: None,
         side: RemoteCommentSide::Right,
         is_resolved: resolved,
         is_outdated: outdated,

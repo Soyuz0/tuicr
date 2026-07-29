@@ -9,7 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use crate::app::{App, SUBMIT_PICKER_EVENTS};
+use crate::app::App;
 use crate::forge::submit::{ResolverAction, SubmitEvent, UnmappableItem};
 use crate::ui::styles;
 
@@ -22,7 +22,7 @@ pub fn render_submit_action_picker(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" Submit review to GitHub? ")
+        .title(format!(" Submit review to {}? ", app.forge_display_name()))
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .style(styles::popup_style(theme))
@@ -32,7 +32,7 @@ pub fn render_submit_action_picker(frame: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
-    for (i, (label, _)) in SUBMIT_PICKER_EVENTS.iter().enumerate() {
+    for (i, (label, _)) in app.supported_submit_picker_events().iter().enumerate() {
         let style = if i == app.submit_picker_cursor {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
         } else {
@@ -397,6 +397,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "x".to_string(),
             comment_id: "test-comment-id".to_string(),
         }
@@ -477,6 +478,27 @@ mod tests {
         let text = buffer_text(&buffer);
         assert!(text.contains("> Request changes"));
         assert!(!text.contains("> Comment"));
+    }
+
+    #[test]
+    fn azure_picker_hides_unsupported_draft_action() {
+        let repository = ForgeRepository::azure_devops(
+            "dev.azure.com",
+            "neutral-org",
+            "https://dev.azure.com/neutral-org",
+            "neutral-project",
+            "neutral-repo",
+        );
+        let mut app = make_pr_app_for(repository.clone());
+        app.forge_backend = Some(Box::new(
+            crate::forge::azure_devops::AzureDevOpsBackend::new(Some(repository)),
+        ));
+        let text = buffer_text(&draw_picker(&app));
+        assert!(text.contains("Submit review to Azure DevOps?"));
+        assert!(text.contains("Comment"));
+        assert!(text.contains("Approve"));
+        assert!(text.contains("Request changes"));
+        assert!(!text.contains("Draft"));
     }
 
     #[test]

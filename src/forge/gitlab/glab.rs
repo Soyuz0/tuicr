@@ -1461,6 +1461,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "nice work".to_string(),
             comment_id: "c1".to_string(),
         };
@@ -1522,6 +1523,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "old code".to_string(),
             comment_id: "c2".to_string(),
         };
@@ -1567,6 +1569,7 @@ mod tests {
             start_line: Some(25),
             start_side: Some(GhSide::Right),
             old_path: None,
+            file_level: false,
             body: "range comment".to_string(),
             comment_id: "c-range".to_string(),
         };
@@ -1614,6 +1617,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: Some("src/old_name.rs".into()),
+            file_level: false,
             body: "renamed file comment".to_string(),
             comment_id: "c-rename".to_string(),
         };
@@ -1650,6 +1654,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "context comment".to_string(),
             comment_id: "c3".to_string(),
         };
@@ -1691,6 +1696,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "looks good".to_string(),
             comment_id: "c-approve".to_string(),
         };
@@ -1732,6 +1738,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "please change this".to_string(),
             comment_id: "c-rc".to_string(),
         };
@@ -1810,6 +1817,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "please change this".to_string(),
             comment_id: "c-rc-err".to_string(),
         };
@@ -1875,6 +1883,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "inline draft".to_string(),
             comment_id: "c1".to_string(),
         };
@@ -1955,6 +1964,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "inline draft".to_string(),
             comment_id: "c1".to_string(),
         };
@@ -1996,6 +2006,7 @@ mod tests {
             start_line: None,
             start_side: None,
             old_path: None,
+            file_level: false,
             body: "inline comment".to_string(),
             comment_id: "c1".to_string(),
         };

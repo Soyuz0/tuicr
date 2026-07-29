@@ -37,7 +37,7 @@ pub const UNSTAGED_SELECTION_ID: &str = "__tuicr_unstaged__";
 pub const GAP_EXPAND_BATCH: usize = 20;
 
 /// Create a forge backend for the given repository.
-/// Routes to the GitHub backend (via `gh`) or the GitLab backend (via `glab`)
+/// Routes to the GitHub, GitLab, or Azure DevOps CLI backend
 /// based on `repo.kind`.
 fn create_forge_backend(
     repo: &ForgeRepository,
@@ -52,6 +52,12 @@ fn create_forge_backend(
         ForgeKind::GitLab => {
             use crate::forge::gitlab::GitLabGlabBackend;
             Box::new(GitLabGlabBackend::new(Some(repo.clone())).with_local_checkout(local_checkout))
+        }
+        ForgeKind::AzureDevOps => {
+            use crate::forge::azure_devops::AzureDevOpsBackend;
+            Box::new(
+                AzureDevOpsBackend::new(Some(repo.clone())).with_local_checkout(local_checkout),
+            )
         }
     }
 }
@@ -881,6 +887,9 @@ pub struct SubmitInFlightState {
     /// Head SHA at preflight — used as `commit_id` in the GitHub payload and
     /// to discard stale results if the user reloaded the PR mid-submit.
     pub head_sha_snapshot: String,
+    /// PR head loaded when the review began. This differs from
+    /// `head_sha_snapshot` when a strict commit subset is selected.
+    pub pr_head_sha_snapshot: String,
     /// Repository + PR identity. Lets the stale-result guard verify the
     /// result still applies to the same PR session.
     pub repository: crate::forge::traits::ForgeRepository,
@@ -895,7 +904,7 @@ pub enum PrSubmitEvent {
         repository: crate::forge::traits::ForgeRepository,
         pr_number: u64,
         head_sha: String,
-        result: std::result::Result<crate::forge::traits::GhCreateReviewResponse, String>,
+        result: std::result::Result<crate::forge::traits::ReviewSubmissionOutcome, String>,
     },
 }
 
@@ -1477,6 +1486,7 @@ pub struct AppStartupOptions<'a> {
     /// Direct PR target (`tuicr pr <target>`). Mutually exclusive with the
     /// other selectors above; the binary validates that before reaching here.
     pub pr_target: Option<&'a str>,
+    pub pr_target_kind: crate::forge::traits::PullRequestTargetKind,
     /// `--repo-url` override for PR operations, already parsed into a
     /// `ForgeRepository`. When `Some`, the canonical resolver short-circuits
     /// the `gh api` parent lookup and uses this value directly.

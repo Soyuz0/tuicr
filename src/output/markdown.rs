@@ -443,14 +443,19 @@ fn generate_markdown(
     }
 
     // PR-mode-only: include unresolved remote discussions grouped by file.
-    if matches!(diff_source, DiffSource::PullRequest(_)) {
+    if let DiffSource::PullRequest(pr) = diff_source {
         let unresolved: Vec<&RemoteReviewThread> =
             filter_threads(remote_threads, PrCommentsVisibility::Unresolved);
         if !unresolved.is_empty() {
             if local_section_written {
                 let _ = writeln!(md);
             }
-            let _ = writeln!(md, "## Existing GitHub Comments");
+            let forge = match pr.key.repository.kind {
+                crate::forge::traits::ForgeKind::GitHub => "GitHub",
+                crate::forge::traits::ForgeKind::GitLab => "GitLab",
+                crate::forge::traits::ForgeKind::AzureDevOps => "Azure DevOps",
+            };
+            let _ = writeln!(md, "## Existing {forge} Comments");
             let _ = writeln!(md);
 
             // Group threads by file to make the export easy to scan.
@@ -464,7 +469,11 @@ fn generate_markdown(
                 for thread in threads {
                     if let Some(root) = thread.root() {
                         let author = root.author.as_deref().unwrap_or("unknown");
-                        let line_marker = thread.line.map(|l| format!(":{l}")).unwrap_or_default();
+                        let line_marker = match (thread.start_line, thread.line) {
+                            (Some(start), Some(end)) => format!(":{start}-{end}"),
+                            (None, Some(line)) => format!(":{line}"),
+                            _ => String::new(),
+                        };
                         let _ = writeln!(
                             md,
                             "{thread_n}. `{path}{line_marker}` @{author} - {body}",
@@ -1375,6 +1384,7 @@ mod tests {
             id: id.to_string(),
             path: "src/lib.rs".to_string(),
             line: Some(line),
+            start_line: None,
             side: RemoteCommentSide::Right,
             is_resolved: resolved,
             is_outdated: false,

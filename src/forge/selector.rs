@@ -85,7 +85,7 @@ impl PullRequestsTab {
                 scope: PullRequestListScope::Open,
             },
             None => PullRequestsTab::Disabled {
-                reason: "No GitHub remote on this repo".to_string(),
+                reason: "No supported forge remote on this repo".to_string(),
             },
         }
     }

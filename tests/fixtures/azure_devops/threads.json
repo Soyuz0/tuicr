@@ -1,0 +1,55 @@
+{
+  "count": 5,
+  "value": [
+    {
+      "id": 1,
+      "status": "active",
+      "comments": [
+        {"id": 1, "parentCommentId": 0, "content": "Line comment", "commentType": "text"},
+        {"id": 2, "parentCommentId": 1, "content": "Reply", "commentType": "text"}
+      ],
+      "threadContext": {
+        "filePath": "/src/lib.rs",
+        "rightFileStart": {"line": 10, "offset": 0},
+        "rightFileEnd": {"line": 12, "offset": 0}
+      }
+    },
+    {
+      "id": 2,
+      "status": "fixed",
+      "comments": [
+        {"id": 1, "content": "Resolved old-side comment", "commentType": "text"}
+      ],
+      "threadContext": {
+        "filePath": "/src/old.rs",
+        "leftFileStart": {"line": 5, "offset": 0},
+        "leftFileEnd": {"line": 5, "offset": 0}
+      }
+    },
+    {
+      "id": 3,
+      "status": "active",
+      "comments": [
+        {"id": 1, "content": "File comment", "commentType": "text"}
+      ],
+      "threadContext": {"filePath": "/src/file.rs"}
+    },
+    {
+      "id": 4,
+      "status": "active",
+      "comments": [
+        {"id": 1, "content": null, "commentType": "text", "isDeleted": true}
+      ]
+    },
+    {
+      "id": 5,
+      "status": "active",
+      "comments": [
+        {"id": 1, "content": "Automated event", "commentType": "system"}
+      ],
+      "properties": {
+        "CodeReviewThreadType": {"$type": "System.String", "$value": "VoteUpdate"}
+      }
+    }
+  ]
+}

@@ -213,6 +213,7 @@ fn convert_thread(raw: GhReviewThread) -> RemoteReviewThread {
         id: raw.id,
         path: raw.path.unwrap_or_default(),
         line,
+        start_line: None,
         side,
         is_resolved: raw.is_resolved,
         is_outdated: raw.is_outdated,

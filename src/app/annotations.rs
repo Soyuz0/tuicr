@@ -101,7 +101,7 @@ impl App {
             let visibility = self.session.remote_comments_visibility;
             if !matches!(visibility, PrCommentsVisibility::Hide) {
                 for (thread_idx, thread) in self.forge_review_threads.iter().enumerate() {
-                    if thread.line.is_some() {
+                    if thread.line.is_some() || (!thread.path.is_empty() && !thread.is_outdated) {
                         continue;
                     }
                     let Some(_muted) = visibility.render_decision(thread) else {
@@ -152,6 +152,25 @@ impl App {
                             comment_idx,
                         });
                     }
+                }
+            }
+
+            for (thread_idx, thread) in self.forge_review_threads.iter().enumerate() {
+                if thread.line.is_some()
+                    || thread.is_outdated
+                    || thread.path.is_empty()
+                    || thread.path != path.to_string_lossy()
+                    || self
+                        .session
+                        .remote_comments_visibility
+                        .render_decision(thread)
+                        .is_none()
+                {
+                    continue;
+                }
+                for _ in 0..crate::forge::remote_comments::thread_display_lines(thread) {
+                    self.line_annotations
+                        .push(AnnotatedLine::RemoteThreadLine { thread_idx });
                 }
             }
 

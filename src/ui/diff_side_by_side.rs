@@ -259,7 +259,11 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
     }
 
     for summary in &app.forge_review_summaries {
-        let summary_lines = comment_panel::format_remote_review_summary_lines(&app.theme, summary);
+        let summary_lines = comment_panel::format_remote_review_summary_lines(
+            &app.theme,
+            summary,
+            app.forge_display_name(),
+        );
         for mut summary_line in summary_lines {
             let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
             summary_line.spans.insert(
@@ -332,14 +336,18 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
         let visibility = app.session.remote_comments_visibility;
         if !matches!(visibility, PrCommentsVisibility::Hide) {
             for thread in &app.forge_review_threads {
-                if thread.line.is_some() {
+                if thread.line.is_some() || (!thread.path.is_empty() && !thread.is_outdated) {
                     continue; // inline threads are rendered in-diff
                 }
                 let Some(muted) = visibility.render_decision(thread) else {
                     continue;
                 };
-                let thread_lines =
-                    comment_panel::format_remote_thread_lines(&app.theme, thread, muted);
+                let thread_lines = comment_panel::format_remote_thread_lines(
+                    &app.theme,
+                    thread,
+                    muted,
+                    app.forge_display_name(),
+                );
                 for mut comment_line in thread_lines {
                     let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
                     comment_line.spans.insert(
@@ -502,6 +510,37 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
                         line_idx += 1;
                     }
                 }
+            }
+        }
+
+        for thread in &app.forge_review_threads {
+            if thread.line.is_some()
+                || thread.is_outdated
+                || thread.path.is_empty()
+                || thread.path != path.to_string_lossy()
+            {
+                continue;
+            }
+            let Some(muted) = app
+                .session
+                .remote_comments_visibility
+                .render_decision(thread)
+            else {
+                continue;
+            };
+            for mut comment_line in comment_panel::format_remote_thread_lines(
+                &app.theme,
+                thread,
+                muted,
+                app.forge_display_name(),
+            ) {
+                let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
+                comment_line.spans.insert(
+                    0,
+                    Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
+                );
+                lines.push(comment_line);
+                line_idx += 1;
             }
         }
 
@@ -1731,7 +1770,12 @@ fn add_remote_threads_to_line(
         if !matches_side {
             continue;
         }
-        let thread_lines = comment_panel::format_remote_thread_lines(ctx.theme, thread, muted);
+        let thread_lines = comment_panel::format_remote_thread_lines(
+            ctx.theme,
+            thread,
+            muted,
+            ctx.app.forge_display_name(),
+        );
         let box_top_row = line_idx;
         for mut comment_line in thread_lines {
             let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
@@ -2018,6 +2062,7 @@ mod remote_comments_side_by_side_snapshot_tests {
             id: "T".to_string(),
             path: "src/lib.rs".to_string(),
             line: Some(2),
+            start_line: None,
             side: RemoteCommentSide::Right,
             is_resolved: false,
             is_outdated: false,

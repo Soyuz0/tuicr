@@ -716,7 +716,7 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
                 "  :submit draft",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  Push a pending (draft) review to the forge"),
+            Span::raw("  Push a pending review (unavailable on Azure DevOps)"),
         ]),
         Line::from(vec![
             Span::styled(

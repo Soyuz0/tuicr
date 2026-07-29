@@ -3,6 +3,9 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandOutputErrorKind {
     NotFound,

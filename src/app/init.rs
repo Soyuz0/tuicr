@@ -16,6 +16,7 @@ impl App {
                 comment_type_configs,
                 output_to_stdout,
                 target,
+                options.pr_target_kind,
                 options.repo_url_override.clone(),
                 options.commit_selection,
             );
@@ -750,6 +751,7 @@ impl App {
         comment_type_configs: Option<Vec<CommentTypeConfig>>,
         output_to_stdout: bool,
         target: &str,
+        target_kind: crate::forge::traits::PullRequestTargetKind,
         repo_url_override: Option<ForgeRepository>,
         commit_selection: CommitSelectionStart,
     ) -> Result<Self> {
@@ -757,11 +759,17 @@ impl App {
         use crate::forge::gitlab::glab::parse_pull_request_target_gitlab;
         use crate::forge::pr_open::open_pull_request;
         use crate::forge::traits::ForgeKind;
+        use crate::forge::traits::PullRequestTargetKind;
 
         // Try GitHub-style target first (numeric, GitHub URL, owner/repo#N).
         // If it embeds a GitLab URL, the GitLab parser picks it up.
-        let parsed = parse_pull_request_target(target)
-            .or_else(|_| parse_pull_request_target_gitlab(target))?;
+        let parsed = match target_kind {
+            PullRequestTargetKind::Auto => parse_pull_request_target(target)
+                .or_else(|_| parse_pull_request_target_gitlab(target))?,
+            PullRequestTargetKind::AzureDevOps => {
+                crate::forge::azure_devops::remote::parse_pull_request_target_azure_devops(target)?
+            }
+        };
 
         // Resolution order when the target lacks an explicit repo
         // (`tuicr pr 125`):
@@ -776,6 +784,17 @@ impl App {
         let detected_repo = local_repo_root
             .as_deref()
             .and_then(crate::forge::detect_forge_repository);
+        if target_kind == PullRequestTargetKind::AzureDevOps
+            && detected_repo
+                .as_ref()
+                .is_some_and(|repo| repo.kind != ForgeKind::AzureDevOps)
+            && parsed.repository.is_none()
+        {
+            return Err(TuicrError::Forge(
+                "tuicr ado <number> requires an Azure Repos checkout. A full PR URL can disambiguate the repository, but diff loading still requires its matching checkout."
+                    .to_string(),
+            ));
+        }
 
         // Canonical resolution (fork parent lookup) only works for GitHub.
         let canonical_repo = detected_repo.as_ref().and_then(|origin| {
@@ -798,11 +817,15 @@ impl App {
             .or_else(|| canonical_repo.clone())
             .or_else(|| detected_repo.clone())
             .ok_or_else(|| {
-                TuicrError::Forge(
-                    "tuicr pr <number> requires a local forge remote. \
-                     Use owner/repo#N or a full PR URL outside a checkout."
-                        .to_string(),
-                )
+                let message = match target_kind {
+                    PullRequestTargetKind::Auto => {
+                        "tuicr pr <number> requires a local forge remote. Use owner/repo#N or a full PR URL outside a checkout."
+                    }
+                    PullRequestTargetKind::AzureDevOps => {
+                        "tuicr ado <number> requires an Azure Repos checkout. A full PR URL can disambiguate the repository, but diff loading still requires its matching checkout."
+                    }
+                };
+                TuicrError::Forge(message.to_string())
             })?;
 
         // Use the local checkout for `.tuicrignore` only when it matches the

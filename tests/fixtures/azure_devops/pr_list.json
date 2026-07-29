@@ -1,0 +1,13 @@
+[
+  {
+    "pullRequestId": 125,
+    "title": "Neutral fixture pull request",
+    "status": "active",
+    "sourceRefName": "refs/heads/feature",
+    "targetRefName": "refs/heads/main",
+    "repository": {
+      "id": "00000000-0000-0000-0000-000000000001",
+      "name": "neutral-repo"
+    }
+  }
+]

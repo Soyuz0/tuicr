@@ -1,0 +1,31 @@
+{
+  "pullRequestId": 125,
+  "title": "Neutral fixture pull request",
+  "description": "Fixture description",
+  "status": "active",
+  "isDraft": false,
+  "createdBy": {
+    "displayName": "Fixture Reviewer"
+  },
+  "creationDate": "2026-01-01T00:00:00Z",
+  "sourceRefName": "refs/heads/feature",
+  "targetRefName": "refs/heads/main",
+  "lastMergeSourceCommit": {
+    "commitId": "1111111111111111111111111111111111111111"
+  },
+  "lastMergeTargetCommit": {
+    "commitId": "2222222222222222222222222222222222222222"
+  },
+  "repository": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "name": "neutral-repo",
+    "webUrl": "https://dev.azure.com/neutral-org/neutral-project/_git/neutral-repo",
+    "project": {
+      "id": "00000000-0000-0000-0000-000000000002",
+      "name": "neutral-project"
+    }
+  },
+  "unknownFutureField": {
+    "safe": true
+  }
+}
