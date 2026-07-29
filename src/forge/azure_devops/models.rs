@@ -871,6 +871,28 @@ mod tests {
     }
 
     #[test]
+    fn keeps_active_draft_pull_requests_reviewable() {
+        let json = r#"{
+            "pullRequestId": 13,
+            "title": "Work in progress",
+            "status": "active",
+            "isDraft": true,
+            "sourceRefName": "refs/heads/feature",
+            "targetRefName": "refs/heads/main",
+            "lastMergeSourceCommit": {"commitId":"head123"},
+            "lastMergeTargetCommit": {"commitId":"base123"}
+        }"#;
+        let pull_request: AzurePullRequest = serde_json::from_str(json).unwrap();
+
+        let summary = pull_request.clone().into_summary(&repository());
+        let details = pull_request.into_details(&repository()).unwrap();
+
+        assert!(summary.is_draft);
+        assert!(details.is_draft);
+        assert!(!details.is_read_only());
+    }
+
+    #[test]
     fn reports_missing_merge_shas_with_field_names() {
         let pull_request = AzurePullRequest {
             pull_request_id: 1,

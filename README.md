@@ -137,8 +137,10 @@ here. See [docs/GITLAB.md](docs/GITLAB.md) for setup, self-hosted instances, and
 
 Install Azure CLI and its `azure-devops` extension, then authenticate with `az login` or
 `az devops login`. `:submit` offers Comment, Approve, and Request changes; Request changes maps to
-Azure's `wait-for-author` vote and Draft is hidden. Azure submission uses separate thread and vote
-calls, so confirmed successes are locked individually when a later call fails. See
+Azure's `wait-for-author` vote. Azure draft PRs are fully reviewable; only the separate
+`:submit draft` action is hidden because Azure has no private pending-review submission. Azure
+submission uses separate thread and vote calls, so confirmed successes are locked individually
+when a later call fails. See
 [docs/AZURE_DEVOPS.md](docs/AZURE_DEVOPS.md) for setup, remote formats, permissions, exact commands,
 retry behavior, testing, and known limitations.
 

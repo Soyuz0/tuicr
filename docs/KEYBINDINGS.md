@@ -136,7 +136,7 @@ In command mode,
 | `:submit comment` | Submit a Comment review |
 | `:submit approve` | Submit an Approve review |
 | `:submit request-changes` | Submit a Request-changes review |
-| `:submit draft` | Submit a Draft review (hidden when unsupported, including Azure DevOps) |
+| `:submit draft` | Submit a private pending Draft review (hidden when unsupported, including Azure DevOps) |
 | `:set wrap` | Enable line wrap in diff view |
 | `:set wrap!` | Toggle line wrap in diff view |
 | `:set commits` | Show inline commit selector |
@@ -155,7 +155,8 @@ In command mode,
 | `q` | Quick quit |
 
 `comment`, `approve`, and `request-changes` work on GitHub, GitLab, and Azure DevOps. Azure maps
-request changes to `wait-for-author`; Draft is unavailable and hidden for Azure PRs.
+request changes to `wait-for-author`. Azure draft PRs are reviewable; only the private pending
+review created by `:submit draft` is unavailable and hidden for Azure PRs.
 
 ## Commit selection / review target selector
 

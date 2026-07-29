@@ -50,6 +50,11 @@ The Pull Requests selector auto-detects Azure remotes and lists active PRs.
 Press `r` to switch between all active PRs and PRs where the current identity
 is a reviewer.
 
+Active draft PRs are listed with a `[draft]` marker and are fully reviewable:
+tuicr can open their diffs, save comments, and submit Comment, Approve, or
+Request changes feedback. This is distinct from tuicr's `:submit draft`
+action, which means creating a private pending review on the forge.
+
 Supported remote forms:
 
 ```text
@@ -96,7 +101,7 @@ identified `commentType=system` messages are omitted; user replies are retained.
 | Comment | Create threads without changing the vote |
 | Approve | Create threads, then `az repos pr set-vote --vote approve` |
 | Request changes | Create threads, then `az repos pr set-vote --vote wait-for-author` |
-| Draft | Unavailable and hidden from the Azure picker |
+| Draft | Unavailable and hidden from the Azure picker; this is the private pending-review action, not reviewing an Azure draft PR |
 
 Azure thread creation and voting are separate operations, so submission is not
 atomic. tuicr posts the summary, then each independent inline/file thread, and

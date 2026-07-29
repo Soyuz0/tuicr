@@ -262,7 +262,7 @@ These are non-obvious things the implementation chain hit. Worth preserving for 
 
 14. **Azure resource names come from `az devops invoke` discovery.** Match the documented Git route template, then pass the discovered `resourceName`; do not hard-code guessed resource GUIDs or names.
 
-15. **Azure submission is not atomic.** Post the summary and independent threads first, stop at the first failed thread, and apply `approve` or `wait-for-author` last. Lock only confirmed local IDs. Azure Draft is unsupported and hidden.
+15. **Azure submission is not atomic.** Post the summary and independent threads first, stop at the first failed thread, and apply `approve` or `wait-for-author` last. Lock only confirmed local IDs. Active Azure draft PRs are reviewable; only the `:submit draft` private pending-review action is unsupported and hidden.
 
 16. **Azure diff loading is immutable but checkout-backed.** Exact source/target objects are read locally; missing objects use `git fetch --no-tags --no-write-fetch-head` without checkout/ref changes. Documented iteration changes do not provide a safe universal unified-patch fallback.
 
