@@ -569,7 +569,14 @@ pub struct AzureResourceArea {
     pub location_url: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// A single entry from Azure DevOps API resource-location discovery.
+///
+/// Only the routing fields are modelled. The live API returns `minVersion` and
+/// `maxVersion` as JSON *numbers* (`3.0`, `7.2`), so typing them as `String`
+/// made the whole array fail to deserialize with `invalid type: floating point
+/// 7.2, expected a string`. Nothing in tuicr reads the version fields, so they
+/// are simply not deserialized rather than being given a permissive type.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureApiResourceLocation {
     #[serde(default)]
@@ -580,14 +587,6 @@ pub struct AzureApiResourceLocation {
     pub resource_name: String,
     #[serde(default)]
     pub route_template: String,
-    #[serde(default)]
-    pub min_version: Option<String>,
-    #[serde(default)]
-    pub max_version: Option<String>,
-    #[serde(default)]
-    pub released_version: Option<String>,
-    #[serde(default)]
-    pub resource_version: Option<u32>,
 }
 
 pub fn parse_azure_pull_requests(json: &str) -> Result<Vec<AzurePullRequest>> {

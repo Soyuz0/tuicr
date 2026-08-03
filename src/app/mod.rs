@@ -9,7 +9,9 @@ use crate::comment_vim::CommentVimEditor;
 use crate::config::{CommentTypeConfig, ExportConfig};
 use crate::editor::EditorTarget;
 use crate::error::{Result, TuicrError};
-use crate::forge::context::{ContextProvider, ForgeContextProvider, VcsContextProvider};
+use crate::forge::context::{
+    ContextProvider, FileRevision, ForgeContextProvider, VcsContextProvider,
+};
 use crate::forge::selector::PullRequestsTab;
 use crate::forge::traits::{ForgeBackend, ForgeRepository};
 use crate::model::review::FileReview;
@@ -42,7 +44,7 @@ pub const GAP_EXPAND_BATCH: usize = 20;
 fn create_forge_backend(
     repo: &ForgeRepository,
     local_checkout: Option<PathBuf>,
-) -> Box<dyn ForgeBackend> {
+) -> Box<dyn ForgeBackend + Sync> {
     use crate::forge::traits::ForgeKind;
     match repo.kind {
         ForgeKind::GitHub => {

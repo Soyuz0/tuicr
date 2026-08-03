@@ -1,11 +1,14 @@
 pub mod az;
+mod discovery;
 pub mod models;
 pub mod remote;
 mod submit;
 
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use serde::Deserialize;
 
@@ -18,14 +21,14 @@ use crate::forge::traits::{
     PullRequestTarget, ReviewSubmissionOutcome,
 };
 use crate::model::DiffLine;
-use crate::process::run_command_output;
+use crate::process::{run_command_output, run_command_output_bytes_with_stdin};
 use crate::vcs::slice_context_lines;
 
-use self::az::{AzCommandRunner, SystemAzRunner, map_az_error};
+use self::az::{AzCommandRunner, SystemAzRunner, json_payload, map_az_error};
 use self::models::{
     AzureApiResourceLocation, AzureGitItem, AzureIteration, AzureIterationChange, AzurePullRequest,
-    parse_azure_api_resources, parse_azure_commits, parse_azure_iteration_changes,
-    parse_azure_iterations, parse_azure_pull_requests, parse_azure_threads,
+    parse_azure_commits, parse_azure_iteration_changes, parse_azure_iterations,
+    parse_azure_pull_requests, parse_azure_threads,
 };
 use self::remote::percent_encode_path_component;
 
@@ -41,11 +44,15 @@ const REVIEWERS_ROUTE: &str =
     "{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/reviewers";
 const ITEMS_ROUTE: &str = "{project}/_apis/git/repositories/{repositoryId}/items";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 pub struct AzureDevOpsBackend<R = SystemAzRunner> {
     default_repository: Option<ForgeRepository>,
     runner: R,
     local_checkout: Option<PathBuf>,
+    /// Memoizes "does `local_checkout` point at this repository?" per repository.
+    /// Resolving it opens the repo with libgit2 and walks its remotes, which is
+    /// far too expensive to repeat per file.
+    checkout_matches: Mutex<HashMap<String, bool>>,
 }
 
 impl AzureDevOpsBackend<SystemAzRunner> {
@@ -54,8 +61,17 @@ impl AzureDevOpsBackend<SystemAzRunner> {
             default_repository,
             runner: SystemAzRunner,
             local_checkout: None,
+            checkout_matches: Mutex::new(HashMap::new()),
         }
     }
+}
+
+/// Tolerates poisoning: this is a pure memo, so a panic elsewhere must not turn
+/// every later lookup into a failure.
+fn lock_checkout_cache(
+    cache: &Mutex<HashMap<String, bool>>,
+) -> MutexGuard<'_, HashMap<String, bool>> {
+    cache.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 impl<R> AzureDevOpsBackend<R>
@@ -67,6 +83,7 @@ where
             default_repository,
             runner,
             local_checkout: None,
+            checkout_matches: Mutex::new(HashMap::new()),
         }
     }
 
@@ -76,13 +93,17 @@ where
     }
 
     fn run_az(&self, args: Vec<String>) -> Result<String> {
-        self.runner.run(&args).map_err(map_az_error)
+        self.runner
+            .run(&args)
+            .map_err(map_az_error)
+            .map(|output| json_payload(&output).to_string())
     }
 
     pub(crate) fn run_az_with_input(&self, args: Vec<String>, input: &[u8]) -> Result<String> {
         self.runner
             .run_with_input_file(&args, input)
             .map_err(map_az_error)
+            .map(|output| json_payload(&output).to_string())
     }
 
     fn resolve_repository(&self, target: &PullRequestTarget) -> Result<ForgeRepository> {
@@ -145,33 +166,63 @@ where
             })
     }
 
+    /// Run the untargeted `az devops invoke` that enumerates the organization's
+    /// API surface. This is the expensive call (16-22s against a live org), so
+    /// every caller goes through [`discovery::resource_table`].
+    fn fetch_resource_table(&self, organization_url: &str) -> Result<String> {
+        self.run_az(vec![
+            "devops".to_string(),
+            "invoke".to_string(),
+            "--organization".to_string(),
+            organization_url.to_string(),
+            "--query".to_string(),
+            "[?area=='git']".to_string(),
+        ])
+    }
+
     fn discover_resource(
         &self,
         repository: &ForgeRepository,
         expected_route: &str,
     ) -> Result<AzureApiResourceLocation> {
         let identity = Self::identity(repository)?;
-        let output = self.run_az(vec![
-            "devops".to_string(),
-            "invoke".to_string(),
-            "--organization".to_string(),
-            identity.organization_url.clone(),
-            "--query".to_string(),
-            "[?area=='git']".to_string(),
-        ])?;
+        let organization_url = identity.organization_url.as_str();
         let expected = normalize_route(expected_route);
-        parse_azure_api_resources(&output)?
-            .into_iter()
-            .find(|location| {
-                location.area.eq_ignore_ascii_case("git")
-                    && route_matches(&location.route_template, &expected)
-                    && !location.resource_name.trim().is_empty()
-            })
-            .ok_or_else(|| {
-                TuicrError::Forge(format!(
-                    "Azure DevOps Git API discovery returned no exact route for `{expected_route}`"
-                ))
-            })
+
+        let find = |table: &[AzureApiResourceLocation]| {
+            table
+                .iter()
+                .find(|location| {
+                    location.area.eq_ignore_ascii_case("git")
+                        && route_matches(&resolve_route_placeholders(location), &expected)
+                        && !location.resource_name.trim().is_empty()
+                })
+                .cloned()
+        };
+
+        let cached = discovery::resource_table(organization_url, false, || {
+            self.fetch_resource_table(organization_url)
+        })?;
+        if let Some(location) = find(&cached.table) {
+            return Ok(location);
+        }
+
+        // A *cached* table that lacks the route is treated as stale rather than
+        // as a hard failure, so a route added after the entry was written still
+        // resolves. A freshly fetched table is authoritative, so it is not
+        // refetched -- that would double the `az` calls on a real miss.
+        if cached.from_cache {
+            let fresh = discovery::resource_table(organization_url, true, || {
+                self.fetch_resource_table(organization_url)
+            })?;
+            if let Some(location) = find(&fresh.table) {
+                return Ok(location);
+            }
+        }
+
+        Err(TuicrError::Forge(format!(
+            "Azure DevOps Git API discovery returned no exact route for `{expected_route}`"
+        )))
     }
 
     pub(crate) fn invoke(
@@ -185,7 +236,10 @@ where
     ) -> Result<String> {
         let identity = Self::identity(repository)?;
         let resource = self.discover_resource(repository, expected_route)?;
-        if !route_matches(&resource.route_template, &normalize_route(expected_route)) {
+        if !route_matches(
+            &resolve_route_placeholders(&resource),
+            &normalize_route(expected_route),
+        ) {
             return Err(TuicrError::Forge(format!(
                 "Azure DevOps discovered resource `{}` with an unexpected route `{}`",
                 resource.resource_name, resource.route_template
@@ -319,11 +373,118 @@ where
         })
     }
 
-    fn local_content(&self, request: &ForgeFileLinesRequest) -> Option<String> {
+    /// Resolve (and remember) whether the configured checkout really points at
+    /// `repository`.
+    ///
+    /// The underlying check opens the repository with libgit2 and walks its
+    /// remotes. It used to run once per file during a PR open, which is pure
+    /// repeated work: both the checkout path and the repository are fixed for
+    /// the lifetime of this backend.
+    fn matching_checkout(&self, repository: &ForgeRepository) -> Option<&Path> {
         let root = self.local_checkout.as_deref()?;
-        crate::forge::local_checkout_for_repo(root, &request.repository)?;
+        let key = repository.display_name();
+        if let Some(&matched) = lock_checkout_cache(&self.checkout_matches).get(&key) {
+            return matched.then_some(root);
+        }
+        let matched = crate::forge::local_checkout_for_repo(root, repository).is_some();
+        lock_checkout_cache(&self.checkout_matches).insert(key, matched);
+        matched.then_some(root)
+    }
+
+    fn local_content(&self, request: &ForgeFileLinesRequest) -> Option<String> {
+        let root = self.matching_checkout(&request.repository)?;
         let spec = format!("{}:{}", request.sha(), slash_path(request.path.as_path()));
         run_git(root, &["cat-file", "blob", &spec]).ok()
+    }
+
+    /// Resolve line counts for as many requests as the local checkout can serve,
+    /// using a single `git cat-file --batch` process.
+    ///
+    /// Returns the indices it could **not** answer, so the caller can fall back
+    /// to the per-file (and possibly remote) path for those. One process for the
+    /// whole PR replaces one spawn per changed file, which was measured at ~1s of
+    /// blocked UI for a 167-file PR versus ~50ms batched.
+    fn batch_local_line_counts(
+        &self,
+        requests: &[ForgeFileLinesRequest],
+        counts: &mut [Option<u32>],
+    ) -> Vec<usize> {
+        let all = || (0..requests.len()).collect::<Vec<_>>();
+        let Some(repository) = requests.first().map(|request| &request.repository) else {
+            return Vec::new();
+        };
+        // Every request in a batch belongs to one PR, so a single checkout check
+        // covers them all; anything else falls back per file.
+        if requests
+            .iter()
+            .any(|request| !request.repository.same_repository(repository))
+        {
+            return all();
+        }
+        let Some(root) = self.matching_checkout(repository) else {
+            return all();
+        };
+
+        // `git cat-file --batch` takes one newline-delimited spec per line, so a
+        // path containing a newline would split into several requests and shift
+        // every later record. Such paths are excluded from the batch and answered
+        // per file instead; misattributing a line count is worse than a subprocess.
+        let mut unresolved = Vec::new();
+        let mut batched = Vec::with_capacity(requests.len());
+        let mut stdin = Vec::with_capacity(requests.len() * 64);
+        for (index, request) in requests.iter().enumerate() {
+            let path = slash_path(request.path.as_path());
+            if path.contains('\n') || path.contains('\r') {
+                unresolved.push(index);
+                continue;
+            }
+            batched.push(index);
+            stdin.extend_from_slice(request.sha().as_bytes());
+            stdin.push(b':');
+            stdin.extend_from_slice(path.as_bytes());
+            stdin.push(b'\n');
+        }
+        if batched.is_empty() {
+            return all();
+        }
+
+        let Ok(stdout) = run_command_output_bytes_with_stdin(
+            &git_executable(),
+            Some(root),
+            ["cat-file", "--batch"].iter().map(OsStr::new),
+            &stdin,
+        ) else {
+            return all();
+        };
+
+        let mut offset = 0;
+        let mut batched = batched.into_iter();
+        while let Some(index) = batched.next() {
+            match parse_batch_record(&stdout, offset) {
+                Some((count, next)) => {
+                    counts[index] = Some(count);
+                    offset = next;
+                }
+                None => {
+                    // Either the object is missing or the stream desynchronized.
+                    // Advance past this record when possible; otherwise abandon the
+                    // remainder so nothing is attributed to the wrong file.
+                    match skip_batch_record(&stdout, offset) {
+                        Some(next) => {
+                            unresolved.push(index);
+                            offset = next;
+                        }
+                        None => {
+                            unresolved.push(index);
+                            unresolved.extend(batched);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        unresolved.sort_unstable();
+        unresolved
     }
 
     fn immutable_diff(
@@ -511,6 +672,14 @@ where
         })
     }
 
+    fn file_line_counts(&self, requests: Vec<ForgeFileLinesRequest>) -> Vec<Option<u32>> {
+        let mut counts = vec![None; requests.len()];
+        for index in self.batch_local_line_counts(&requests, &mut counts) {
+            counts[index] = self.file_line_count(requests[index].clone()).ok();
+        }
+        counts
+    }
+
     fn list_review_threads(&self, pr: &PullRequestDetails) -> Result<Vec<RemoteReviewThread>> {
         let route = Self::pull_request_route_parameters(&pr.repository, pr.number)?;
         let output = self.invoke(&pr.repository, THREADS_ROUTE, None, &route, &[], None)?;
@@ -642,11 +811,28 @@ fn normalize_route(route: &str) -> String {
         .join("/")
 }
 
+/// Substitute the placeholders that a resource location resolves by definition.
+///
+/// Azure returns parameterized templates such as
+/// `{project}/_apis/{area}/repositories/{repositoryId}/{resource}/{*path}`,
+/// where `{area}` and `{resource}` are filled in by the entry's own `area` and
+/// `resourceName`. The expected routes in this module are written with those
+/// already resolved (literal `git`, literal `items`), so comparing raw templates
+/// never matched a single real route and discovery always failed.
+fn resolve_route_placeholders(location: &AzureApiResourceLocation) -> String {
+    location
+        .route_template
+        .replace("{area}", &location.area)
+        .replace("{resource}", &location.resource_name)
+}
+
 fn route_matches(discovered_route: &str, normalized_expected: &str) -> bool {
     let discovered = normalize_route(discovered_route);
     if discovered == normalized_expected {
         return true;
     }
+    // Collection routes carry an optional trailing item segment
+    // (`.../threads/{threadId}`, `.../items/{*path}`).
     discovered
         .rsplit_once('/')
         .is_some_and(|(base, last)| base == normalized_expected && last.starts_with('{'))
@@ -688,6 +874,61 @@ fn git_executable() -> String {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "git".to_string())
+}
+
+/// Split one `git cat-file --batch` record header at `offset`.
+///
+/// A successful record is `<oid> SP <type> SP <size> LF`, followed by exactly
+/// `size` content bytes and a trailing `LF`. Missing objects instead emit
+/// `<request> SP missing LF` with no content, and newer Git can report
+/// `ambiguous`. Anything that is not a well-formed three-field header with a
+/// numeric size is treated as "no content".
+fn parse_batch_header(stdout: &[u8], offset: usize) -> Option<(usize, usize)> {
+    let rest = stdout.get(offset..)?;
+    let newline = rest.iter().position(|byte| *byte == b'\n')?;
+    let header = std::str::from_utf8(&rest[..newline]).ok()?;
+    let size = header
+        .rsplit(' ')
+        .next()
+        .filter(|_| header.split(' ').count() >= 3)
+        .and_then(|size| size.parse::<usize>().ok())?;
+    Some((size, offset + newline + 1))
+}
+
+/// Line count for the record at `offset`, plus the offset of the next record.
+///
+/// Matches `str::lines().count()`: a trailing newline does not add a line.
+fn parse_batch_record(stdout: &[u8], offset: usize) -> Option<(u32, usize)> {
+    let (size, content_start) = parse_batch_header(stdout, offset)?;
+    // A malformed header can advertise an enormous size, so this must not be
+    // allowed to overflow into a valid-looking (wrong) range.
+    let content_end = content_start.checked_add(size)?;
+    let content = stdout.get(content_start..content_end)?;
+    // The record is only complete once its trailing separator is present.
+    if stdout.get(content_end) != Some(&b'\n') {
+        return None;
+    }
+    let newlines = content.iter().filter(|byte| **byte == b'\n').count();
+    let lines = newlines + usize::from(!content.is_empty() && content.last() != Some(&b'\n'));
+    Some((u32::try_from(lines).ok()?, content_end + 1))
+}
+
+/// Offset just past the record at `offset`, for records with no usable content
+/// (`missing`/`ambiguous`), which occupy only their header line.
+///
+/// Returns `None` when the stream cannot be resynchronized, so the caller stops
+/// rather than resuming mid-record and shifting every later file's count.
+fn skip_batch_record(stdout: &[u8], offset: usize) -> Option<usize> {
+    if let Some((size, content_start)) = parse_batch_header(stdout, offset) {
+        // A well-formed numeric header means a content record. Only skip it when
+        // it is actually complete; a truncated one leaves the stream unusable.
+        let content_end = content_start.checked_add(size)?;
+        return (stdout.get(content_end) == Some(&b'\n')).then_some(content_end + 1);
+    }
+    // Otherwise it is a header-only record such as `<request> missing`.
+    let rest = stdout.get(offset..)?;
+    let newline = rest.iter().position(|byte| *byte == b'\n')?;
+    Some(offset + newline + 1)
 }
 
 fn run_git(root: &Path, args: &[&str]) -> std::result::Result<String, String> {
@@ -899,6 +1140,320 @@ mod tests {
         );
     }
 
+    fn details(number: u64) -> PullRequestDetails {
+        PullRequestDetails {
+            repository: repository(),
+            number,
+            title: String::new(),
+            url: String::new(),
+            state: "OPEN".to_string(),
+            is_draft: false,
+            author: None,
+            head_ref_name: String::new(),
+            base_ref_name: String::new(),
+            head_sha: "head".to_string(),
+            base_sha: "base".to_string(),
+            body: String::new(),
+            updated_at: None,
+            closed: false,
+            merged_at: None,
+            diff_start_sha: None,
+        }
+    }
+
+    /// Discovery is the dominant cost of an Azure PR open (16-22s live), and
+    /// `invoke` needs it for every REST call. One PR open issues at least three
+    /// `invoke`s, so they have to share a single discovery.
+    #[test]
+    fn repeated_invokes_share_one_cached_discovery() {
+        let cache = discovery::TestCache::enable();
+        let discovered = format!(
+            r#"[{{"area":"git","resourceName":"server-name","routeTemplate":"{COMMITS_ROUTE}"}},
+                {{"area":"git","resourceName":"threads-name","routeTemplate":"{THREADS_ROUTE}"}}]"#
+        );
+        let runner = FakeRunner::with_replies([
+            Box::leak(discovered.into_boxed_str()),
+            "[]",
+            r#"{"value":[]}"#,
+        ]);
+        let backend = AzureDevOpsBackend::with_runner(None, runner);
+        let pr = details(7);
+
+        backend.list_pull_request_commits(&pr).unwrap();
+        backend.list_review_threads(&pr).unwrap();
+
+        let discovery_calls = backend
+            .runner
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.0.iter().any(|argument| argument == "[?area=='git']"))
+            .count();
+        assert_eq!(
+            discovery_calls, 1,
+            "two invokes must not each pay for discovery"
+        );
+
+        // A fresh backend on another thread (one per PR-open phase) must reuse
+        // the process-wide memo rather than rediscovering.
+        let second = AzureDevOpsBackend::with_runner(None, FakeRunner::with_replies(["[]"]));
+        second.list_pull_request_commits(&pr).unwrap();
+        assert!(
+            second.runner.calls.lock().unwrap()[0]
+                .0
+                .iter()
+                .all(|argument| argument != "[?area=='git']"),
+            "a new backend must reuse the cached table"
+        );
+
+        // Dropping the memo still avoids the network: the on-disk entry serves it.
+        cache.clear_memo();
+        let third = AzureDevOpsBackend::with_runner(None, FakeRunner::with_replies(["[]"]));
+        third.list_pull_request_commits(&pr).unwrap();
+        assert!(
+            third.runner.calls.lock().unwrap()[0]
+                .0
+                .iter()
+                .all(|argument| argument != "[?area=='git']"),
+            "the persisted cache must survive losing the memo"
+        );
+    }
+
+    /// A cached table predates any route Azure adds later, so a miss against a
+    /// cached table must retry once with a live fetch instead of failing.
+    #[test]
+    fn cached_table_missing_a_route_refetches_once() {
+        let _cache = discovery::TestCache::enable();
+        let stale = r#"[{"area":"git","resourceName":"threads-name","routeTemplate":"{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads"}]"#;
+        let fresh = format!(
+            r#"[{{"area":"git","resourceName":"server-name","routeTemplate":"{COMMITS_ROUTE}"}}]"#
+        );
+        // Reply order: seed discovery, threads payload, forced discovery, commits payload.
+        let runner = FakeRunner::with_replies([
+            stale,
+            r#"{"value":[]}"#,
+            Box::leak(fresh.into_boxed_str()),
+            "[]",
+        ]);
+        let backend = AzureDevOpsBackend::with_runner(None, runner);
+        let pr = details(7);
+
+        // Seeds the cache with a table that lacks COMMITS_ROUTE.
+        backend.list_review_threads(&pr).unwrap();
+        backend.list_pull_request_commits(&pr).unwrap();
+
+        let calls = backend.runner.calls.lock().unwrap();
+        let discovery_calls = calls
+            .iter()
+            .filter(|call| call.0.iter().any(|argument| argument == "[?area=='git']"))
+            .count();
+        assert_eq!(discovery_calls, 2, "exactly one forced refetch");
+        assert!(
+            calls
+                .last()
+                .unwrap()
+                .0
+                .windows(2)
+                .any(|pair| pair == ["--resource", "server-name"])
+        );
+    }
+
+    /// `az devops invoke` writes `Please wait a couple of seconds...` to stdout
+    /// (not stderr) and `--only-show-errors` does not suppress it. Feeding that
+    /// to serde failed at column 1, which silently disabled every discovery-backed
+    /// Azure feature. Live output also returns `minVersion`/`maxVersion` as JSON
+    /// numbers, which a `String` field rejected.
+    #[test]
+    fn tolerates_stdout_preamble_and_numeric_api_versions() {
+        let discovered = format!(
+            "Please wait a couple of seconds while we fetch all required information.\n\
+             [{{\"area\":\"git\",\"resourceName\":\"server-name\",\"minVersion\":2.1,\
+             \"maxVersion\":7.2,\"releasedVersion\":\"7.1\",\"resourceVersion\":1,\
+             \"routeTemplate\":\"{COMMITS_ROUTE}\"}}]"
+        );
+        let runner = FakeRunner::with_replies([Box::leak(discovered.into_boxed_str()), "[]"]);
+        let backend = AzureDevOpsBackend::with_runner(None, runner);
+
+        backend
+            .list_pull_request_commits(&details(7))
+            .expect("live-shaped discovery output must parse");
+        assert!(
+            backend.runner.calls.lock().unwrap()[1]
+                .0
+                .windows(2)
+                .any(|pair| pair == ["--resource", "server-name"])
+        );
+    }
+
+    /// Byte-for-byte output of a real `git cat-file --batch` for, in order:
+    /// a file ending in a newline, one that does not, an empty file, a binary
+    /// file, and a missing object.
+    const REAL_BATCH_STREAM: &[u8] = b"de980441c3ab03a8c07dda1ad27b8a11f39deb1e blob 6\na\nb\nc\n\n1c943a98887754f364fafaa1da3ac56e0e0875a9 blob 5\na\nb\nc\ne69de29bb2d1d6434b8b29ae775ad8c2e48c5391 blob 0\n\nb538f94a18841c76cfe8257f992b84fb562ac9ef blob 6\nx\x00\xff\ny\n\nHEAD:nope.txt missing\n";
+
+    /// Line counts must match `str::lines().count()`, and the length-prefixed
+    /// walk must stay byte-exact: the binary record contains `0xFF`, which lossy
+    /// UTF-8 conversion would widen and desynchronize every later record.
+    #[test]
+    fn parses_real_cat_file_batch_records_including_binary_and_missing() {
+        let mut offset = 0;
+        let mut counts = Vec::new();
+        for _ in 0..4 {
+            let (count, next) =
+                parse_batch_record(REAL_BATCH_STREAM, offset).expect("well-formed record");
+            counts.push(count);
+            offset = next;
+        }
+        assert_eq!(counts, vec![3, 3, 0, 2]);
+
+        // The trailing record is `missing`: no content, header line only.
+        assert!(parse_batch_record(REAL_BATCH_STREAM, offset).is_none());
+        let after_missing = skip_batch_record(REAL_BATCH_STREAM, offset).expect("skip missing");
+        assert_eq!(after_missing, REAL_BATCH_STREAM.len());
+    }
+
+    /// A truncated record must not be reported as a count, or the remaining
+    /// files would silently inherit another file's length.
+    #[test]
+    fn refuses_truncated_or_malformed_batch_records() {
+        let truncated = &REAL_BATCH_STREAM[..REAL_BATCH_STREAM.len() - 30];
+        let mut offset = 0;
+        while let Some((_, next)) = parse_batch_record(truncated, offset) {
+            offset = next;
+        }
+        assert!(offset < truncated.len(), "expected an unparsed tail");
+
+        assert!(parse_batch_record(b"no-newline-anywhere", 0).is_none());
+        assert!(parse_batch_record(b"oid blob notanumber\ncontent\n", 0).is_none());
+        assert!(parse_batch_record(b"", 0).is_none());
+        assert!(skip_batch_record(b"", 0).is_none());
+    }
+
+    /// A header advertising an absurd size must not overflow into a wrong range.
+    #[test]
+    fn oversized_batch_header_neither_panics_nor_resynchronizes() {
+        let hostile = format!("oid blob {}\ncontent\n", usize::MAX).into_bytes();
+        assert!(parse_batch_record(&hostile, 0).is_none());
+        assert!(skip_batch_record(&hostile, 0).is_none());
+
+        // A complete header whose content is truncated must also refuse to skip,
+        // so the caller stops instead of resuming mid-record.
+        assert!(parse_batch_record(b"oid blob 100\nshort\n", 0).is_none());
+        assert!(skip_batch_record(b"oid blob 100\nshort\n", 0).is_none());
+    }
+
+    /// End-to-end check of the batched path against real `git cat-file --batch`
+    /// output, covering the cases that break naive parsing: a file without a
+    /// trailing newline, an empty file, binary content containing `0xFF` (which
+    /// lossy UTF-8 conversion would widen and desynchronize), a path with a
+    /// newline in it, and an object that is simply absent.
+    #[cfg(unix)]
+    #[test]
+    fn batched_line_counts_match_real_git_for_awkward_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let git_repository = git2::Repository::init(&checkout).unwrap();
+        git_repository
+            .remote(
+                "origin",
+                "https://dev.azure.com/neutral-org/neutral-project/_git/neutral-repo",
+            )
+            .unwrap();
+
+        // (path, contents, expected line count)
+        let files: [(&str, &[u8], u32); 5] = [
+            ("trailing.txt", b"a\nb\nc\n", 3),
+            ("no_trailing.txt", b"a\nb\nc", 3),
+            ("empty.txt", b"", 0),
+            ("binary.dat", b"x\x00\xffy\nz\n", 2),
+            ("news\nline.txt", b"a\nb\n", 2),
+        ];
+
+        let commit_id = {
+            let mut builder = git_repository.treebuilder(None).unwrap();
+            for (path, contents, _) in files {
+                let blob = git_repository.blob(contents).unwrap();
+                builder.insert(path, blob, 0o100_644).unwrap();
+            }
+            let tree = git_repository.find_tree(builder.write().unwrap()).unwrap();
+            let signature = git2::Signature::now("t", "t@example.invalid").unwrap();
+            git_repository
+                .commit(Some("HEAD"), &signature, &signature, "x", &tree, &[])
+                .unwrap()
+                .to_string()
+        };
+
+        let backend = AzureDevOpsBackend::with_runner(None, FakeRunner::default())
+            .with_local_checkout(Some(checkout));
+
+        let mut requests: Vec<ForgeFileLinesRequest> = files
+            .iter()
+            .map(|(path, _, _)| line_request(path))
+            .collect();
+        // An object that is not in the tree: `git cat-file` reports it missing.
+        requests.push(line_request("absent.txt"));
+        for request in &mut requests {
+            request.head_sha = commit_id.clone();
+        }
+
+        let counts = backend.file_line_counts(requests);
+        let expected: Vec<Option<u32>> = files
+            .iter()
+            .map(|(_, _, lines)| Some(*lines))
+            // The absent object cannot be resolved locally, and the fake `az`
+            // runner cannot serve it remotely either.
+            .chain(std::iter::once(None))
+            .collect();
+        assert_eq!(counts, expected);
+    }
+
+    /// `git cat-file --batch` is newline-delimited, so a path containing a newline
+    /// would split into extra requests and shift every later record. Those paths
+    /// must be excluded from the batch rather than risk a wrong line count.
+    #[test]
+    fn paths_containing_newlines_are_excluded_from_the_batch() {
+        let backend = AzureDevOpsBackend::with_runner(None, FakeRunner::default())
+            .with_local_checkout(Some(PathBuf::from("/nonexistent/checkout")));
+        let requests = vec![
+            line_request("src/ok.rs"),
+            line_request("src/we\nird.rs"),
+            line_request("src/also\rbad.rs"),
+        ];
+        let mut counts = vec![None; requests.len()];
+        // The checkout does not match, so everything falls back; the point is that
+        // the unresolved list is complete, ordered, and free of duplicates.
+        let unresolved = backend.batch_local_line_counts(&requests, &mut counts);
+        assert_eq!(unresolved, vec![0, 1, 2]);
+        assert!(unresolved.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// The batch must not run against a checkout that belongs to a different
+    /// repository, and every request must still get an aligned slot.
+    #[test]
+    fn batch_line_counts_skip_a_non_matching_checkout() {
+        let backend = AzureDevOpsBackend::with_runner(None, FakeRunner::default())
+            .with_local_checkout(Some(PathBuf::from("/nonexistent/checkout")));
+        let requests = vec![line_request("src/a.rs"), line_request("src/b.rs")];
+        let mut counts = vec![None; requests.len()];
+        let unresolved = backend.batch_local_line_counts(&requests, &mut counts);
+        assert_eq!(unresolved, vec![0, 1], "both must fall back");
+        assert_eq!(counts, vec![None, None]);
+    }
+
+    fn line_request(path: &str) -> ForgeFileLinesRequest {
+        ForgeFileLinesRequest {
+            repository: repository(),
+            base_sha: "base".to_string(),
+            head_sha: "head".to_string(),
+            path: PathBuf::from(path),
+            status: crate::model::FileStatus::Modified,
+            side: crate::forge::traits::ForgeFileSide::Head,
+            start_line: 0,
+            end_line: 0,
+        }
+    }
+
     #[test]
     fn missing_exact_discovery_route_is_explicit() {
         let runner = FakeRunner::with_replies([
@@ -915,6 +1470,98 @@ mod tests {
     fn discovery_accepts_documented_collection_route_with_optional_item_id() {
         let discovered = format!("{THREADS_ROUTE}/{{threadId}}");
         assert!(route_matches(&discovered, &normalize_route(THREADS_ROUTE)));
+    }
+
+    /// Verbatim `routeTemplate` values from a live organization's discovery
+    /// response. Azure parameterizes the area and resource segments, so raw
+    /// template comparison matched none of these and discovery always failed --
+    /// which `unwrap_or_default` then hid as "no commits / no threads".
+    #[test]
+    fn resolves_every_live_route_template_to_its_resource() {
+        let live = [
+            (
+                COMMITS_ROUTE,
+                "pullRequestCommits",
+                "{project}/_apis/{area}/repositories/{repositoryId}/pullRequests/{pullRequestId}/commits",
+            ),
+            (
+                ITERATIONS_ROUTE,
+                "pullRequestIterations",
+                "{project}/_apis/{area}/repositories/{repositoryId}/pullRequests/{pullRequestId}/iterations/{iterationId}",
+            ),
+            (
+                ITERATION_CHANGES_ROUTE,
+                "pullRequestIterationChanges",
+                "{project}/_apis/{area}/repositories/{repositoryId}/pullRequests/{pullRequestId}/iterations/{iterationId}/changes",
+            ),
+            (
+                THREADS_ROUTE,
+                "pullRequestThreads",
+                "{project}/_apis/{area}/repositories/{repositoryId}/pullRequests/{pullRequestId}/threads/{threadId}",
+            ),
+            (
+                REVIEWERS_ROUTE,
+                "pullRequestReviewers",
+                "{project}/_apis/{area}/repositories/{repositoryId}/pullRequests/{pullRequestId}/reviewers/{reviewerId}",
+            ),
+            (
+                // Uses both `{area}` and `{resource}`, plus a wildcard tail.
+                ITEMS_ROUTE,
+                "items",
+                "{project}/_apis/{area}/repositories/{repositoryId}/{resource}/{*path}",
+            ),
+        ];
+
+        for (expected_route, resource_name, template) in live {
+            let location = AzureApiResourceLocation {
+                id: String::new(),
+                area: "git".to_string(),
+                resource_name: resource_name.to_string(),
+                route_template: template.to_string(),
+            };
+            assert!(
+                route_matches(
+                    &resolve_route_placeholders(&location),
+                    &normalize_route(expected_route)
+                ),
+                "live template for `{resource_name}` must resolve `{expected_route}`"
+            );
+        }
+    }
+
+    /// Substitution must not let a different git resource satisfy a route.
+    #[test]
+    fn placeholder_substitution_does_not_create_false_matches() {
+        for (resource_name, template) in [
+            (
+                "itemsBatch",
+                "{project}/_apis/{area}/repositories/{repositoryId}/{resource}",
+            ),
+            (
+                "hfsItems",
+                "{project}/_apis/{area}/repositories/{repositoryId}/{resource}/{*path}",
+            ),
+            (
+                "pullRequestWorkItems",
+                "{project}/_apis/{area}/repositories/{repositoryId}/pullRequests/{pullRequestId}/workitems",
+            ),
+        ] {
+            let location = AzureApiResourceLocation {
+                id: String::new(),
+                area: "git".to_string(),
+                resource_name: resource_name.to_string(),
+                route_template: template.to_string(),
+            };
+            let resolved = resolve_route_placeholders(&location);
+            assert!(
+                !route_matches(&resolved, &normalize_route(ITEMS_ROUTE)),
+                "`{resource_name}` must not satisfy the items route"
+            );
+            assert!(
+                !route_matches(&resolved, &normalize_route(COMMITS_ROUTE)),
+                "`{resource_name}` must not satisfy the commits route"
+            );
+        }
     }
 
     #[test]

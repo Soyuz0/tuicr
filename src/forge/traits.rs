@@ -566,6 +566,19 @@ pub trait ForgeBackend {
     fn file_line_count(&self, _request: ForgeFileLinesRequest) -> Result<u32> {
         Ok(0)
     }
+    /// Batched [`Self::file_line_count`], returning one entry per request in
+    /// order with `None` where the count is unavailable.
+    ///
+    /// Opening a PR needs a count for every changed file before the first
+    /// render, so the naive loop spends one subprocess per file on the main
+    /// thread. Backends that can answer the whole batch in a single call should
+    /// override this; the default preserves the per-file behaviour.
+    fn file_line_counts(&self, requests: Vec<ForgeFileLinesRequest>) -> Vec<Option<u32>> {
+        requests
+            .into_iter()
+            .map(|request| self.file_line_count(request).ok())
+            .collect()
+    }
     /// Fetch existing review discussions for a PR, including their resolved
     /// and outdated state. Implementations should return all threads in
     /// posted order; filtering by visibility happens in the App.

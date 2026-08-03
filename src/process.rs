@@ -89,6 +89,24 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_command_output_bytes_with_stdin(program, current_dir, args, stdin.as_bytes())
+        .map(|stdout| String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// Byte-exact variant of [`run_command_output_with_stdin`].
+///
+/// Required by length-prefixed protocols such as `git cat-file --batch`, where
+/// lossy UTF-8 replacement would change byte offsets and desynchronize parsing.
+pub fn run_command_output_bytes_with_stdin<I, S>(
+    program: &str,
+    current_dir: Option<&Path>,
+    args: I,
+    stdin: &[u8],
+) -> CommandOutputResult<Vec<u8>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = Command::new(program);
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
@@ -117,7 +135,7 @@ where
     // so the child sees EOF and can finish.
     if let Some(mut child_stdin) = child.stdin.take() {
         child_stdin
-            .write_all(stdin.as_bytes())
+            .write_all(stdin)
             .map_err(|err| CommandOutputError {
                 kind: CommandOutputErrorKind::SpawnFailed,
                 status: None,
@@ -134,7 +152,7 @@ where
     })?;
 
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(output.stdout)
     } else {
         Err(CommandOutputError {
             kind: CommandOutputErrorKind::Unsuccessful,

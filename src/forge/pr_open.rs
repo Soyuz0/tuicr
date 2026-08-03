@@ -48,7 +48,7 @@ pub struct OpenedPullRequest {
 /// root are applied. When absent (PR opened via URL outside a checkout, or
 /// for a different repo), no filtering happens.
 pub fn open_pull_request(
-    backend: &dyn ForgeBackend,
+    backend: &(dyn ForgeBackend + Sync),
     target: PullRequestTarget,
     local_checkout: Option<&Path>,
     highlighter: &SyntaxHighlighter,
@@ -69,11 +69,17 @@ pub fn open_pull_request(
 /// patch text, and the commit list. Safe to run on a background thread
 /// because it does no syntax parsing and holds nothing that isn't `Send`.
 ///
-/// The commit list is best-effort: if the forge fails on that endpoint
-/// only, we still return the diff so PR review proceeds without the
-/// inline selector. The first two calls remain required.
+/// `get_pull_request` must complete first because everything else keys off the
+/// resolved `PullRequestDetails`. The remaining three calls only read those
+/// details and hit unrelated endpoints, so they run concurrently on scoped
+/// threads; each is a separate CLI subprocess, so the wall time collapses to the
+/// slowest one instead of their sum.
+///
+/// The commit list and review metadata stay best-effort: if the forge fails on
+/// those endpoints only, we still return the diff so PR review proceeds without
+/// the inline selector. The details and diff calls remain required.
 pub fn fetch_pr_data(
-    backend: &dyn ForgeBackend,
+    backend: &(dyn ForgeBackend + Sync),
     target: PullRequestTarget,
 ) -> Result<(
     PullRequestDetails,
@@ -84,14 +90,31 @@ pub fn fetch_pr_data(
 )> {
     let pr_info = backend.get_pull_request_info(target)?;
     let details = pr_info.details.clone();
-    let patch = backend.get_pull_request_diff(&details)?;
-    let commits = backend
-        .list_pull_request_commits(&details)
-        .unwrap_or_default();
-    let review_metadata = backend
-        .list_pull_request_review_metadata(&details)
-        .unwrap_or_default();
-    Ok((details, patch, commits, review_metadata, pr_info))
+
+    let (patch, commits, review_metadata) = std::thread::scope(|scope| {
+        let commits = scope.spawn(|| {
+            backend
+                .list_pull_request_commits(&details)
+                .unwrap_or_default()
+        });
+        let review_metadata = scope.spawn(|| {
+            backend
+                .list_pull_request_review_metadata(&details)
+                .unwrap_or_default()
+        });
+        // The required call stays on this thread so its error propagates
+        // directly instead of needing to be carried back across a join.
+        let patch = backend.get_pull_request_diff(&details);
+        // A panic in a best-effort fetch must degrade like a failure would,
+        // not take down the PR open.
+        (
+            patch,
+            commits.join().unwrap_or_default(),
+            review_metadata.join().unwrap_or_default(),
+        )
+    });
+
+    Ok((details, patch?, commits, review_metadata, pr_info))
 }
 
 /// CPU-only half of the PR open path: parse the patch, apply
@@ -183,7 +206,7 @@ mod tests {
     };
     use crate::model::DiffLine;
     use chrono::Utc;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     fn repo() -> ForgeRepository {
         ForgeRepository::github("github.com", "agavra", "tuicr")
@@ -213,7 +236,9 @@ mod tests {
     struct StaticBackend {
         details: PullRequestDetails,
         patch: String,
-        calls: RefCell<Vec<&'static str>>,
+        // `Mutex` rather than `RefCell` so the fake is `Sync`, which the
+        // concurrent fetch in `fetch_pr_data` requires of a forge backend.
+        calls: Mutex<Vec<&'static str>>,
     }
 
     impl ForgeBackend for StaticBackend {
@@ -221,11 +246,11 @@ mod tests {
             unimplemented!()
         }
         fn get_pull_request(&self, _target: PullRequestTarget) -> Result<PullRequestDetails> {
-            self.calls.borrow_mut().push("get_pull_request");
+            self.calls.lock().unwrap().push("get_pull_request");
             Ok(self.details.clone())
         }
         fn get_pull_request_diff(&self, _pr: &PullRequestDetails) -> Result<String> {
-            self.calls.borrow_mut().push("get_pull_request_diff");
+            self.calls.lock().unwrap().push("get_pull_request_diff");
             Ok(self.patch.clone())
         }
         fn fetch_file_lines(&self, _req: ForgeFileLinesRequest) -> Result<Vec<DiffLine>> {
@@ -277,7 +302,7 @@ index 1111111..2222222 100644
         let backend = StaticBackend {
             details: details(),
             patch: SIMPLE_PATCH.to_string(),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         let target = PullRequestTarget::with_repository(repo(), 125, "125");
         let highlighter = SyntaxHighlighter::default();
@@ -298,7 +323,7 @@ index 1111111..2222222 100644
         );
         // and — both forge calls were made, in order
         assert_eq!(
-            backend.calls.borrow().as_slice(),
+            backend.calls.lock().unwrap().as_slice(),
             &["get_pull_request", "get_pull_request_diff"],
         );
     }
@@ -344,7 +369,7 @@ rename to new_name.rs
         let backend = StaticBackend {
             details: details(),
             patch: MULTI_STATUS_PATCH.to_string(),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         let target = PullRequestTarget::with_repository(repo(), 125, "125");
         let highlighter = SyntaxHighlighter::default();
@@ -383,7 +408,7 @@ rename to new_name.rs
         let backend = StaticBackend {
             details: details(),
             patch: String::new(),
-            calls: RefCell::new(Vec::new()),
+            calls: Mutex::new(Vec::new()),
         };
         let target = PullRequestTarget::with_repository(repo(), 125, "125");
         let highlighter = SyntaxHighlighter::default();

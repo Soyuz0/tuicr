@@ -53,6 +53,30 @@ impl AzCommandRunner for SystemAzRunner {
     }
 }
 
+/// Strip human-readable preamble lines that Azure CLI writes to **stdout**
+/// ahead of the JSON document.
+///
+/// `az devops invoke` prints `Please wait a couple of seconds while we fetch
+/// all required information.` on stdout (not stderr) while it enumerates the
+/// organization's API surface, and `--only-show-errors` does not suppress it.
+/// Handing that straight to `serde_json` fails with `expected value at line 1
+/// column 1`, which silently broke every discovery-backed Azure call.
+///
+/// Only whole leading lines that cannot start a JSON document are dropped, and
+/// only up to the first line that can. Output that never reaches a `{`/`[` is
+/// returned untouched so error formatting still sees the original text.
+pub fn json_payload(output: &str) -> &str {
+    let mut offset = 0;
+    for line in output.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            return &output[offset + (line.len() - trimmed.len())..];
+        }
+        offset += line.len();
+    }
+    output
+}
+
 /// Convert transport and common Azure CLI failures into setup-oriented errors.
 pub fn map_az_error(error: AzCommandError) -> TuicrError {
     match error {
@@ -282,6 +306,29 @@ mod tests {
                 "--only-show-errors"
             ]
         );
+    }
+
+    /// `az devops invoke` prints its progress banner on **stdout**, ahead of the
+    /// JSON, and `--only-show-errors` does not suppress it.
+    #[test]
+    fn strips_only_leading_non_json_lines_from_stdout() {
+        let banner = "Please wait a couple of seconds while we fetch all required information.\n";
+        assert_eq!(json_payload(&format!("{banner}[1,2]")), "[1,2]");
+        assert_eq!(json_payload(&format!("{banner}  {{\"a\":1}}")), "{\"a\":1}");
+        assert_eq!(
+            json_payload(&format!("{banner}\n{banner}[]")),
+            "[]",
+            "multiple preamble lines must all be dropped"
+        );
+
+        // Already-clean payloads are returned untouched, including content that
+        // merely contains a bracket later on.
+        assert_eq!(json_payload("[{\"a\":\"b [c]\"}]"), "[{\"a\":\"b [c]\"}]");
+        assert_eq!(json_payload("{\"a\":1}"), "{\"a\":1}");
+
+        // Output that never reaches JSON is preserved so error text survives.
+        assert_eq!(json_payload("ERROR: not logged in"), "ERROR: not logged in");
+        assert_eq!(json_payload(""), "");
     }
 
     #[test]

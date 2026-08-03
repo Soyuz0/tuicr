@@ -41,6 +41,30 @@ pub trait ContextProvider {
         new_path: Option<&PathBuf>,
         file_status: FileStatus,
     ) -> Result<u32>;
+
+    /// Batched [`Self::file_line_count`], one output per input in order.
+    ///
+    /// A PR open needs a count for every changed file before the first render,
+    /// so providers backed by subprocesses can collapse that into a single call.
+    /// The default keeps the per-file behaviour.
+    fn file_line_counts(&self, files: &[FileRevision]) -> Vec<Option<u32>> {
+        files
+            .iter()
+            .map(|file| {
+                self.file_line_count(file.old_path.as_ref(), file.new_path.as_ref(), file.status)
+                    .ok()
+            })
+            .collect()
+    }
+}
+
+/// One file's identity for a batched line-count lookup, mirroring the arguments
+/// of [`ContextProvider::file_line_count`].
+#[derive(Debug, Clone)]
+pub struct FileRevision {
+    pub old_path: Option<PathBuf>,
+    pub new_path: Option<PathBuf>,
+    pub status: FileStatus,
 }
 
 /// Adapter over a `VcsBackend`. Picks the appropriate display path (new on
@@ -165,6 +189,46 @@ impl ContextProvider for ForgeContextProvider<'_> {
         };
         self.forge.file_line_count(request)
     }
+
+    fn file_line_counts(&self, files: &[FileRevision]) -> Vec<Option<u32>> {
+        // Files with no usable path on the relevant side get `Some(0)` here so
+        // the result stays index-aligned with `files`, matching what
+        // `file_line_count` returns for them.
+        let mut requests = Vec::with_capacity(files.len());
+        let mut slots = Vec::with_capacity(files.len());
+        for file in files {
+            let side = ForgeFileLinesRequest::side_for_status(file.status);
+            match ForgeFileLinesRequest::path_for_side(
+                side,
+                file.old_path.as_ref(),
+                file.new_path.as_ref(),
+            ) {
+                Some(path) => {
+                    slots.push(Some(requests.len()));
+                    requests.push(ForgeFileLinesRequest {
+                        repository: self.repository.clone(),
+                        base_sha: self.base_sha.clone(),
+                        head_sha: self.head_sha.clone(),
+                        path,
+                        status: file.status,
+                        side,
+                        start_line: 0,
+                        end_line: 0,
+                    });
+                }
+                None => slots.push(None),
+            }
+        }
+
+        let counts = self.forge.file_line_counts(requests);
+        slots
+            .into_iter()
+            .map(|slot| match slot {
+                Some(index) => counts.get(index).copied().flatten(),
+                None => Some(0),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +287,114 @@ mod tests {
         ) -> Result<crate::forge::traits::GhCreateReviewResponse> {
             unimplemented!()
         }
+    }
+
+    /// Records the batch it receives and answers with each request's index, so
+    /// misalignment between inputs and outputs is detectable.
+    struct BatchingForge {
+        batch_sizes: RefCell<Vec<usize>>,
+    }
+
+    impl ForgeBackend for BatchingForge {
+        fn list_pull_requests(&self, _query: PullRequestListQuery) -> Result<PagedPullRequests> {
+            unimplemented!()
+        }
+        fn get_pull_request(&self, _target: PullRequestTarget) -> Result<PullRequestDetails> {
+            unimplemented!()
+        }
+        fn get_pull_request_diff(&self, _pr: &PullRequestDetails) -> Result<String> {
+            unimplemented!()
+        }
+        fn fetch_file_lines(&self, _request: ForgeFileLinesRequest) -> Result<Vec<DiffLine>> {
+            unimplemented!()
+        }
+        fn file_line_counts(&self, requests: Vec<ForgeFileLinesRequest>) -> Vec<Option<u32>> {
+            self.batch_sizes.borrow_mut().push(requests.len());
+            (0..requests.len())
+                .map(|index| u32::try_from(index + 100).ok())
+                .collect()
+        }
+        fn list_review_threads(
+            &self,
+            _pr: &PullRequestDetails,
+        ) -> Result<Vec<crate::forge::remote_comments::RemoteReviewThread>> {
+            Ok(Vec::new())
+        }
+        fn list_pull_request_commits(
+            &self,
+            _pr: &PullRequestDetails,
+        ) -> Result<Vec<crate::forge::traits::PullRequestCommit>> {
+            Ok(Vec::new())
+        }
+        fn get_pull_request_commit_range_diff(
+            &self,
+            _pr: &PullRequestDetails,
+            _start_sha: &str,
+            _end_sha: &str,
+        ) -> Result<String> {
+            unimplemented!()
+        }
+        fn create_review(
+            &self,
+            _pr: &PullRequestDetails,
+            _request: crate::forge::traits::CreateReviewRequest<'_>,
+        ) -> Result<crate::forge::traits::GhCreateReviewResponse> {
+            unimplemented!()
+        }
+    }
+
+    /// Files with no path on the relevant side are not sent to the backend, but
+    /// must still occupy their slot, or every later file gets another file's count.
+    #[test]
+    fn batched_counts_stay_aligned_when_some_files_have_no_path() {
+        let forge = BatchingForge {
+            batch_sizes: RefCell::new(Vec::new()),
+        };
+        let provider = ForgeContextProvider::for_pr(&forge, &key(), "basesha");
+        let files = vec![
+            FileRevision {
+                old_path: None,
+                new_path: Some(PathBuf::from("a.rs")),
+                status: FileStatus::Modified,
+            },
+            FileRevision {
+                old_path: None,
+                new_path: None,
+                status: FileStatus::Modified,
+            },
+            FileRevision {
+                old_path: None,
+                new_path: Some(PathBuf::from("b.rs")),
+                status: FileStatus::Modified,
+            },
+        ];
+
+        let counts = provider.file_line_counts(&files);
+
+        assert_eq!(
+            *forge.batch_sizes.borrow(),
+            vec![2],
+            "one batched call, skipping the pathless file"
+        );
+        assert_eq!(counts, vec![Some(100), Some(0), Some(101)]);
+    }
+
+    /// The default trait implementation must keep the documented per-file
+    /// behaviour for backends that do not batch.
+    #[test]
+    fn default_batch_falls_back_to_per_file_counts() {
+        let forge = CapturingForge {
+            seen: RefCell::new(Vec::new()),
+            response: Vec::new(),
+        };
+        let provider = ForgeContextProvider::for_pr(&forge, &key(), "basesha");
+        let counts = provider.file_line_counts(&[FileRevision {
+            old_path: None,
+            new_path: Some(PathBuf::from("a.rs")),
+            status: FileStatus::Modified,
+        }]);
+        // `CapturingForge` does not override `file_line_count`, whose default is 0.
+        assert_eq!(counts, vec![Some(0)]);
     }
 
     fn repo() -> ForgeRepository {

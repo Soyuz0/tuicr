@@ -39,14 +39,60 @@ impl App {
 
     /// Populate the file line count cache for all eligible files.
     /// Only enabled for diff sources where the worktree/index is the correct snapshot.
+    ///
+    /// This runs on the main thread during PR open, before the first render, so
+    /// it asks the provider for the whole batch in one go. The per-file loop cost
+    /// one subprocess per changed file (measured at ~1s of blocked UI for a
+    /// 167-file PR); a batching provider collapses that into a single call.
     pub(in crate::app) fn populate_file_line_count_cache(&mut self) {
         self.file_line_count_cache.clear();
-        if self.eof_gap_enabled() {
-            for file_idx in 0..self.diff_files.len() {
-                let file = &self.diff_files[file_idx];
-                if !file.hunks.is_empty() && file.status != FileStatus::Deleted {
-                    self.ensure_file_line_count_cached(file_idx);
-                }
+        if !self.eof_gap_enabled() {
+            return;
+        }
+
+        let eligible: Vec<(usize, FileRevision)> = self
+            .diff_files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| !file.hunks.is_empty() && file.status != FileStatus::Deleted)
+            .map(|(file_idx, file)| {
+                (
+                    file_idx,
+                    FileRevision {
+                        old_path: file.old_path.clone(),
+                        new_path: file.new_path.clone(),
+                        status: file.status,
+                    },
+                )
+            })
+            .collect();
+        if eligible.is_empty() {
+            return;
+        }
+
+        let revisions: Vec<FileRevision> = eligible.iter().map(|(_, file)| file.clone()).collect();
+        let counts = if let (DiffSource::PullRequest(pr), Some(backend)) =
+            (&self.diff_source, self.forge_backend.as_ref())
+        {
+            ForgeContextProvider {
+                forge: backend.as_ref(),
+                repository: pr.key.repository.clone(),
+                base_sha: pr.base_sha.clone(),
+                head_sha: pr.key.head_sha.clone(),
+            }
+            .file_line_counts(&revisions)
+        } else {
+            let ref_commit = self.ref_commit().map(str::to_string);
+            VcsContextProvider {
+                vcs: self.vcs.as_ref(),
+                ref_commit,
+            }
+            .file_line_counts(&revisions)
+        };
+
+        for ((file_idx, _), count) in eligible.into_iter().zip(counts) {
+            if let Some(count) = count {
+                self.file_line_count_cache.insert(file_idx, count);
             }
         }
     }
