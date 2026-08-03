@@ -6,6 +6,7 @@ use arboard::Clipboard;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::app::{CommentTypeDefinition, DiffSource};
+use crate::config::ExportConfig;
 use crate::error::{Result, TuicrError};
 use crate::forge::remote_comments::{
     PrCommentsVisibility, RemoteReviewThread, filter_threads, group_threads_by_path,
@@ -28,7 +29,7 @@ pub fn generate_export_content(
     session: &ReviewSession,
     diff_source: &DiffSource,
     comment_types: &[CommentTypeDefinition],
-    show_legend: bool,
+    export: &ExportConfig,
     remote_threads: &[RemoteReviewThread],
     session_slug: Option<&str>,
 ) -> Result<String> {
@@ -44,7 +45,7 @@ pub fn generate_export_content(
         session,
         diff_source,
         comment_types,
-        show_legend,
+        export,
         remote_threads,
         session_slug,
     ))
@@ -54,7 +55,7 @@ pub fn export_to_clipboard(
     session: &ReviewSession,
     diff_source: &DiffSource,
     comment_types: &[CommentTypeDefinition],
-    show_legend: bool,
+    export: &ExportConfig,
     remote_threads: &[RemoteReviewThread],
     session_slug: Option<&str>,
 ) -> Result<String> {
@@ -62,7 +63,7 @@ pub fn export_to_clipboard(
         session,
         diff_source,
         comment_types,
-        show_legend,
+        export,
         remote_threads,
         session_slug,
     )?;
@@ -224,11 +225,42 @@ fn review_scope_label(diff_source: &DiffSource) -> String {
     format!("Review Comment (scope: {scope})")
 }
 
+/// The "Reviewing …" banner for non-pull-request scopes. `None` for the
+/// working tree, which has never carried one, and for pull requests, whose
+/// banner is emitted alongside their metadata.
+fn scope_banner(diff_source: &DiffSource) -> Option<String> {
+    fn short_ids(commits: &[String]) -> String {
+        commits
+            .iter()
+            .map(|c| &c[..7.min(c.len())])
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    match diff_source {
+        DiffSource::WorkingTree | DiffSource::PullRequest(_) => None,
+        DiffSource::Staged => Some("Reviewing staged changes".to_string()),
+        DiffSource::Unstaged => Some("Reviewing unstaged changes".to_string()),
+        DiffSource::StagedAndUnstaged => Some("Reviewing staged + unstaged changes".to_string()),
+        DiffSource::CommitRange(commits) if commits.len() == 1 => Some(format!(
+            "Reviewing commit: {}",
+            &commits[0][..7.min(commits[0].len())]
+        )),
+        DiffSource::CommitRange(commits) => {
+            Some(format!("Reviewing commits: {}", short_ids(commits)))
+        }
+        DiffSource::StagedUnstagedAndCommits(commits) => Some(format!(
+            "Reviewing staged + unstaged + commits: {}",
+            short_ids(commits)
+        )),
+    }
+}
+
 fn generate_markdown(
     session: &ReviewSession,
     diff_source: &DiffSource,
     comment_types: &[CommentTypeDefinition],
-    show_legend: bool,
+    export: &ExportConfig,
     remote_threads: &[RemoteReviewThread],
     session_slug: Option<&str>,
 ) -> String {
@@ -239,66 +271,50 @@ fn generate_markdown(
         let _ = writeln!(md);
     }
 
-    // Intro for agents
-    let _ = writeln!(
-        md,
-        "I reviewed your code and have the following comments. Please address them."
-    );
-    let _ = writeln!(md);
+    // Intro for agents. An empty string drops the line and its spacer so the
+    // export opens directly on content.
+    let intro = export.intro();
+    if !intro.is_empty() {
+        let _ = writeln!(md, "{intro}");
+        let _ = writeln!(md);
+    }
 
-    // Include commit range info if reviewing commits
+    // Scope banner. `scope_line` governs the prose "what am I reviewing" line;
+    // `pr_metadata` separately governs the PR URL and head SHA, which an agent
+    // needs to fetch context even when the preamble has been trimmed away.
     match diff_source {
-        DiffSource::WorkingTree => {}
-        DiffSource::Staged => {
-            let _ = writeln!(md, "Reviewing staged changes");
-            let _ = writeln!(md);
-        }
-        DiffSource::Unstaged => {
-            let _ = writeln!(md, "Reviewing unstaged changes");
-            let _ = writeln!(md);
-        }
-        DiffSource::StagedAndUnstaged => {
-            let _ = writeln!(md, "Reviewing staged + unstaged changes");
-            let _ = writeln!(md);
-        }
-        DiffSource::CommitRange(commits) => {
-            if commits.len() == 1 {
+        DiffSource::PullRequest(pr) => {
+            let mut wrote_any = false;
+            if export.scope_line() {
                 let _ = writeln!(
                     md,
-                    "Reviewing commit: {}",
-                    &commits[0][..7.min(commits[0].len())]
+                    "Reviewing pull request {}#{}: {}",
+                    pr.key.repository.display_name(),
+                    pr.key.number,
+                    pr.title
                 );
-            } else {
-                let short_ids: Vec<&str> = commits.iter().map(|c| &c[..7.min(c.len())]).collect();
-                let _ = writeln!(md, "Reviewing commits: {}", short_ids.join(", "));
+                wrote_any = true;
             }
-            let _ = writeln!(md);
+            if export.pr_metadata() {
+                let _ = writeln!(md, "URL: {}", pr.url);
+                let _ = writeln!(md, "Head: {}", pr.key.short_head());
+                wrote_any = true;
+            }
+            if wrote_any {
+                let _ = writeln!(md);
+            }
         }
-        DiffSource::StagedUnstagedAndCommits(commits) => {
-            let short_ids: Vec<&str> = commits.iter().map(|c| &c[..7.min(c.len())]).collect();
-            let _ = writeln!(
-                md,
-                "Reviewing staged + unstaged + commits: {}",
-                short_ids.join(", ")
-            );
-            let _ = writeln!(md);
-        }
-        DiffSource::PullRequest(pr) => {
-            let short = pr.key.short_head();
-            let _ = writeln!(
-                md,
-                "Reviewing pull request {}#{}: {}",
-                pr.key.repository.display_name(),
-                pr.key.number,
-                pr.title
-            );
-            let _ = writeln!(md, "URL: {}", pr.url);
-            let _ = writeln!(md, "Head: {short}");
-            let _ = writeln!(md);
+        other => {
+            if export.scope_line()
+                && let Some(banner) = scope_banner(other)
+            {
+                let _ = writeln!(md, "{banner}");
+                let _ = writeln!(md);
+            }
         }
     }
 
-    if show_legend {
+    if export.legend() {
         let used_ids = collect_used_comment_type_ids(session);
         // The typeless `None` default never appears in the legend.
         let legend = comment_types
@@ -388,11 +404,15 @@ fn generate_markdown(
         }
     }
 
-    // Output numbered list
+    // Output numbered list. An empty header drops the heading but still marks
+    // the section as written, so the remote-section separator below survives.
     let mut local_section_written = false;
     if !all_comments.is_empty() {
-        let _ = writeln!(md, "## Local tuicr Comments");
-        let _ = writeln!(md);
+        let header = export.comments_header();
+        if !header.is_empty() {
+            let _ = writeln!(md, "{header}");
+            let _ = writeln!(md);
+        }
         local_section_written = true;
     }
     for (i, (file, line_range, side, comment_type, content, commit_id)) in
@@ -455,8 +475,11 @@ fn generate_markdown(
                 crate::forge::traits::ForgeKind::GitLab => "GitLab",
                 crate::forge::traits::ForgeKind::AzureDevOps => "Azure DevOps",
             };
-            let _ = writeln!(md, "## Existing {forge} Comments");
-            let _ = writeln!(md);
+            let remote_header = export.remote_comments_header().replace("{forge}", forge);
+            if !remote_header.is_empty() {
+                let _ = writeln!(md, "{remote_header}");
+                let _ = writeln!(md);
+            }
 
             // Group threads by file to make the export easy to scan.
             let owned_unresolved: Vec<RemoteReviewThread> =
@@ -543,6 +566,237 @@ mod tests {
     use crate::model::{Comment, CommentType, FileStatus, LineRange, LineSide, SessionDiffSource};
     use std::path::PathBuf;
 
+    /// Export settings with only the legend suppressed.
+    fn legend_off() -> ExportConfig {
+        ExportConfig {
+            legend: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// A PR session carrying one local draft comment, for exercising the
+    /// boundary between the local and remote sections.
+    fn pr_session_with_local_draft() -> ReviewSession {
+        let mut session = ReviewSession::new(
+            PathBuf::from("forge:github.com/agavra/tuicr"),
+            "abc1234deadbeef".to_string(),
+            Some("reviews".to_string()),
+            SessionDiffSource::PullRequest,
+        );
+        session.add_file(PathBuf::from("src/lib.rs"), FileStatus::Modified, 0);
+        if let Some(review) = session.get_file_mut(&PathBuf::from("src/lib.rs")) {
+            review.add_line_comment(
+                10,
+                Comment::new(
+                    "Local draft".to_string(),
+                    CommentType::from_id("issue"),
+                    Some(LineSide::New),
+                ),
+            );
+        }
+        session
+    }
+
+    #[test]
+    fn should_use_custom_comment_headers() {
+        let session = pr_session_with_local_draft();
+        let export = ExportConfig {
+            comments_header: Some("## Comments".to_string()),
+            remote_comments_header: Some("## Upstream".to_string()),
+            ..Default::default()
+        };
+
+        let markdown = generate_markdown(
+            &session,
+            &sample_pr_diff_source(),
+            &comment_types(),
+            &export,
+            &[sample_remote_thread(
+                "a",
+                "alice",
+                "Can this be simpler?",
+                42,
+                false,
+            )],
+            None,
+        );
+
+        assert!(markdown.contains("## Comments"));
+        assert!(markdown.contains("## Upstream"));
+        assert!(!markdown.contains("## Local tuicr Comments"));
+        assert!(!markdown.contains("## Existing GitHub Comments"));
+    }
+
+    #[test]
+    fn should_keep_remote_separator_when_comments_header_is_empty() {
+        // Dropping the local heading must not swallow the blank line that
+        // separates the numbered list from the remote section.
+        let session = pr_session_with_local_draft();
+        let export = ExportConfig {
+            comments_header: Some(String::new()),
+            ..Default::default()
+        };
+
+        let markdown = generate_markdown(
+            &session,
+            &sample_pr_diff_source(),
+            &comment_types(),
+            &export,
+            &[sample_remote_thread(
+                "a",
+                "alice",
+                "Can this be simpler?",
+                42,
+                false,
+            )],
+            None,
+        );
+
+        assert!(!markdown.contains("## Local tuicr Comments"));
+        assert!(
+            markdown.contains("\n\n## Existing GitHub Comments"),
+            "expected a blank line before the remote header in:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn should_omit_scope_line_when_disabled() {
+        let session = create_test_session();
+        let export = ExportConfig {
+            scope_line: Some(false),
+            ..Default::default()
+        };
+
+        let markdown = generate_markdown(
+            &session,
+            &DiffSource::Unstaged,
+            &comment_types(),
+            &export,
+            &[],
+            None,
+        );
+
+        assert!(!markdown.contains("Reviewing unstaged changes"));
+    }
+
+    #[test]
+    fn should_keep_pr_metadata_when_scope_line_disabled() {
+        // URL and head SHA are addressable context an agent needs, not
+        // preamble framing, so trimming the scope line must not drop them.
+        let session = create_test_session();
+        let export = ExportConfig {
+            scope_line: Some(false),
+            ..Default::default()
+        };
+
+        let markdown = generate_markdown(
+            &session,
+            &sample_pr_diff_source(),
+            &comment_types(),
+            &export,
+            &[],
+            None,
+        );
+
+        assert!(!markdown.contains("Reviewing pull request"));
+        assert!(markdown.contains("URL: https://github.com/agavra/tuicr/pull/125"));
+        assert!(markdown.contains("Head: "));
+    }
+
+    #[test]
+    fn should_omit_pr_metadata_when_disabled_but_keep_scope_line() {
+        let session = create_test_session();
+        let export = ExportConfig {
+            pr_metadata: Some(false),
+            ..Default::default()
+        };
+
+        let markdown = generate_markdown(
+            &session,
+            &sample_pr_diff_source(),
+            &comment_types(),
+            &export,
+            &[],
+            None,
+        );
+
+        assert!(markdown.contains("Reviewing pull request agavra/tuicr#125"));
+        assert!(!markdown.contains("URL: "));
+        assert!(!markdown.contains("Head: "));
+    }
+
+    #[test]
+    fn should_omit_pr_banner_and_spacer_when_scope_and_metadata_disabled() {
+        let session = create_test_session();
+        let export = ExportConfig {
+            intro: Some(String::new()),
+            scope_line: Some(false),
+            pr_metadata: Some(false),
+            ..Default::default()
+        };
+
+        let markdown = generate_markdown(
+            &session,
+            &sample_pr_diff_source(),
+            &comment_types(),
+            &export,
+            &[],
+            None,
+        );
+
+        assert!(!markdown.contains("Reviewing pull request"));
+        assert!(!markdown.contains("URL: "));
+        assert!(
+            !markdown.starts_with('\n'),
+            "the banner's trailing blank line should go with it, got:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn should_use_custom_export_intro() {
+        let session = create_test_session();
+        let export = ExportConfig {
+            intro: Some("Code review comments:".to_string()),
+            ..Default::default()
+        };
+
+        let markdown = generate_markdown(
+            &session,
+            &DiffSource::WorkingTree,
+            &comment_types(),
+            &export,
+            &[],
+            None,
+        );
+
+        assert!(markdown.contains("Code review comments:"));
+        assert!(!markdown.contains("I reviewed your code"));
+    }
+
+    #[test]
+    fn should_omit_export_intro_and_its_spacer_when_empty() {
+        let session = create_test_session();
+        let export = ExportConfig {
+            intro: Some(String::new()),
+            ..Default::default()
+        };
+
+        let markdown = generate_markdown(
+            &session,
+            &DiffSource::WorkingTree,
+            &comment_types(),
+            &export,
+            &[],
+            None,
+        );
+
+        assert!(!markdown.contains("I reviewed your code"));
+        assert!(
+            !markdown.starts_with('\n'),
+            "the intro's trailing blank line should go with it, got:\n{markdown}"
+        );
+    }
+
     fn comment_types() -> Vec<CommentTypeDefinition> {
         vec![
             CommentTypeDefinition {
@@ -611,7 +865,7 @@ mod tests {
             &session,
             &diff_source,
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &[],
             Some("agavra/tuicr@main/worktree"),
         );
@@ -627,7 +881,14 @@ mod tests {
         let session = create_test_session();
         let diff_source = DiffSource::WorkingTree;
 
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         assert!(!markdown.contains("## Session:"));
     }
@@ -639,7 +900,14 @@ mod tests {
         let diff_source = DiffSource::WorkingTree;
 
         // when
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(markdown.contains("I reviewed your code and have the following comments"));
@@ -695,7 +963,14 @@ mod tests {
 
         let diff_source =
             DiffSource::CommitRange(vec!["ed50028".to_string(), "c17beb2".to_string()]);
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         assert!(
             markdown.contains("`Commit Message (ed50028):1`"),
@@ -735,7 +1010,7 @@ mod tests {
             &session,
             &DiffSource::WorkingTree,
             &custom_types,
-            true,
+            &ExportConfig::default(),
             &[],
             None,
         );
@@ -751,7 +1026,14 @@ mod tests {
         let diff_source = DiffSource::WorkingTree;
 
         // when
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         // Should have 2 numbered comments
@@ -780,7 +1062,7 @@ mod tests {
             &session,
             &DiffSource::WorkingTree,
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &[],
             None,
         );
@@ -823,7 +1105,7 @@ mod tests {
             &session,
             &DiffSource::WorkingTree,
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &[],
             None,
         );
@@ -851,7 +1133,7 @@ mod tests {
             &session,
             &DiffSource::WorkingTree,
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &[],
             None,
         );
@@ -873,7 +1155,7 @@ mod tests {
             &session,
             &DiffSource::CommitRange(vec!["abc1234567890".to_string()]),
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &[],
             None,
         );
@@ -903,7 +1185,7 @@ mod tests {
             &session,
             &DiffSource::CommitRange(vec!["abc1234567890".to_string()]),
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &[],
             None,
         );
@@ -922,7 +1204,7 @@ mod tests {
             &session,
             &DiffSource::WorkingTree,
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &[],
             None,
         );
@@ -946,7 +1228,14 @@ mod tests {
         let diff_source = DiffSource::WorkingTree;
 
         // when
-        let result = export_to_clipboard(&session, &diff_source, &comment_types(), true, &[], None);
+        let result = export_to_clipboard(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(result.is_err());
@@ -960,8 +1249,14 @@ mod tests {
         let diff_source = DiffSource::WorkingTree;
 
         // when
-        let result =
-            generate_export_content(&session, &diff_source, &comment_types(), true, &[], None);
+        let result = generate_export_content(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(result.is_ok());
@@ -983,8 +1278,14 @@ mod tests {
         let diff_source = DiffSource::WorkingTree;
 
         // when
-        let result =
-            generate_export_content(&session, &diff_source, &comment_types(), true, &[], None);
+        let result = generate_export_content(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(result.is_err());
@@ -1001,7 +1302,14 @@ mod tests {
         ]);
 
         // when
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(markdown.contains("Reviewing commits: abc1234, def4567"));
@@ -1014,7 +1322,14 @@ mod tests {
         let diff_source = DiffSource::CommitRange(vec!["abc1234567890".to_string()]);
 
         // when
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(markdown.contains("Reviewing commit: abc1234"));
@@ -1075,7 +1390,14 @@ mod tests {
         // given - simulate what would be copied during export
         let session = create_test_session();
         let diff_source = DiffSource::WorkingTree;
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
         let mut buffer: Vec<u8> = Vec::new();
 
         // when
@@ -1117,7 +1439,14 @@ mod tests {
         let diff_source = DiffSource::WorkingTree;
 
         // when
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(markdown.contains("`src/main.rs:42`"));
@@ -1150,7 +1479,14 @@ mod tests {
         let diff_source = DiffSource::WorkingTree;
 
         // when
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(markdown.contains("`src/main.rs:10-15`"));
@@ -1183,7 +1519,14 @@ mod tests {
         let diff_source = DiffSource::WorkingTree;
 
         // when
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(markdown.contains("`src/main.rs:~20-~25`"));
@@ -1215,7 +1558,14 @@ mod tests {
         let diff_source = DiffSource::WorkingTree;
 
         // when
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(markdown.contains("`src/main.rs:~30`"));
@@ -1247,19 +1597,32 @@ mod tests {
         let diff_source = DiffSource::WorkingTree;
 
         // when
-        let markdown = generate_markdown(&session, &diff_source, &comment_types(), true, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[],
+            None,
+        );
 
         // then
         assert!(markdown.contains("`src/main.rs:50`"));
     }
 
     #[test]
-    fn should_omit_legend_when_show_legend_is_false() {
+    fn should_omit_legend_when_legend_is_disabled() {
         let session = create_test_session();
         let diff_source = DiffSource::WorkingTree;
 
-        let markdown =
-            generate_markdown(&session, &diff_source, &comment_types(), false, &[], None);
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &legend_off(),
+            &[],
+            None,
+        );
 
         assert!(!markdown.contains("Comment types:"));
         assert!(markdown.contains("[SUGGESTION]"));
@@ -1287,7 +1650,7 @@ mod tests {
             &session,
             &DiffSource::WorkingTree,
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &[],
             None,
         );
@@ -1330,7 +1693,7 @@ mod tests {
             &session,
             &DiffSource::WorkingTree,
             &none_only,
-            true,
+            &ExportConfig::default(),
             &[],
             None,
         );
@@ -1430,7 +1793,7 @@ mod tests {
             &session,
             &sample_pr_diff_source(),
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &threads,
             None,
         );
@@ -1450,6 +1813,49 @@ mod tests {
     }
 
     #[test]
+    fn should_use_azure_name_and_range_in_default_remote_thread_export() {
+        use crate::forge::traits::ForgeRepository;
+
+        let session = ReviewSession::new(
+            PathBuf::from("forge:dev.azure.com/acme/widgets/service"),
+            "abc1234deadbeef".to_string(),
+            Some("reviews".to_string()),
+            SessionDiffSource::PullRequest,
+        );
+        let mut diff_source = sample_pr_diff_source();
+        let DiffSource::PullRequest(pr) = &mut diff_source else {
+            unreachable!("sample source is a pull request")
+        };
+        pr.key.repository = ForgeRepository::azure_devops(
+            "dev.azure.com",
+            "acme",
+            "https://dev.azure.com/acme",
+            "widgets",
+            "service",
+        );
+        let mut thread = sample_remote_thread("a", "alice", "Please adjust this range", 42, false);
+        thread.start_line = Some(40);
+
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &ExportConfig::default(),
+            &[thread],
+            None,
+        );
+
+        assert!(
+            markdown.contains("## Existing Azure DevOps Comments"),
+            "unexpected Azure export:\n{markdown}"
+        );
+        assert!(
+            markdown.contains("`src/lib.rs:40-42`"),
+            "missing range anchor in:\n{markdown}"
+        );
+    }
+
+    #[test]
     fn should_export_pr_remote_threads_even_when_no_local_drafts() {
         // given a PR session with no local comments but one unresolved remote thread
         let session = ReviewSession::new(
@@ -1465,7 +1871,7 @@ mod tests {
             &session,
             &sample_pr_diff_source(),
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &threads,
             None,
         );
@@ -1503,7 +1909,7 @@ mod tests {
             &session,
             &DiffSource::WorkingTree,
             &comment_types(),
-            true,
+            &ExportConfig::default(),
             &threads,
             None,
         );
@@ -1548,7 +1954,7 @@ mod tests {
             &session,
             &DiffSource::WorkingTree,
             &custom_types,
-            true,
+            &ExportConfig::default(),
             &[],
             None,
         );

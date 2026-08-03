@@ -83,6 +83,7 @@ Shown below the file tree when local comments or visible remote PR threads exist
 | `dd` | Delete comment at cursor |
 | `i` | Edit comment at cursor (vim: text cursor at start) |
 | `A` | Edit comment at cursor with text cursor at end (vim mode only) |
+| `e` | Open focused file in `$EDITOR` |
 | `y` | Copy review to clipboard |
 
 ## Visual mode
@@ -139,6 +140,8 @@ In command mode,
 | `:submit draft` | Submit a private pending Draft review (hidden when unsupported, including Azure DevOps) |
 | `:set wrap` | Enable line wrap in diff view |
 | `:set wrap!` | Toggle line wrap in diff view |
+| `:set relativenumber` / `:set norelativenumber` | Enable / disable relative rendered-row numbers |
+| `:set relativenumber!` | Toggle relative rendered-row numbers |
 | `:set commits` | Show inline commit selector |
 | `:set nocommits` | Hide inline commit selector |
 | `:set commits!` | Toggle inline commit selector |

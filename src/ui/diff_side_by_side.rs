@@ -166,6 +166,16 @@ impl SideBySideContext<'_> {
     fn is_visible(&self, line_idx: usize) -> bool {
         line_idx >= self.visible_start && line_idx < self.visible_end
     }
+
+    fn display_lineno(&self, source_line: Option<u32>, line_idx: usize) -> Option<u32> {
+        source_line.map(|line| {
+            if self.app.relative_line_numbers {
+                line_idx.abs_diff(self.current_line_idx) as u32
+            } else {
+                line
+            }
+        })
+    }
 }
 
 pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -237,6 +247,13 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
     let is_review_comment_mode =
         app.input_mode == InputMode::Comment && app.comment_is_review_level;
 
+    crate::ui::pr_info_panel::append_pr_info_section(
+        app,
+        &mut lines,
+        &mut line_idx,
+        ctx.current_line_idx,
+    );
+
     // The `═══ Review Comments ═══` label is redundant in single-file
     // view -- see the matching guard in `src/ui/diff_unified.rs`.
     if !app.is_single_file_view {
@@ -247,7 +264,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
                 styles::current_line_indicator_style(&app.theme),
             ),
             Span::styled(
-                "═══ Review Comments ",
+                crate::ui::diff_view::REVIEW_COMMENTS_HEADER_PREFIX,
                 styles::file_header_style(&app.theme),
             ),
             Span::styled(
@@ -390,6 +407,14 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
         }
     }
 
+    crate::ui::pr_info_panel::append_issue_comments_section(
+        app,
+        &mut lines,
+        &mut line_idx,
+        ctx.current_line_idx,
+        ctx.panel_width.saturating_sub(1),
+    );
+
     for (file_idx, file) in app.diff_files.iter().enumerate() {
         // Single-file view: hide everything except the cursor's file. See
         // src/ui/diff_unified.rs for the matching guard.
@@ -397,17 +422,11 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
             continue;
         }
         let path = file.display_path();
-        let status = file.status.as_char();
         let is_reviewed = app.session.is_file_reviewed(path);
 
         if !app.is_single_file_view {
             let indicator = cursor_indicator_spaced(line_idx, ctx.current_line_idx);
-            let review_mark = if is_reviewed { "✓ " } else { "" };
-            let header_text = if file.is_commit_message {
-                format!("═══ {}{} ", review_mark, path.display())
-            } else {
-                format!("═══ {}{} [{}] ", review_mark, path.display(), status)
-            };
+            let header_text = crate::ui::diff_view::file_header_prefix_text(app, file);
             lines.push(Line::from(vec![
                 Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
                 Span::styled(header_text, styles::file_header_style(&app.theme)),
@@ -575,25 +594,14 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
             }
         }
 
-        if file.is_too_large {
+        if file.is_too_large || file.is_binary || file.hunks.is_empty() {
             let indicator = cursor_indicator_spaced(line_idx, ctx.current_line_idx);
             lines.push(Line::from(vec![
                 Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
-                Span::styled("(file too large to display)", styles::dim_style(&app.theme)),
-            ]));
-            line_idx += 1;
-        } else if file.is_binary {
-            let indicator = cursor_indicator_spaced(line_idx, ctx.current_line_idx);
-            lines.push(Line::from(vec![
-                Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
-                Span::styled("(binary file)", styles::dim_style(&app.theme)),
-            ]));
-            line_idx += 1;
-        } else if file.hunks.is_empty() {
-            let indicator = cursor_indicator_spaced(line_idx, ctx.current_line_idx);
-            lines.push(Line::from(vec![
-                Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
-                Span::styled("(no changes)", styles::dim_style(&app.theme)),
+                Span::styled(
+                    crate::ui::diff_view::binary_or_empty_label(file),
+                    styles::dim_style(&app.theme),
+                ),
             ]));
             line_idx += 1;
         } else {
@@ -1044,12 +1052,12 @@ fn render_sbs_expanded_context_line(
     let lw = ctx.lineno_width;
     let content_width = ctx.content_width;
     let indicator = cursor_indicator(*line_idx, ctx.current_line_idx);
-    let old_line_num = expanded_line
-        .old_lineno
+    let old_line_num = ctx
+        .display_lineno(expanded_line.old_lineno, *line_idx)
         .map(|n| format!("{n:>lw$} "))
         .unwrap_or_else(|| " ".repeat(lw + 1));
-    let new_line_num = expanded_line
-        .new_lineno
+    let new_line_num = ctx
+        .display_lineno(expanded_line.new_lineno, *line_idx)
         .map(|n| format!("{n:>lw$} "))
         .unwrap_or_else(|| " ".repeat(lw + 1));
     let ec_style = styles::expanded_context_style(theme);
@@ -1203,12 +1211,12 @@ fn render_context_line_side_by_side(
 ) -> (usize, Option<SideBySideCursorInfo>) {
     if ctx.is_visible(line_idx) {
         let w = ctx.lineno_width;
-        let old_line_num = diff_line
-            .old_lineno
+        let old_line_num = ctx
+            .display_lineno(diff_line.old_lineno, line_idx)
             .map(|n| format!("{n:>w$}"))
             .unwrap_or_else(|| " ".repeat(w));
-        let new_line_num = diff_line
-            .new_lineno
+        let new_line_num = ctx
+            .display_lineno(diff_line.new_lineno, line_idx)
             .map(|n| format!("{n:>w$}"))
             .unwrap_or_else(|| " ".repeat(w));
 
@@ -1265,12 +1273,12 @@ fn render_context_line_side_by_side(
             ctx.theme,
             indicator,
             SideSpec {
-                lineno: diff_line.old_lineno,
+                lineno: ctx.display_lineno(diff_line.old_lineno, line_idx),
                 marker: " ",
                 marker_style: ctx_style,
             },
             SideSpec {
-                lineno: diff_line.new_lineno,
+                lineno: ctx.display_lineno(diff_line.new_lineno, line_idx),
                 marker: " ",
                 marker_style: ctx_style,
             },
@@ -1370,6 +1378,7 @@ fn render_deletion_addition_pair_side_by_side(
                     del_line,
                     ctx.content_width,
                     ctx.lineno_width,
+                    ctx.display_lineno(del_line.old_lineno, line_idx),
                 );
             } else {
                 add_empty_column_spans(&mut spans, ctx.content_width, ctx.lineno_width);
@@ -1385,6 +1394,7 @@ fn render_deletion_addition_pair_side_by_side(
                     add_line,
                     ctx.content_width,
                     ctx.lineno_width,
+                    ctx.display_lineno(add_line.new_lineno, line_idx),
                 );
             } else {
                 add_empty_column_spans(&mut spans, ctx.content_width, ctx.lineno_width);
@@ -1399,7 +1409,7 @@ fn render_deletion_addition_pair_side_by_side(
                         content_spans_for_diff_line(ctx.theme, dl, LineOrigin::Deletion),
                         column_pad_style(ctx.theme, dl, LineOrigin::Deletion),
                         "▌",
-                        dl.old_lineno,
+                        ctx.display_lineno(dl.old_lineno, line_idx),
                         styles::diff_del_style(ctx.theme),
                     ),
                     None => (Vec::new(), Style::default(), " ", None, Style::default()),
@@ -1410,7 +1420,7 @@ fn render_deletion_addition_pair_side_by_side(
                         content_spans_for_diff_line(ctx.theme, al, LineOrigin::Addition),
                         column_pad_style(ctx.theme, al, LineOrigin::Addition),
                         "▌",
-                        al.new_lineno,
+                        ctx.display_lineno(al.new_lineno, line_idx),
                         styles::diff_add_style(ctx.theme),
                     ),
                     None => (Vec::new(), Style::default(), " ", None, Style::default()),
@@ -1533,6 +1543,7 @@ fn render_standalone_addition_side_by_side(
             diff_line,
             ctx.content_width,
             ctx.lineno_width,
+            ctx.display_lineno(diff_line.new_lineno, line_idx),
         );
 
         lines.push(Line::from(spans));
@@ -1549,7 +1560,7 @@ fn render_standalone_addition_side_by_side(
                 marker_style: Style::default(),
             },
             SideSpec {
-                lineno: diff_line.new_lineno,
+                lineno: ctx.display_lineno(diff_line.new_lineno, line_idx),
                 marker: "▌",
                 marker_style: styles::diff_add_style(ctx.theme),
             },
@@ -1667,9 +1678,9 @@ fn add_deletion_spans(
     diff_line: &crate::model::DiffLine,
     content_width: usize,
     lw: usize,
+    display_lineno: Option<u32>,
 ) {
-    let line_num = diff_line
-        .old_lineno
+    let line_num = display_lineno
         .map(|n| format!("{n:>lw$}"))
         .unwrap_or_else(|| " ".repeat(lw));
 
@@ -1698,9 +1709,9 @@ fn add_addition_spans(
     diff_line: &crate::model::DiffLine,
     content_width: usize,
     lw: usize,
+    display_lineno: Option<u32>,
 ) {
-    let line_num = diff_line
-        .new_lineno
+    let line_num = display_lineno
         .map(|n| format!("{n:>lw$}"))
         .unwrap_or_else(|| " ".repeat(lw));
 

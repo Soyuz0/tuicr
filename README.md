@@ -26,7 +26,7 @@
 ```bash
 curl -fsSL tuicr.dev/install.sh | sh
 # or
-brew install agavra/tap/tuicr
+brew install tuicr
 ```
 
 <details>
@@ -159,8 +159,8 @@ I reviewed your code and have the following comments. Please address them.
 
 Paste it back to any coding agent (Claude, Codex, Cursor, etc).
 
-For an agent-driven workflow where your agent opens tuicr in a tmux split pane, see
-[skills/tuicr/SKILL.md](skills/tuicr/SKILL.md).
+For an agent-driven workflow where your agent opens tuicr in a tmux, Zellij, or Herdr
+split pane, see [skills/tuicr/SKILL.md](skills/tuicr/SKILL.md).
 
 ### To stdout
 
@@ -222,6 +222,7 @@ appearance = "system"        # or "dark" / "light"
 mouse = true
 leader = ";"                  # configurable prefix for leader shortcuts
 comment_vim = false           # vim modal editing in the review comment box
+relative_line_numbers = false # show rendered-row distances in the diff gutter
 review_watch_interval_ms = 1000 # set to 0 to disable persisted-review polling
 
 [[comment_types]]
@@ -263,6 +264,7 @@ A first-session cheatsheet. Press `?` inside tuicr for the full reference.
 | `v` / `V` | Visual mode (range comment) |
 | `r` | Toggle file reviewed |
 | `R` | Toggle hunk reviewed |
+| `e` | Open focused file in `$EDITOR` |
 | `y` | Copy review to clipboard |
 | `:edit` | Open focused file in `$EDITOR` |
 | `:submit` | Push review to GitHub, GitLab, or Azure DevOps |

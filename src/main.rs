@@ -297,15 +297,14 @@ fn main() -> anyhow::Result<()> {
         if let Some(wrap) = cfg.wrap {
             app.diff_state.wrap_lines = wrap;
         }
+        app.relative_line_numbers = cfg.relative_line_numbers.unwrap_or(false);
         // Open in single-file view when the user opts in. Pristine
         // `--all-files` already turned it on inside `App::new`, so we
         // only toggle if it's still off.
         if cfg.single_file_view == Some(true) && !app.is_single_file_view {
             app.toggle_single_file_view();
         }
-        if cfg.export_legend == Some(false) {
-            app.export_legend = false;
-        }
+        app.export = cfg.resolved_export();
         if cfg.cursor_line == Some(false) {
             app.cursor_line_highlight = false;
         }

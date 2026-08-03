@@ -439,6 +439,13 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled(
+                "  e         ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Open focused file in $EDITOR"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "  v/V       ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
@@ -717,6 +724,20 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw("  Push a pending review (unavailable on Azure DevOps)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  :set relativenumber[!]",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  Enable/toggle relative rendered-row numbers"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  :set norelativenumber",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  Disable relative rendered-row numbers"),
         ]),
         Line::from(vec![
             Span::styled(

@@ -6,7 +6,7 @@ use chrono::Utc;
 use ratatui::style::Color;
 
 use crate::comment_vim::CommentVimEditor;
-use crate::config::CommentTypeConfig;
+use crate::config::{CommentTypeConfig, ExportConfig};
 use crate::editor::EditorTarget;
 use crate::error::{Result, TuicrError};
 use crate::forge::context::{ContextProvider, ForgeContextProvider, VcsContextProvider};
@@ -120,7 +120,7 @@ fn profile_unit_result(result: &Result<()>) -> String {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileTreeItem {
     Directory {
         path: String,
@@ -258,6 +258,12 @@ pub enum GapCursorHit {
 /// Describes what a rendered line represents - built once and used for O(1) cursor queries
 #[derive(Debug, Clone)]
 pub enum AnnotatedLine {
+    /// A rendered line of [`App::pr_info`] content
+    PrInfoLine { line_idx: usize },
+    /// Top-level PR conversation comments section header
+    IssueCommentsHeader,
+    /// A rendered line of a top-level PR issue comment box
+    IssueComment { comment_idx: usize },
     /// Review comments section header line
     ReviewCommentsHeader,
     /// A review-level comment line (part of a multi-line comment box)
@@ -442,7 +448,10 @@ pub fn annotation_file_idx(annotation: &AnnotatedLine) -> Option<usize> {
         | AnnotatedLine::SideBySideLine { file_idx, .. }
         | AnnotatedLine::LineComment { file_idx, .. }
         | AnnotatedLine::BinaryOrEmpty { file_idx } => Some(*file_idx),
-        AnnotatedLine::ReviewCommentsHeader
+        AnnotatedLine::PrInfoLine { .. }
+        | AnnotatedLine::IssueCommentsHeader
+        | AnnotatedLine::IssueComment { .. }
+        | AnnotatedLine::ReviewCommentsHeader
         | AnnotatedLine::ReviewComment { .. }
         | AnnotatedLine::RemoteReviewSummaryLine { .. }
         | AnnotatedLine::Expander { .. }
@@ -788,6 +797,7 @@ pub enum PrOpenEvent {
                 String,
                 Vec<crate::forge::traits::PullRequestCommit>,
                 crate::forge::traits::PullRequestReviewMetadata,
+                crate::forge::traits::PullRequestInfo,
             ),
             String,
         >,
@@ -815,6 +825,7 @@ pub struct PrReloadRequest {
     pub head_sha: String,
     pub started_at: Instant,
     pub anchor: Option<PrCursorAnchor>,
+    pub restore_overview_cursor: Option<usize>,
 }
 
 /// Result delivered from the PR-reload background thread.
@@ -828,6 +839,7 @@ pub enum PrReloadEvent {
                 String,
                 Vec<crate::forge::traits::PullRequestCommit>,
                 crate::forge::traits::PullRequestReviewMetadata,
+                crate::forge::traits::PullRequestInfo,
             ),
             String,
         >,
@@ -1030,6 +1042,7 @@ pub struct App {
     pub input_mode: InputMode,
     pub focused_panel: FocusedPanel,
     pub diff_view_mode: DiffViewMode,
+    pub relative_line_numbers: bool,
 
     pub file_list_state: FileListState,
     pub comment_navigator_state: CommentNavigatorState,
@@ -1168,6 +1181,8 @@ pub struct App {
     /// open-time head so the stale-head warning never fires; PR 6 may refresh
     /// it via a pre-submit `gh pr view` to power the warning.
     pub current_pr_head: Option<String>,
+    /// Extended PR metadata rendered at the top of the diff view. Populated in PR mode.
+    pub pr_info: Option<crate::forge::traits::PullRequestInfo>,
 
     pub should_quit: bool,
     pub dirty: bool,
@@ -1282,8 +1297,8 @@ pub struct App {
     pub saved_inline_selection: Option<(usize, usize)>,
     /// Path filter for scoping diff to a specific file or directory
     pub path_filter: Option<String>,
-    /// Whether to include the "Comment types:" legend line in export
-    pub export_legend: bool,
+    /// Resolved `[export]` settings shaping the generated review markdown.
+    pub export: ExportConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
