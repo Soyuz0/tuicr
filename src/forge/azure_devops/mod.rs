@@ -527,6 +527,17 @@ where
                 })?;
             }
         }
+        // Three-dot: diff from the merge base of the two commits, not between
+        // their tips. Azure's UI diffs a PR against the iteration's
+        // `commonRefCommit` (the merge base), so a two-dot diff against the
+        // target branch tip also reported every commit merged into the target
+        // since the branch diverged -- as reversed changes. On a real PR that
+        // turned 40 changed files into 167.
+        //
+        // For a commit subrange `start_sha` is already an ancestor of
+        // `end_sha`, so the merge base is `start_sha` and this is equivalent to
+        // the two-dot form.
+        let range = format!("{start_sha}...{end_sha}");
         run_git(
             root,
             &[
@@ -536,11 +547,25 @@ where
                 "--no-color",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
-                start_sha,
-                end_sha,
+                &range,
             ],
         )
         .map_err(|error| TuicrError::Forge(format!("Azure DevOps local Git diff failed: {error}")))
+    }
+
+    /// Resolve the merge base that the diff's `a/` side actually refers to.
+    ///
+    /// Azure reports `lastMergeTargetCommit` (the target branch tip) as the
+    /// base, but the diff is taken from the merge base. Leaving `base_sha` at the
+    /// tip made base-side context expansion read the wrong revision for any file
+    /// that also changed on the target branch. Best-effort: on failure the
+    /// caller keeps Azure's value, and the diff stays correct regardless because
+    /// [`Self::immutable_diff`] recomputes the merge base itself.
+    fn resolve_merge_base(&self, pr: &PullRequestDetails) -> Option<String> {
+        let root = self.matching_checkout(&pr.repository)?;
+        let merge_base = run_git(root, &["merge-base", &pr.base_sha, &pr.head_sha]).ok()?;
+        let merge_base = merge_base.trim();
+        (!merge_base.is_empty()).then(|| merge_base.to_string())
     }
 
     pub(crate) fn refetch_pull_request(
@@ -640,7 +665,15 @@ where
                 )));
             }
         }
-        pull_request.into_details(&repository)
+        let mut details = pull_request.into_details(&repository)?;
+        // Azure reports the target branch tip as the base; the diff is actually
+        // taken from the merge base. Record the merge base so `base_sha` names
+        // the revision the diff's `a/` side really is, matching GitLab's
+        // `diff_refs.base_sha` semantics.
+        if let Some(merge_base) = self.resolve_merge_base(&details) {
+            details.base_sha = merge_base;
+        }
+        Ok(details)
     }
 
     fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<String> {
@@ -1342,6 +1375,88 @@ mod tests {
         assert!(skip_batch_record(b"oid blob 100\nshort\n", 0).is_none());
     }
 
+    /// A PR diff must show only what the PR changes, even when the target branch
+    /// has moved on. Azure's UI diffs against the iteration's `commonRefCommit`
+    /// (the merge base); diffing against the target tip instead also reports
+    /// every commit merged into the target since the branch diverged, as
+    /// reversed changes. On a real 40-file PR that produced 167 files.
+    #[cfg(unix)]
+    #[test]
+    fn pr_diff_excludes_target_branch_commits_after_divergence() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let git_repository = git2::Repository::init(&checkout).unwrap();
+        git_repository
+            .remote(
+                "origin",
+                "https://dev.azure.com/neutral-org/neutral-project/_git/neutral-repo",
+            )
+            .unwrap();
+        let signature = git2::Signature::now("t", "t@example.invalid").unwrap();
+
+        let commit = |parent: Option<git2::Oid>, files: &[(&str, &str)]| -> git2::Oid {
+            let mut builder = git_repository.treebuilder(None).unwrap();
+            for (path, contents) in files {
+                let blob = git_repository.blob(contents.as_bytes()).unwrap();
+                builder.insert(path, blob, 0o100_644).unwrap();
+            }
+            let tree = git_repository.find_tree(builder.write().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = parent
+                .map(|oid| git_repository.find_commit(oid).unwrap())
+                .into_iter()
+                .collect();
+            let borrowed: Vec<&git2::Commit> = parents.iter().collect();
+            git_repository
+                .commit(None, &signature, &signature, "c", &tree, &borrowed)
+                .unwrap()
+        };
+
+        // Shared history, then the branch and the target diverge.
+        let root = commit(None, &[("shared.txt", "shared\n")]);
+        // The PR touches only `feature.txt`.
+        let head = commit(
+            Some(root),
+            &[("shared.txt", "shared\n"), ("feature.txt", "feature\n")],
+        );
+        // Meanwhile the target branch gains an unrelated file and edits another.
+        let target = commit(
+            Some(root),
+            &[
+                ("shared.txt", "changed on target\n"),
+                ("other.txt", "other\n"),
+            ],
+        );
+
+        let backend = AzureDevOpsBackend::with_runner(None, FakeRunner::default())
+            .with_local_checkout(Some(checkout));
+        let mut pr = details(7);
+        pr.base_sha = target.to_string();
+        pr.head_sha = head.to_string();
+
+        let diff = backend.get_pull_request_diff(&pr).unwrap();
+        let changed: Vec<&str> = diff
+            .lines()
+            .filter_map(|line| line.strip_prefix("+++ b/"))
+            .collect();
+        assert_eq!(
+            changed,
+            ["feature.txt"],
+            "only the PR's own change may appear; got diff:\n{diff}"
+        );
+        assert!(
+            !diff.contains("other.txt") && !diff.contains("changed on target"),
+            "target-branch commits must not leak into the PR diff:\n{diff}"
+        );
+
+        // `base_sha` must name the merge base, so base-side context expansion
+        // reads the revision the diff's `a/` side actually refers to.
+        assert_eq!(
+            backend.resolve_merge_base(&pr).as_deref(),
+            Some(root.to_string().as_str())
+        );
+    }
+
     /// End-to-end check of the batched path against real `git cat-file --batch`
     /// output, covering the cases that break naive parsing: a file without a
     /// trailing newline, an empty file, binary content containing `0xFF` (which
@@ -1685,6 +1800,9 @@ fi
             ]
         );
         assert_eq!(calls[3], ["cat-file", "-e", "missing^{commit}"]);
+        // Three-dot: the diff must start at the merge base, not the target tip,
+        // or every commit merged into the target since the branch diverged shows
+        // up as a reversed change.
         assert_eq!(
             calls[4],
             [
@@ -1694,8 +1812,7 @@ fi
                 "--no-color",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
-                "base",
-                "missing"
+                "base...missing"
             ]
         );
         assert!(!calls.iter().flatten().any(|argument| matches!(
