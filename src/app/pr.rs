@@ -1128,6 +1128,149 @@ impl App {
         self.spawn_pr_threads_fetch(&details, local_checkout);
     }
 
+    /// Toggle the resolved state of the remote review thread under the cursor.
+    ///
+    /// Returns the message to show the user, or an error when there is nothing
+    /// to act on. The forge write runs on a background thread; local state is
+    /// only flipped once the forge confirms it, in `poll_pr_resolve_events`.
+    pub fn toggle_remote_thread_resolved_at_cursor(&mut self) -> Result<String> {
+        if self.pr_resolve_rx.is_some() {
+            return Err(TuicrError::UnsupportedOperation(
+                "A resolve request is already in flight".to_string(),
+            ));
+        }
+        let DiffSource::PullRequest(pr) = &self.diff_source else {
+            return Err(TuicrError::UnsupportedOperation(
+                "Resolving review threads requires PR review mode".to_string(),
+            ));
+        };
+        let Some(thread_idx) = self.remote_thread_idx_at_cursor() else {
+            return Err(TuicrError::UnsupportedOperation(
+                "No remote review thread at the cursor".to_string(),
+            ));
+        };
+        let Some(thread) = self.forge_review_threads.get(thread_idx) else {
+            return Err(TuicrError::UnsupportedOperation(
+                "No remote review thread at the cursor".to_string(),
+            ));
+        };
+
+        let thread_id = thread.id.clone();
+        let resolved = !thread.is_resolved;
+        let details = crate::forge::traits::PullRequestDetails {
+            repository: pr.key.repository.clone(),
+            number: pr.key.number,
+            title: pr.title.clone(),
+            url: pr.url.clone(),
+            state: pr.state.clone(),
+            is_draft: false,
+            author: None,
+            head_ref_name: pr.head_ref_name.clone(),
+            base_ref_name: pr.base_ref_name.clone(),
+            head_sha: pr.key.head_sha.clone(),
+            base_sha: pr.base_sha.clone(),
+            body: String::new(),
+            updated_at: None,
+            closed: pr.closed,
+            merged_at: None,
+            diff_start_sha: None,
+        };
+        let local_checkout = self
+            .forge_backend
+            .as_deref()
+            .and_then(|backend| backend.local_checkout_path());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pr_resolve_rx = Some(rx);
+
+        let repository = details.repository.clone();
+        let pr_number = details.number;
+        let head_sha = details.head_sha.clone();
+        let sent_thread_id = thread_id.clone();
+        std::thread::spawn(move || {
+            // Build the backend inside the thread; `&App` must not cross it.
+            let backend = create_forge_backend(&repository, local_checkout);
+            let result = backend
+                .set_review_thread_resolved(&details, &sent_thread_id, resolved)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(PrResolveEvent::Done {
+                repository,
+                pr_number,
+                head_sha,
+                thread_id: sent_thread_id,
+                resolved,
+                result,
+            });
+        });
+
+        Ok(format!(
+            "{} thread…",
+            if resolved { "Resolving" } else { "Reopening" }
+        ))
+    }
+
+    /// Apply a completed resolve/unresolve write.
+    pub fn poll_pr_resolve_events(&mut self) {
+        let Some(rx) = self.pr_resolve_rx.as_ref() else {
+            return;
+        };
+        let PrResolveEvent::Done {
+            repository,
+            pr_number,
+            head_sha,
+            thread_id,
+            resolved,
+            result,
+        } = match rx.try_recv() {
+            Ok(event) => event,
+            Err(_) => return,
+        };
+        self.pr_resolve_rx = None;
+
+        // Discard a result for a PR the user has since navigated away from.
+        let still_relevant = match &self.diff_source {
+            DiffSource::PullRequest(pr) => {
+                pr.key.repository == repository
+                    && pr.key.number == pr_number
+                    && pr.key.head_sha == head_sha
+            }
+            _ => false,
+        };
+        if !still_relevant {
+            return;
+        }
+
+        if let Err(error) = result {
+            self.set_error(format!("Could not update thread: {error}"));
+            return;
+        }
+
+        // Re-find by id rather than by index: the thread list can be replaced by
+        // a concurrent refetch while the write is in flight.
+        let Some(thread) = self
+            .forge_review_threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+        else {
+            return;
+        };
+        thread.is_resolved = resolved;
+
+        // Under the default `Unresolved` visibility a resolved thread is filtered
+        // out of the diff and the navigator entirely, so say where it went rather
+        // than letting it silently vanish from under the cursor.
+        use crate::forge::remote_comments::PrCommentsVisibility;
+        let message = match (resolved, self.session.remote_comments_visibility) {
+            (true, PrCommentsVisibility::Unresolved) => {
+                "Thread resolved — now hidden; `:comments all` to show it"
+            }
+            (true, _) => "Thread resolved",
+            (false, _) => "Thread reopened",
+        };
+        self.set_message(message.to_string());
+        self.rebuild_annotations();
+    }
+
     /// Open a PR using the provided forge backend, synchronously. Exists
     /// as a seam for tests that want to drive the open without spinning
     /// up a background thread + mpsc round-trip. Production paths go

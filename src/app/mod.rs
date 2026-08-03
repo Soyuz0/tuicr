@@ -940,6 +940,24 @@ pub enum PrThreadsEvent {
     },
 }
 
+/// Result of a resolve/unresolve write, delivered from the background thread.
+#[derive(Debug)]
+pub enum PrResolveEvent {
+    Done {
+        /// Forge identity for the request; used to discard a stale result if the
+        /// user has since opened a different PR.
+        repository: crate::forge::traits::ForgeRepository,
+        pr_number: u64,
+        head_sha: String,
+        /// The thread the write targeted, so the local state flip is applied to
+        /// the right thread even if the list shifted while the write was in
+        /// flight.
+        thread_id: String,
+        resolved: bool,
+        result: std::result::Result<(), String>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffViewMode {
     Unified,
@@ -1156,6 +1174,9 @@ pub struct App {
     /// Background-thread channel that delivers remote-thread fetch results.
     /// `Receiver` is only present while a fetch is in flight.
     pub pr_threads_rx: Option<std::sync::mpsc::Receiver<PrThreadsEvent>>,
+    /// Channel for an in-flight resolve/unresolve write. Present only while one
+    /// is outstanding, which also serves as the re-entrancy guard.
+    pub pr_resolve_rx: Option<std::sync::mpsc::Receiver<PrResolveEvent>>,
 
     /// `[forge]` section settings resolved at startup. Drives the body/footer
     /// formatting on submit. Defaults to `ForgeConfig::default()` when the

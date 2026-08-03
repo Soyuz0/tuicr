@@ -208,6 +208,10 @@ Forge review (`tuicr pr <target>`, `tuicr mr <target>`, `tuicr ado <target>`, or
   GitHub uses review metadata; GitLab combines `/user`, MR diff versions, approvals, and discussions.
 - `get_pull_request_commit_range_diff` — cumulative diff for a contiguous subrange (`start_sha` is the parent of the first selected commit; `end_sha` is the last).
 - `list_review_threads` — existing forge comments + resolved/outdated state.
+- `set_review_thread_resolved` — mark an existing thread resolved/reopened.
+  `thread_id` is whatever the backend put in `RemoteReviewThread::id`, so its
+  format stays backend-private. Default is an explicit `UnsupportedOperation`;
+  only Azure DevOps implements it (PATCH the thread's `status`).
 - `fetch_file_lines` — remote context expansion in the diff view.
 - `create_review` — POST a review with inline comments via `CreateReviewRequest`.
 - `create_review_detailed` — provider-aware result for non-atomic submission; Azure reports per-comment success and vote failure so retry submits only remaining drafts.
@@ -276,7 +280,29 @@ These are non-obvious things the implementation chain hit. Worth preserving for 
 
 15. **Azure submission is not atomic.** Post the summary and independent threads first, stop at the first failed thread, and apply `approve` or `wait-for-author` last. Lock only confirmed local IDs. Active Azure draft PRs are reviewable; only the `:submit draft` private pending-review action is unsupported and hidden.
 
-16. **Azure diff loading is immutable but checkout-backed.** Exact source/target objects are read locally; missing objects use `git fetch --no-tags --no-write-fetch-head` without checkout/ref changes. Documented iteration changes do not provide a safe universal unified-patch fallback.
+16. **Resolving a thread can hide it.** Under the default
+    `:comments unresolved` visibility, `render_decision` filters resolved
+    threads out of both the diff and the comment navigator, so a successful
+    resolve makes the thread vanish from under the cursor. The handler says so
+    explicitly rather than leaving the disappearance unexplained. Always
+    `rebuild_annotations()` after mutating `forge_review_threads`, since the
+    annotation stream length changes.
+
+17. **Azure diffs from the merge base, not the target tip.** Azure reports
+    `lastMergeTargetCommit` as the base, but its UI diffs against the
+    iteration's `commonRefCommit`. `immutable_diff` uses a three-dot range and
+    `get_pull_request` rewrites `base_sha` to the merge base; a two-dot diff
+    also reports every commit merged into the target since the branch
+    diverged, as reversed changes.
+
+18. **Azure API discovery is cached and placeholder-resolved.** Discovery is a
+    16-22s call, memoized in-process and on disk by
+    `forge::azure_devops::discovery` (inert under `cfg(test)` unless a
+    `TestCache` guard is held). `az` prints a progress banner on stdout ahead
+    of the JSON, and route templates are parameterized by `{area}`/`{resource}`;
+    both must be handled or discovery silently yields nothing.
+
+19. **Azure diff loading is immutable but checkout-backed.** Exact source/target objects are read locally; missing objects use `git fetch --no-tags --no-write-fetch-head` without checkout/ref changes. Documented iteration changes do not provide a safe universal unified-patch fallback.
 
 ### Keeping Docs Updated
 

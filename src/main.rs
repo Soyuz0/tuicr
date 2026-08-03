@@ -375,6 +375,7 @@ fn main() -> anyhow::Result<()> {
         app.poll_pr_reload_events();
         app.poll_pr_range_reload_events();
         app.poll_pr_threads_events();
+        app.poll_pr_resolve_events();
         app.poll_pr_submit_events();
         needs_redraw |= app.poll_persisted_session_changes();
         needs_redraw |= pr_pending;

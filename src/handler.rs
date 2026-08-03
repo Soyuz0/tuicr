@@ -91,6 +91,8 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         &["comments hide"],
         CommandKind::Comments(PrCommentsVisibility::Hide),
     ),
+    CommandSpec::new(&["resolve"], CommandKind::ResolveThread(true)),
+    CommandSpec::new(&["unresolve"], CommandKind::ResolveThread(false)),
 ];
 
 /// CommandSpec is the single registry entry used by both completion and
@@ -138,6 +140,8 @@ enum CommandKind {
     SubmitPicker,
     Submit(SubmitEvent),
     Comments(PrCommentsVisibility),
+    /// Resolve (`true`) or reopen (`false`) the thread under the cursor.
+    ResolveThread(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -872,6 +876,10 @@ fn dispatch_command(app: &mut App, kind: CommandKind) -> CommandAfterDispatch {
             set_remote_comments_visibility(app, visibility);
             CommandAfterDispatch::ExitCommandMode
         }
+        CommandKind::ResolveThread(resolved) => {
+            resolve_thread_at_cursor(app, resolved);
+            CommandAfterDispatch::ExitCommandMode
+        }
     }
 }
 
@@ -954,6 +962,27 @@ fn set_remote_comments_visibility(app: &mut App, visibility: PrCommentsVisibilit
         app.set_message(format!("Remote comments: {label}"));
     } else {
         app.set_message(format!("Remote comments: already {label}"));
+    }
+}
+
+/// `:resolve` / `:unresolve`. Unlike the `x` toggle these are explicit about the
+/// target state, so a no-op is reported rather than silently flipping back.
+fn resolve_thread_at_cursor(app: &mut App, resolved: bool) {
+    match app.remote_thread_idx_at_cursor() {
+        Some(idx)
+            if app
+                .forge_review_threads
+                .get(idx)
+                .is_some_and(|thread| thread.is_resolved == resolved) =>
+        {
+            let state = if resolved { "resolved" } else { "open" };
+            app.set_message(format!("Thread is already {state}"));
+        }
+        Some(_) => match app.toggle_remote_thread_resolved_at_cursor() {
+            Ok(message) => app.set_message(message),
+            Err(error) => app.set_error(error.to_string()),
+        },
+        None => app.set_warning("No remote review thread at the cursor"),
     }
 }
 
@@ -1476,6 +1505,10 @@ fn handle_shared_normal_action(app: &mut App, action: Action) {
         Action::PrevComment => app.prev_comment(),
         Action::ToggleReviewed => app.toggle_reviewed(),
         Action::ToggleHunkReviewed => app.toggle_hunk_reviewed(),
+        Action::ToggleRemoteThreadResolved => match app.toggle_remote_thread_resolved_at_cursor() {
+            Ok(message) => app.set_message(message),
+            Err(error) => app.set_error(error.to_string()),
+        },
         Action::ToggleFocus => {
             let has_selector = app.has_inline_commit_selector();
             let has_comments = app.has_comment_navigator_items();

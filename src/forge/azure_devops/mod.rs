@@ -722,6 +722,38 @@ where
             .collect())
     }
 
+    fn set_review_thread_resolved(
+        &self,
+        pr: &PullRequestDetails,
+        thread_id: &str,
+        resolved: bool,
+    ) -> Result<()> {
+        // `RemoteReviewThread::id` is Azure's numeric thread id (see
+        // `AzureThread::into_review_thread`), which is exactly the `threadId`
+        // route parameter. Reject anything else rather than build a bad route.
+        if thread_id.is_empty() || !thread_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(TuicrError::Forge(format!(
+                "Azure DevOps review thread id `{thread_id}` is not numeric"
+            )));
+        }
+        let mut route = Self::pull_request_route_parameters(&pr.repository, pr.number)?;
+        route.push(("threadId", thread_id.to_string()));
+
+        // `fixed` is what the Azure UI's "Resolved" sets; `active` is its
+        // "Reactivate". Both round-trip through `is_resolved_status`.
+        let status = if resolved { "fixed" } else { "active" };
+        let body = serde_json::to_vec(&serde_json::json!({ "status": status }))?;
+        self.invoke(
+            &pr.repository,
+            THREADS_ROUTE,
+            Some("PATCH"),
+            &route,
+            &[],
+            Some(&body),
+        )?;
+        Ok(())
+    }
+
     fn list_pull_request_commits(&self, pr: &PullRequestDetails) -> Result<Vec<PullRequestCommit>> {
         let route = Self::pull_request_route_parameters(&pr.repository, pr.number)?;
         let output = self.invoke(
@@ -1567,6 +1599,81 @@ mod tests {
             start_line: 0,
             end_line: 0,
         }
+    }
+
+    /// Resolution is a thread property. Azure's UI "Resolved" is `fixed` and its
+    /// "Reactivate" is `active`, and both must round-trip through
+    /// `is_resolved_status` so a resolve does not read back as still open.
+    #[test]
+    fn resolving_a_thread_patches_status_on_the_thread_route() {
+        for (resolved, expected_status) in [(true, "fixed"), (false, "active")] {
+            let discovered = format!(
+                r#"[{{"area":"git","resourceName":"threads-name","routeTemplate":"{THREADS_ROUTE}/{{threadId}}"}}]"#
+            );
+            let runner =
+                FakeRunner::with_replies([Box::leak(discovered.into_boxed_str()), "{\"id\":42}"]);
+            let backend = AzureDevOpsBackend::with_runner(None, runner);
+
+            backend
+                .set_review_thread_resolved(&details(7), "42", resolved)
+                .expect("PATCH must succeed");
+
+            let calls = backend.runner.calls.lock().unwrap();
+            let (args, body) = calls.last().expect("an invoke call");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--http-method", "PATCH"]),
+                "must PATCH, not POST: {args:?}"
+            );
+            assert!(
+                args.contains(&"threadId=42".to_string()),
+                "thread id must go in the route: {args:?}"
+            );
+            assert!(args.contains(&"pullRequestId=7".to_string()));
+
+            let body = body.as_ref().expect("status payload sent via --in-file");
+            let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(payload["status"], expected_status);
+            // Nothing else may be sent: a full-thread PUT would clobber comments.
+            assert_eq!(
+                payload.as_object().map(serde_json::Map::len),
+                Some(1),
+                "payload must carry only `status`: {payload}"
+            );
+
+            // The status we send must map back to the resolved flag we intended.
+            assert_eq!(
+                crate::forge::azure_devops::models::is_resolved_status_for_test(expected_status),
+                resolved
+            );
+        }
+    }
+
+    /// The thread id goes straight into a route, so a non-numeric one is rejected
+    /// rather than used to build a bogus request.
+    #[test]
+    fn non_numeric_thread_ids_are_rejected_before_any_call() {
+        for bad in ["", "abc", "42x", "PRRT_kwDO", "1 2", "-1"] {
+            let backend = AzureDevOpsBackend::with_runner(None, FakeRunner::default());
+            let error = backend
+                .set_review_thread_resolved(&details(7), bad, true)
+                .expect_err("must reject");
+            assert!(error.to_string().contains("not numeric"), "for {bad:?}");
+            assert!(
+                backend.runner.calls.lock().unwrap().is_empty(),
+                "must not call az for {bad:?}"
+            );
+        }
+    }
+
+    /// Backends without a resolve concept must say so, not silently no-op.
+    #[test]
+    fn other_backends_report_resolve_as_unsupported() {
+        use crate::forge::github::gh::GitHubGhBackend;
+        let error = GitHubGhBackend::new(None)
+            .set_review_thread_resolved(&details(7), "PRRT_abc", true)
+            .expect_err("default must be unsupported");
+        assert!(matches!(error, TuicrError::UnsupportedOperation(_)));
     }
 
     #[test]

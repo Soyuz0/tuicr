@@ -356,10 +356,17 @@ impl App {
     /// distinct condition so the handler can produce a clearer message than
     /// the generic "no comment at cursor".
     pub fn cursor_on_remote_thread(&self) -> bool {
-        matches!(
-            self.line_annotations.get(self.diff_state.cursor_line),
-            Some(AnnotatedLine::RemoteThreadLine { .. })
-        )
+        self.remote_thread_idx_at_cursor().is_some()
+    }
+
+    /// Index into [`Self::forge_review_threads`] for the remote thread rendered
+    /// under the cursor, if any. Only visible threads produce annotations, so a
+    /// hit here is always a thread the user can actually see.
+    pub fn remote_thread_idx_at_cursor(&self) -> Option<usize> {
+        match self.line_annotations.get(self.diff_state.cursor_line) {
+            Some(AnnotatedLine::RemoteThreadLine { thread_idx }) => Some(*thread_idx),
+            _ => None,
+        }
     }
 
     fn find_comment_at_cursor(&self) -> Option<CommentLocation> {

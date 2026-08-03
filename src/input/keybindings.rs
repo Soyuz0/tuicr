@@ -38,6 +38,8 @@ pub enum Action {
     // Review actions
     ToggleReviewed,
     ToggleHunkReviewed,
+    /// Toggle resolved state of the remote review thread under the cursor.
+    ToggleRemoteThreadResolved,
     AddLineComment,
     AddFileComment,
     EditComment,
@@ -200,6 +202,7 @@ fn map_normal_mode(key: KeyEvent, leader_key: char) -> Action {
         // Review actions
         (KeyCode::Char('r'), KeyModifiers::NONE) => Action::ToggleReviewed,
         (KeyCode::Char('R'), _) => Action::ToggleHunkReviewed,
+        (KeyCode::Char('x'), KeyModifiers::NONE) => Action::ToggleRemoteThreadResolved,
         (KeyCode::Char('c'), KeyModifiers::NONE) => Action::AddLineComment,
         (KeyCode::Char('C'), _) => Action::AddFileComment,
         (KeyCode::Char('i'), KeyModifiers::NONE) => Action::EditComment,

@@ -76,6 +76,7 @@ Shown below the file tree when local comments or visible remote PR threads exist
 |-----|--------|
 | `r` | Toggle file reviewed |
 | `R` | Toggle hunk reviewed |
+| `x` | Resolve / reopen the remote review thread at the cursor (Azure DevOps only) |
 | `c` | Add line comment (or file comment if not on a diff line) |
 | `C` | Add file comment |
 | `<leader>c` | Add review comment |
@@ -138,6 +139,8 @@ In command mode,
 | `:submit approve` | Submit an Approve review |
 | `:submit request-changes` | Submit a Request-changes review |
 | `:submit draft` | Submit a private pending Draft review (hidden when unsupported, including Azure DevOps) |
+| `:resolve` | Resolve the remote review thread at the cursor (Azure DevOps only) |
+| `:unresolve` | Reopen the remote review thread at the cursor (Azure DevOps only) |
 | `:set wrap` | Enable line wrap in diff view |
 | `:set wrap!` | Toggle line wrap in diff view |
 | `:set relativenumber` / `:set norelativenumber` | Enable / disable relative rendered-row numbers |

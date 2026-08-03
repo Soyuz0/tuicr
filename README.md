@@ -264,6 +264,7 @@ A first-session cheatsheet. Press `?` inside tuicr for the full reference.
 | `v` / `V` | Visual mode (range comment) |
 | `r` | Toggle file reviewed |
 | `R` | Toggle hunk reviewed |
+| `x` | Resolve / reopen the remote review thread at the cursor (Azure DevOps) |
 | `e` | Open focused file in `$EDITOR` |
 | `y` | Copy review to clipboard |
 | `:edit` | Open focused file in `$EDITOR` |

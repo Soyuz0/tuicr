@@ -695,6 +695,13 @@ fn valid_line(position: &AzureCommentPosition) -> Option<u32> {
     u32::try_from(position.line?).ok().filter(|line| *line > 0)
 }
 
+/// Test-only accessor so the Azure backend tests can assert that the `status`
+/// value they PATCH reads back as the resolved state they intended.
+#[cfg(test)]
+pub fn is_resolved_status_for_test(status: &str) -> bool {
+    is_resolved_status(status)
+}
+
 fn is_resolved_status(status: &str) -> bool {
     matches!(
         status.to_ascii_lowercase().as_str(),

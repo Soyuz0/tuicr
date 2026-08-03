@@ -2641,3 +2641,192 @@ fn should_discard_stale_remote_threads_event_after_switching_pr() {
     // then — stale result was dropped
     assert!(app.forge_review_threads.is_empty());
 }
+
+/// `x` / `:resolve` act on the thread the cursor is on, so the cursor must map
+/// back to a specific index in `forge_review_threads`.
+#[test]
+fn should_identify_the_remote_thread_under_the_cursor() {
+    let mut app = build_app();
+    let summary = sample_pr(42, "answer");
+    let backend = Box::new(ThreadAwareForgeBackend::new(
+        test_pr_details(42, "answer"),
+        crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+        vec![sample_thread(2, "remote body", false, false)],
+    ));
+    app.open_pr_with_backend(&summary, backend, None).unwrap();
+
+    let thread_row = app
+        .line_annotations
+        .iter()
+        .position(|annotation| {
+            matches!(
+                annotation,
+                crate::app::AnnotatedLine::RemoteThreadLine { .. }
+            )
+        })
+        .expect("the fetched thread must be rendered");
+
+    // Off the thread: nothing to act on.
+    app.diff_state.cursor_line = 0;
+    assert_eq!(app.remote_thread_idx_at_cursor(), None);
+    assert!(!app.cursor_on_remote_thread());
+
+    // On the thread: resolves to its index.
+    app.diff_state.cursor_line = thread_row;
+    assert_eq!(app.remote_thread_idx_at_cursor(), Some(0));
+    assert!(app.cursor_on_remote_thread());
+}
+
+/// Resolving requires a target; without one the user gets an error rather than a
+/// silent no-op or a stray forge call.
+#[test]
+fn should_refuse_to_resolve_without_a_thread_under_the_cursor() {
+    let mut app = build_app();
+    let summary = sample_pr(42, "answer");
+    let backend = Box::new(ThreadAwareForgeBackend::new(
+        test_pr_details(42, "answer"),
+        crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+        vec![sample_thread(2, "remote body", false, false)],
+    ));
+    app.open_pr_with_backend(&summary, backend, None).unwrap();
+    app.diff_state.cursor_line = 0;
+
+    let error = app
+        .toggle_remote_thread_resolved_at_cursor()
+        .expect_err("no thread at cursor");
+    assert!(error.to_string().contains("No remote review thread"));
+    assert!(
+        app.pr_resolve_rx.is_none(),
+        "no request may be left in flight"
+    );
+}
+
+/// Outside PR mode there is nothing to resolve against.
+#[test]
+fn should_refuse_to_resolve_outside_pr_mode() {
+    let mut app = build_app();
+    let error = app
+        .toggle_remote_thread_resolved_at_cursor()
+        .expect_err("not in PR mode");
+    assert!(error.to_string().contains("PR review mode"));
+}
+
+/// A resolved thread is filtered out under the default visibility, so the user
+/// must be told where it went instead of watching it vanish.
+#[test]
+fn should_explain_that_a_resolved_thread_becomes_hidden() {
+    let mut app = build_app();
+    let summary = sample_pr(42, "answer");
+    let backend = Box::new(ThreadAwareForgeBackend::new(
+        test_pr_details(42, "answer"),
+        crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+        vec![sample_thread(2, "remote body", false, false)],
+    ));
+    app.open_pr_with_backend(&summary, backend, None).unwrap();
+    assert_eq!(
+        app.session.remote_comments_visibility,
+        PrCommentsVisibility::Unresolved
+    );
+    let rendered_before = app
+        .line_annotations
+        .iter()
+        .filter(|a| matches!(a, crate::app::AnnotatedLine::RemoteThreadLine { .. }))
+        .count();
+    assert!(rendered_before > 0);
+
+    // Simulate the forge confirming a resolve.
+    let details = test_pr_details(42, "answer");
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(crate::app::PrResolveEvent::Done {
+        repository: details.repository.clone(),
+        pr_number: details.number,
+        head_sha: details.head_sha.clone(),
+        thread_id: "T".to_string(),
+        resolved: true,
+        result: Ok(()),
+    })
+    .unwrap();
+    app.pr_resolve_rx = Some(rx);
+    app.poll_pr_resolve_events();
+
+    assert!(app.forge_review_threads[0].is_resolved);
+    assert!(
+        app.pr_resolve_rx.is_none(),
+        "the in-flight guard must be released"
+    );
+    // Annotations were rebuilt and the thread is now filtered out.
+    let rendered_after = app
+        .line_annotations
+        .iter()
+        .filter(|a| matches!(a, crate::app::AnnotatedLine::RemoteThreadLine { .. }))
+        .count();
+    assert_eq!(rendered_after, 0, "resolved thread must be filtered out");
+}
+
+/// A result arriving for a PR the user has navigated away from must not be
+/// applied to whatever is on screen now.
+#[test]
+fn should_discard_a_resolve_result_for_a_different_pr() {
+    let mut app = build_app();
+    let summary = sample_pr(42, "answer");
+    let backend = Box::new(ThreadAwareForgeBackend::new(
+        test_pr_details(42, "answer"),
+        crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+        vec![sample_thread(2, "remote body", false, false)],
+    ));
+    app.open_pr_with_backend(&summary, backend, None).unwrap();
+
+    let details = test_pr_details(42, "answer");
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(crate::app::PrResolveEvent::Done {
+        repository: details.repository.clone(),
+        // A different PR number than the one on screen.
+        pr_number: details.number + 1,
+        head_sha: details.head_sha.clone(),
+        thread_id: "T".to_string(),
+        resolved: true,
+        result: Ok(()),
+    })
+    .unwrap();
+    app.pr_resolve_rx = Some(rx);
+    app.poll_pr_resolve_events();
+
+    assert!(
+        !app.forge_review_threads[0].is_resolved,
+        "a stale result must not mutate the current PR"
+    );
+}
+
+/// A failed write must leave local state untouched, so the UI never claims a
+/// resolve that the forge rejected.
+#[test]
+fn should_leave_state_unchanged_when_the_forge_rejects_a_resolve() {
+    let mut app = build_app();
+    let summary = sample_pr(42, "answer");
+    let backend = Box::new(ThreadAwareForgeBackend::new(
+        test_pr_details(42, "answer"),
+        crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+        vec![sample_thread(2, "remote body", false, false)],
+    ));
+    app.open_pr_with_backend(&summary, backend, None).unwrap();
+
+    let details = test_pr_details(42, "answer");
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(crate::app::PrResolveEvent::Done {
+        repository: details.repository.clone(),
+        pr_number: details.number,
+        head_sha: details.head_sha.clone(),
+        thread_id: "T".to_string(),
+        resolved: true,
+        result: Err("403 Forbidden".to_string()),
+    })
+    .unwrap();
+    app.pr_resolve_rx = Some(rx);
+    app.poll_pr_resolve_events();
+
+    assert!(
+        !app.forge_review_threads[0].is_resolved,
+        "a rejected write must not flip local state"
+    );
+    assert!(app.pr_resolve_rx.is_none());
+}

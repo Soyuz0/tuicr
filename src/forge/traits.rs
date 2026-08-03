@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::error::Result;
+use crate::error::{Result, TuicrError};
 use crate::forge::remote_comments::RemoteReviewThread;
 use crate::forge::submit::SubmitEvent;
 use crate::model::{DiffLine, FileStatus};
@@ -592,6 +592,24 @@ pub trait ForgeBackend {
         _pr: &PullRequestDetails,
     ) -> Result<Vec<crate::forge::remote_comments::RemoteReviewSummary>> {
         Ok(Vec::new())
+    }
+    /// Mark an existing review thread resolved or unresolved.
+    ///
+    /// `thread_id` is the `RemoteReviewThread::id` the backend itself produced in
+    /// [`Self::list_review_threads`], so its format stays backend-private.
+    ///
+    /// Resolution is a property of the thread, not of an individual comment.
+    /// Default is an explicit `UnsupportedOperation` so a backend that has no
+    /// resolve concept reports it rather than silently doing nothing.
+    fn set_review_thread_resolved(
+        &self,
+        _pr: &PullRequestDetails,
+        _thread_id: &str,
+        _resolved: bool,
+    ) -> Result<()> {
+        Err(TuicrError::UnsupportedOperation(
+            "This forge backend cannot resolve review threads from tuicr".to_string(),
+        ))
     }
     /// List the commits that make up a pull request, in chronological order
     /// (oldest first; the App reverses to newest-first display order). The

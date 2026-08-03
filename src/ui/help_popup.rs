@@ -397,6 +397,13 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled(
+                "  x         ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Resolve/reopen remote thread at cursor (PR mode)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "  c         ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
@@ -687,6 +694,20 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw("  Hide remote comments in PR mode"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  :resolve      ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Resolve the remote thread at the cursor"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  :unresolve    ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Reopen the remote thread at the cursor"),
         ]),
         Line::from(vec![
             Span::styled(
