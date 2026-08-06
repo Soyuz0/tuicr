@@ -57,7 +57,7 @@ where
     // `next_line` instead of `lines.next()` to propagate I/O errors.
     while let Some(line) = next_line(&mut lines)? {
         if line.starts_with(header_prefix) {
-            let (mut old_path, mut new_path, status) = parse_file_header(&mut lines, format)?;
+            let (mut old_path, mut new_path, status) = parse_file_header(&mut lines)?;
 
             // For git-style diffs (jj, git patches), if parse_file_header didn't find
             // ---/+++ or rename/copy lines (e.g. empty new files, mode-only changes),
@@ -167,9 +167,12 @@ fn is_binary_patch_line(line: &str) -> bool {
     line.starts_with("Binary file") || line.starts_with("GIT binary patch")
 }
 
+/// Parse the `---`/`+++`/`new file`/`rename` header block for one file.
+///
+/// Format-independent: the tab that terminates a path in `---`/`+++` lines means
+/// the same thing in Mercurial and Git output, so no `DiffFormat` is needed.
 fn parse_file_header<'a, I>(
     lines: &mut std::iter::Peekable<I>,
-    format: DiffFormat,
 ) -> Result<(Option<PathBuf>, Option<PathBuf>, FileStatus)>
 where
     I: Iterator<Item = Result<Cow<'a, str>>>,
@@ -183,24 +186,13 @@ where
         if line.starts_with("---") {
             let path_str = line.trim_start_matches("--- ").trim_start_matches("a/");
             if path_str != "/dev/null" {
-                // Hg format may include timestamps after tab
-                let path = if format == DiffFormat::Hg {
-                    path_str.split('\t').next().unwrap_or(path_str)
-                } else {
-                    path_str
-                };
-                old_path = Some(PathBuf::from(path));
+                old_path = Some(PathBuf::from(header_path(path_str)));
             }
             next_line(lines)?;
         } else if line.starts_with("+++") {
             let path_str = line.trim_start_matches("+++ ").trim_start_matches("b/");
             if path_str != "/dev/null" {
-                let path = if format == DiffFormat::Hg {
-                    path_str.split('\t').next().unwrap_or(path_str)
-                } else {
-                    path_str
-                };
-                new_path = Some(PathBuf::from(path));
+                new_path = Some(PathBuf::from(header_path(path_str)));
             }
             next_line(lines)?;
             break; // Done with file header
@@ -403,6 +395,21 @@ fn parse_range(s: &str) -> (u32, u32) {
     }
 }
 
+/// Extract the path from a `---`/`+++` header body (prefix already stripped).
+///
+/// A tab terminates the filename in these lines. Mercurial uses it to append a
+/// timestamp, and **Git appends one whenever the path contains a space**, so
+/// that a parser can tell where the name ends. Keeping that tab produced paths
+/// like `"report (28).md\t"`, which then failed every later exact-match lookup
+/// (Azure `changeTrackingId`, `git cat-file <sha>:<path>`, `.tuicrignore`) with
+/// no visible cause, because a trailing tab is invisible when printed.
+///
+/// A literal tab inside a filename cannot be confused with this delimiter: Git
+/// always double-quotes paths containing control characters.
+fn header_path(path_str: &str) -> &str {
+    path_str.split('\t').next().unwrap_or(path_str)
+}
+
 /// Parse paths from a "diff --git a/X b/X" header line.
 /// Returns (old_path, new_path) extracted from the a/ and b/ prefixes.
 fn parse_diff_git_header(line: &str) -> Option<(PathBuf, PathBuf)> {
@@ -561,6 +568,58 @@ mod tests {
         assert_eq!(lines[0].content, "    old");
         assert_eq!(lines[1].content, "    new");
         assert!(lines.iter().all(|l| !l.content.contains('\t')));
+    }
+
+    /// Git appends a tab after the filename in `---`/`+++` lines when the path
+    /// contains a space, to mark where the name ends. Keeping that tab yielded
+    /// paths like `"report (28).md\t"`, which silently broke every exact-match
+    /// lookup downstream (Azure `changeTrackingId`, `git cat-file <sha>:<path>`,
+    /// `.tuicrignore`) — invisible in output, because a trailing tab prints as
+    /// nothing.
+    #[test]
+    fn should_strip_the_tab_git_appends_after_paths_containing_spaces() {
+        // Byte-for-byte as emitted by `git diff` for a real added file.
+        let diff = "diff --git a/packages/fortress/deep-research-report (28).md \
+b/packages/fortress/deep-research-report (28).md\n\
+new file mode 100644\n\
+index 0000000..1234567\n\
+--- /dev/null\n\
++++ b/packages/fortress/deep-research-report (28).md\t\n\
+@@ -0,0 +1,2 @@\n\
++line one\n\
++line two\n";
+
+        let files =
+            parse_unified_diff(diff, DiffFormat::GitStyle, &SyntaxHighlighter::default()).unwrap();
+        assert_eq!(files.len(), 1);
+        let path = files[0].new_path.as_ref().unwrap().to_str().unwrap();
+        assert_eq!(path, "packages/fortress/deep-research-report (28).md");
+        assert!(!path.ends_with('\t'), "trailing tab must be gone: {path:?}");
+        // The space is part of the name and must survive.
+        assert!(path.contains(" (28)"));
+    }
+
+    /// The same delimiter on the old side, for a modified file.
+    #[test]
+    fn should_strip_the_tab_on_both_header_sides() {
+        let diff = "diff --git a/my file.txt b/my file.txt\n\
+--- a/my file.txt\t\n\
++++ b/my file.txt\t\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n";
+
+        let files =
+            parse_unified_diff(diff, DiffFormat::GitStyle, &SyntaxHighlighter::default()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].old_path.as_ref().unwrap().to_str().unwrap(),
+            "my file.txt"
+        );
+        assert_eq!(
+            files[0].new_path.as_ref().unwrap().to_str().unwrap(),
+            "my file.txt"
+        );
     }
 
     #[test]

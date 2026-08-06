@@ -360,8 +360,16 @@ fn comment_request(body: &str) -> AzureCommentCreateRequest<'_> {
     }
 }
 
+/// Normalize a path for exact-match lookups against Azure's iteration changes.
+///
+/// Trims surrounding whitespace as well: both sides of the comparison must agree
+/// exactly, and a stray delimiter tab from a diff header is invisible in any
+/// error message it causes.
 fn normalized_path(path: &str) -> String {
-    path.replace('\\', "/").trim_start_matches('/').to_string()
+    path.replace('\\', "/")
+        .trim()
+        .trim_start_matches('/')
+        .to_string()
 }
 
 fn post_thread<R>(
@@ -594,6 +602,75 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("advanced"));
         assert_eq!(stale_backend.runner.calls.lock().unwrap().len(), 1);
+    }
+
+    /// Regression: a filename containing a space made Git append a delimiter tab
+    /// in the diff header, which used to survive into the comment path and miss
+    /// the `changeTrackingId` map, failing the whole submit. Both the parser fix
+    /// and `normalized_path` trimming must keep this working.
+    #[test]
+    fn resolves_change_tracking_id_for_paths_containing_spaces() {
+        let path = "packages/fortress/deep-research-report (28).md";
+        let runner = FakeRunner::new(vec![
+            ok(show("head-sha")),
+            ok(discovery(super::super::ITERATIONS_ROUTE, "iterations")),
+            ok(r#"[{"id":2}]"#.to_string()),
+            ok(discovery(super::super::ITERATION_CHANGES_ROUTE, "changes")),
+            ok(format!(
+                r#"{{"changeEntries":[{{"changeTrackingId":4,"item":{{"path":"/{path}"}}}}]}}"#
+            )),
+            ok(discovery(super::super::THREADS_ROUTE, "threads")),
+            ok(r#"{"id":70,"comments":[{"id":700}]}"#.to_string()),
+        ]);
+        let backend = AzureDevOpsBackend::with_runner(None, runner);
+        let mut inline = comment("local-1");
+        inline.path = PathBuf::from(path);
+        let comments = [inline];
+
+        let outcome = backend
+            .create_review_detailed(
+                &pr(),
+                CreateReviewRequest {
+                    event: SubmitEvent::Comment,
+                    commit_id: "head-sha",
+                    body: "",
+                    comments: &comments,
+                },
+            )
+            .expect("submit must not fail on a path containing a space");
+
+        let ReviewSubmissionOutcome::NonAtomic(result) = outcome else {
+            panic!("non-atomic result")
+        };
+        assert!(
+            result.failures.is_empty(),
+            "failures: {:?}",
+            result.failures
+        );
+        assert_eq!(result.posted_comments.len(), 1);
+
+        // The posted thread must carry the resolved tracking id and the exact path.
+        let calls = backend.runner.calls.lock().unwrap();
+        let body = calls
+            .iter()
+            .filter_map(|call| call.1.as_ref())
+            .next_back()
+            .expect("a thread payload");
+        let value: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(value["pullRequestThreadContext"]["changeTrackingId"], 4);
+        assert_eq!(value["threadContext"]["filePath"], format!("/{path}"));
+    }
+
+    /// A tab that somehow reaches the submit layer must not defeat the lookup.
+    #[test]
+    fn normalized_path_trims_delimiter_whitespace() {
+        assert_eq!(
+            normalized_path("/packages/fortress/deep-research-report (28).md\t"),
+            "packages/fortress/deep-research-report (28).md"
+        );
+        assert_eq!(normalized_path("\\a\\b.txt"), "a/b.txt");
+        // Interior spaces are part of the name and must survive.
+        assert_eq!(normalized_path("/my file.txt"), "my file.txt");
     }
 
     #[test]
