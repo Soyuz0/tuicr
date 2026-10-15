@@ -393,7 +393,7 @@ These are non-obvious things the implementation chain hit. Worth preserving for 
     of the JSON, and route templates are parameterized by `{area}`/`{resource}`;
     both must be handled or discovery silently yields nothing.
 
-19. **Azure diff loading is immutable but checkout-backed.** Exact source/target objects are read locally; missing objects use `git fetch --no-tags --no-write-fetch-head` without checkout/ref changes. Documented iteration changes do not provide a safe universal unified-patch fallback.
+19. **Azure diff loading is immutable but checkout-backed.** Exact source/target objects are read locally; missing objects use `git fetch --no-tags --no-write-fetch-head` against the matching configured remote without checkout/ref changes. Preserve its transport and authentication settings instead of rebuilding an HTTPS URL. Background fetches disable interactive Git credentials and report how to authenticate on failure. Documented iteration changes do not provide a safe universal unified-patch fallback.
 
 ### Keeping Docs Updated
 

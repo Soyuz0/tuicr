@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 
 use serde::Deserialize;
@@ -30,7 +31,6 @@ use self::models::{
     parse_azure_commits, parse_azure_iteration_changes, parse_azure_iterations,
     parse_azure_pull_requests, parse_azure_threads,
 };
-use self::remote::percent_encode_path_component;
 
 const API_VERSION: &str = "7.1";
 const COMMITS_ROUTE: &str =
@@ -497,29 +497,12 @@ where
             .local_checkout
             .as_deref()
             .ok_or_else(rest_diff_limitation)?;
-        if crate::forge::local_checkout_for_repo(root, &pr.repository).is_none() {
-            return Err(rest_diff_limitation());
-        }
-        let remote_url = azure_remote_url(&pr.repository)?;
+        let remote = crate::forge::local_fetch_remote_for_repo(root, &pr.repository)
+            .ok_or_else(rest_diff_limitation)?;
         for sha in [start_sha, end_sha] {
             let commit = format!("{sha}^{{commit}}");
             if run_git(root, &["cat-file", "-e", &commit]).is_err() {
-                run_git(
-                    root,
-                    &[
-                        "fetch",
-                        "--no-tags",
-                        "--no-write-fetch-head",
-                        &remote_url,
-                        sha,
-                    ],
-                )
-                .map_err(|error| {
-                    TuicrError::Forge(format!(
-                        "Azure DevOps immutable fetch of `{sha}` failed: {error}. {}",
-                        rest_diff_limitation()
-                    ))
-                })?;
+                fetch_commit(root, &remote, sha)?;
                 run_git(root, &["cat-file", "-e", &commit]).map_err(|error| {
                     TuicrError::Forge(format!(
                         "Azure DevOps fetch completed but commit `{sha}` is still unavailable: {error}"
@@ -934,14 +917,33 @@ fn slash_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn azure_remote_url(repository: &ForgeRepository) -> Result<String> {
-    let identity = AzureDevOpsBackend::<SystemAzRunner>::identity(repository)?;
-    Ok(format!(
-        "{}/{}/_git/{}",
-        identity.organization_url.trim_end_matches('/'),
-        percent_encode_path_component(&identity.project),
-        percent_encode_path_component(&repository.name)
-    ))
+fn fetch_commit(root: &Path, remote: &str, sha: &str) -> Result<()> {
+    let output = Command::new(git_executable())
+        .current_dir(root)
+        .args([
+            "-c",
+            "credential.interactive=false",
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            remote,
+            sha,
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            TuicrError::Forge(format!(
+                "Could not run Git to fetch Azure PR commit `{sha}`: {error}"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(TuicrError::Forge(format!(
+            "Azure DevOps immutable fetch of `{sha}` using remote `{remote}` failed: {}\nRun `git fetch {remote}` in this checkout to verify its Git credentials, then retry. Azure CLI login and Git authentication are separate.",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 fn git_executable() -> String {
@@ -1844,7 +1846,7 @@ mod tests {
         git_repository
             .remote(
                 "origin",
-                "https://dev.azure.com/neutral-org/neutral-project/_git/neutral-repo",
+                "git@ssh.dev.azure.com:v3/neutral-org/neutral-project/neutral-repo",
             )
             .unwrap();
 
@@ -1856,10 +1858,14 @@ mod tests {
             r#"#!/bin/sh
 for argument in "$@"; do printf '%s\037' "$argument" >> "$TUICR_GIT_LOG"; done
 printf '\n' >> "$TUICR_GIT_LOG"
+if [ "$1" = "-c" ] && [ "$2" = "credential.interactive=false" ]; then
+  shift 2
+fi
 if [ "$1" = "cat-file" ] && [ "$3" = "missing^{commit}" ] && [ ! -f "$TUICR_GIT_STATE" ]; then
   exit 1
 fi
 if [ "$1" = "fetch" ]; then
+  [ "$GIT_TERMINAL_PROMPT" = "0" ] || exit 99
   touch "$TUICR_GIT_STATE"
 fi
 if [ "$1" = "diff" ]; then
@@ -1931,10 +1937,12 @@ fi
         assert_eq!(
             calls[2],
             [
+                "-c",
+                "credential.interactive=false",
                 "fetch",
                 "--no-tags",
                 "--no-write-fetch-head",
-                "https://dev.azure.com/neutral-org/neutral-project/_git/neutral-repo",
+                "origin",
                 "missing"
             ]
         );

@@ -87,6 +87,13 @@ pub fn detect_gitlab_repository(repo_root: &Path) -> Option<ForgeRepository> {
 
 /// `repo_root`'s remote URLs, `origin` first, then every other remote.
 fn remote_urls(repo_root: &Path) -> Vec<String> {
+    named_remote_urls(repo_root)
+        .into_iter()
+        .map(|(_, url)| url)
+        .collect()
+}
+
+fn named_remote_urls(repo_root: &Path) -> Vec<(String, String)> {
     let Ok(repo) = Repository::discover(repo_root) else {
         // Local VCS discovery already falls back to Git for repository formats
         // libgit2 cannot open (notably reftable and SHA-256). Remote metadata
@@ -106,23 +113,31 @@ fn remote_urls(repo_root: &Path) -> Vec<String> {
                     ["remote", "get-url", "--", name],
                 )
                 .ok()
-                .map(|url| url.trim_end_matches(['\r', '\n']).to_string())
+                .map(|url| {
+                    (
+                        name.to_string(),
+                        url.trim_end_matches(['\r', '\n']).to_string(),
+                    )
+                })
             })
             .collect();
     };
-    let mut all_urls: Vec<String> = Vec::new();
+    let mut all_urls = Vec::new();
 
     if let Ok(remote) = repo.find_remote("origin")
         && let Some(url) = remote.url()
     {
-        all_urls.push(url.to_string());
+        all_urls.push(("origin".to_string(), url.to_string()));
     }
     if let Ok(remotes) = repo.remotes() {
         for name in remotes.iter().flatten() {
+            if name == "origin" {
+                continue;
+            }
             if let Ok(remote) = repo.find_remote(name)
                 && let Some(url) = remote.url()
             {
-                all_urls.push(url.to_string());
+                all_urls.push((name.to_string(), url.to_string()));
             }
         }
     }
@@ -207,14 +222,22 @@ pub fn resolve_remote_repository(vcs: &dyn VcsBackend, name: &str) -> Result<For
 /// `root`'s local checkout, but only when one of its remotes — not
 /// necessarily `origin` — matches `target_repo`.
 pub fn local_checkout_for_repo(root: &Path, target_repo: &ForgeRepository) -> Option<PathBuf> {
-    remote_urls(root)
-        .iter()
-        .any(|url| {
-            parse_any_remote_url(url)
-                .as_ref()
-                .is_some_and(|repo| repo.same_repository(target_repo))
-        })
+    local_fetch_remote_for_repo(root, target_repo)
+        .is_some()
         .then(|| root.to_path_buf())
+}
+
+/// Matching fetch remote, preferring `origin`. Fetching by name retains its
+/// configured transport, username, and remote-specific authentication settings.
+pub(crate) fn local_fetch_remote_for_repo(
+    root: &Path,
+    target_repo: &ForgeRepository,
+) -> Option<String> {
+    named_remote_urls(root).into_iter().find_map(|(name, url)| {
+        parse_any_remote_url(&url)
+            .is_some_and(|repo| repo.same_repository(target_repo))
+            .then_some(name)
+    })
 }
 
 #[cfg(test)]
@@ -336,8 +359,31 @@ mod tests {
 
         let target = ForgeRepository::github("github.com", "agavra", "tuicr");
         assert_eq!(
+            local_fetch_remote_for_repo(dir.path(), &target).as_deref(),
+            Some("upstream")
+        );
+        assert_eq!(
             local_checkout_for_repo(dir.path(), &target),
             Some(dir.path().to_path_buf())
         );
+    }
+
+    #[test]
+    fn azure_fetch_uses_the_configured_remote_for_ssh_and_https_credentials() {
+        let target = ForgeRepository::azure("dev.azure.com", "org/project", "repo")
+            .with_repository_id("resolved-id");
+        for url in [
+            "git@ssh.dev.azure.com:v3/org/project/repo",
+            "https://org@dev.azure.com/org/project/_git/repo",
+        ] {
+            let dir = init_repo_with_origin(url);
+            let repo = Repository::open(dir.path()).unwrap();
+            repo.remote("another", url).unwrap();
+            assert_eq!(
+                local_fetch_remote_for_repo(dir.path(), &target).as_deref(),
+                Some("origin"),
+                "must retain the configured remote for {url}"
+            );
+        }
     }
 }

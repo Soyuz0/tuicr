@@ -80,7 +80,7 @@ source commit SHAs and runs parser-safe Git object operations in the matching
 checkout. Missing commit objects are imported with:
 
 ```bash
-git fetch --no-tags --no-write-fetch-head AZURE_REPOSITORY_URL COMMIT_SHA
+git fetch --no-tags --no-write-fetch-head MATCHING_REMOTE COMMIT_SHA
 ```
 
 tuicr never checks out a PR, switches branches, writes `FETCH_HEAD`, resets,
@@ -90,6 +90,12 @@ its diff currently requires the matching checkout because Azure CLI
 authentication does not automatically provide Git transport credentials and
 the documented REST resources cannot reconstruct every rename, binary, mode,
 or truncated-content case safely.
+
+The fetch uses the matching configured remote, preferring `origin`, so SSH keys,
+HTTPS usernames, and credential-helper settings are preserved. It does not
+replace SSH remotes with HTTPS URLs. Background fetches disable Git's interactive
+credential prompts. If authentication fails, run `git fetch REMOTE` in that
+checkout to check its Git credentials, then reopen the PR.
 
 ## Existing Threads
 
