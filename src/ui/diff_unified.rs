@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ratatui::{
     Frame,
     layout::Rect,
@@ -8,33 +10,56 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, DiffSource, ExpandDirection, FocusedPanel, GAP_EXPAND_BATCH, GapId, InputMode,
+    App, DiffSource, ExpandDirection, FocusedPanel, GAP_EXPAND_BATCH, GapId, InputMode, WrapStyle,
 };
 use crate::forge::remote_comments::PrCommentsVisibility;
 use crate::model::{FileStatus, LineOrigin, LineRange, LineSide};
 use crate::theme::Theme;
 use crate::ui::comment_panel;
 use crate::ui::diff_view::{
-    apply_horizontal_scroll, comment_type_presentation, cursor_indicator, cursor_indicator_spaced,
-    diff_stat_title, hunk_header_text_and_style, paint_cursor_line_highlight,
-    paint_unified_diff_rows_with, paint_visual_selection_overlay, populate_row_to_annotation,
-    push_comment_bar, render_expander_line, render_hidden_lines, scroll_comment_input_into_view,
-    unified_line_bg_style,
+    apply_horizontal_scroll, comment_box_visible, comment_type_presentation, cursor_indicator,
+    cursor_indicator_spaced, diff_stat_title, hunk_header_text_and_style,
+    paint_cursor_line_highlight, paint_unified_diff_rows_with, paint_visual_selection_overlay,
+    populate_row_to_annotation, push_comment_bar, render_expander_line, render_hidden_lines,
+    scroll_comment_input_into_view, skip_comment_box, unified_line_bg_style,
 };
 use crate::ui::styles;
+use crate::ui::text_utils::wrap_spans_hanging;
 use crate::vcs::git::calculate_gap;
+
+const GUTTER_SPANS: usize = 3;
+
+fn unified_row_height(
+    lines: &[Line],
+    idx: usize,
+    content_start: Option<usize>,
+    wrap: bool,
+    viewport_width: usize,
+) -> usize {
+    if !wrap || viewport_width == 0 {
+        return 1;
+    }
+    lines.get(idx).map_or(1, |line| {
+        wrap_spans_hanging(&line.spans, content_start, viewport_width).len()
+    })
+}
 
 pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focused_panel == FocusedPanel::Diff;
 
-    let title = crate::ui::diff_view::diff_title(app, area.width);
-
-    let block = Block::default()
-        .title(title)
-        .title_top(diff_stat_title(app).right_aligned())
-        .borders(Borders::ALL)
+    // When the diff is the only pane, drop the frame entirely — including its
+    // title row. The file name and stats are folded into the top header line
+    // instead (see status_bar::render_header) so there's a single header line.
+    let sole = app.is_diff_sole_pane();
+    let mut block = Block::default()
+        .borders(if sole { Borders::NONE } else { Borders::ALL })
         .style(styles::panel_style(&app.theme))
         .border_style(styles::border_style(&app.theme, focused));
+    if !sole {
+        block = block
+            .title(crate::ui::diff_view::diff_title(app, area.width))
+            .title_top(diff_stat_title(app).right_aligned());
+    }
 
     let inner = block.inner(area);
     let comment_width = inner.width.saturating_sub(1) as usize;
@@ -52,6 +77,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
     // Build all diff lines for infinite scroll
     // Track line index to mark the current line (cursor position)
     let mut lines: Vec<Line> = Vec::new();
+    let mut content_rows = HashSet::new();
     let mut line_idx: usize = 0;
     let current_line_idx = app.diff_state.cursor_line;
 
@@ -61,6 +87,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
     // off-screen rows. In Comment mode the scroll offset may be adjusted after
     // building, so fall back to a full build there.
     let (visible_start, visible_end) = crate::ui::diff_view::diff_visible_range(app, inner);
+    let search_style = styles::search_match_style(&app.theme);
 
     // Track cursor position for IME when in Comment mode
     // Store the logical line index and column where the cursor should be
@@ -85,8 +112,9 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
 
     // The `═══ Review Comments ═══` label is redundant in single-file
     // view (review-level comments are still rendered below; they just
-    // don't need a banner that confuses horizontal scroll).
-    if !app.is_single_file_view {
+    // don't need a banner that confuses horizontal scroll). It's also hidden
+    // while the section has no content.
+    if app.show_review_comments_header() {
         let general_indicator = cursor_indicator_spaced(line_idx, current_line_idx);
         lines.push(Line::from(vec![
             Span::styled(
@@ -109,7 +137,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
         let summary_lines = comment_panel::format_remote_review_summary_lines(
             &app.theme,
             summary,
-            app.forge_display_name(),
+            app.forge_kind(),
         );
         for mut summary_line in summary_lines {
             let indicator = cursor_indicator(line_idx, current_line_idx);
@@ -138,6 +166,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                 app.comment_vim_mode_label()
                     .as_ref()
                     .map(|(t, w)| (t.as_str(), *w)),
+                app.supports_keyboard_enhancement,
             );
             comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
             comment_cursor_column = 1 + cursor_info.column;
@@ -157,6 +186,11 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                 line_idx += 1;
             }
         } else {
+            let rows = App::comment_display_lines(comment, inner.width as usize);
+            if !comment_box_visible(line_idx, rows, (visible_start, visible_end)) {
+                skip_comment_box(&mut lines, &mut line_idx, rows);
+                continue;
+            }
             let comment_lines = comment_panel::format_comment_lines(
                 &app.theme,
                 comment_type_presentation(app, &comment.comment_type),
@@ -194,7 +228,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                     &app.theme,
                     thread,
                     muted,
-                    app.forge_display_name(),
+                    app.forge_kind(),
                 );
                 for mut comment_line in thread_lines {
                     let indicator = cursor_indicator(line_idx, current_line_idx);
@@ -221,6 +255,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
             app.comment_vim_mode_label()
                 .as_ref()
                 .map(|(t, w)| (t.as_str(), *w)),
+            app.supports_keyboard_enhancement,
         );
         comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
         comment_cursor_column = 1 + cursor_info.column;
@@ -244,6 +279,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
         &mut line_idx,
         current_line_idx,
         comment_width,
+        (visible_start, visible_end),
     );
 
     for (file_idx, file) in app.diff_files.iter().enumerate() {
@@ -251,6 +287,12 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
         // currently on. Navigation (`}`/`{`, file list) flips
         // `current_file_idx` and the next render shows the new file.
         if app.is_single_file_view && file_idx != app.diff_state.current_file_idx {
+            continue;
+        }
+        // File-tree include/exclude filters hide files from the diff too.
+        // Must stay in lockstep with `App::file_render_height`, which counts
+        // these files as zero lines.
+        if !app.file_passes_filter(file) {
             continue;
         }
         let path = file.display_path();
@@ -273,10 +315,9 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
             line_idx += 1;
         }
 
-        // If file is reviewed (and we're in multi-file view), skip
-        // rendering the body. In single-file view the user explicitly
-        // focused this file, so show its content under a dimmed banner.
-        if is_reviewed && !app.is_single_file_view {
+        // Reviewed files normally collapse in continuous view. A summary jump
+        // may reveal one target body without changing its reviewed marker.
+        if app.should_collapse_file(file_idx) {
             continue;
         }
         if is_reviewed && app.is_single_file_view {
@@ -284,7 +325,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
             lines.push(Line::from(vec![
                 Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
                 Span::styled(
-                    "  Marked reviewed -- r to re-open",
+                    crate::ui::diff_view::REVIEWED_BANNER_TEXT,
                     Style::default()
                         .fg(app.theme.fg_secondary)
                         .add_modifier(Modifier::DIM),
@@ -321,6 +362,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                         app.comment_vim_mode_label()
                             .as_ref()
                             .map(|(t, w)| (t.as_str(), *w)),
+                        app.supports_keyboard_enhancement,
                     );
                     // Track cursor position: logical line = current line_idx + cursor offset within input
                     comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
@@ -346,6 +388,11 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                         line_idx += 1;
                     }
                 } else {
+                    let rows = App::comment_display_lines(comment, inner.width as usize);
+                    if !comment_box_visible(line_idx, rows, (visible_start, visible_end)) {
+                        skip_comment_box(&mut lines, &mut line_idx, rows);
+                        continue;
+                    }
                     let comment_lines = comment_panel::format_comment_lines(
                         &app.theme,
                         comment_type_presentation(app, &comment.comment_type),
@@ -389,7 +436,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                 &app.theme,
                 thread,
                 muted,
-                app.forge_display_name(),
+                app.forge_kind(),
             ) {
                 let indicator = cursor_indicator(line_idx, current_line_idx);
                 comment_line.spans.insert(
@@ -414,6 +461,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                 app.comment_vim_mode_label()
                     .as_ref()
                     .map(|(t, w)| (t.as_str(), *w)),
+                app.supports_keyboard_enhancement,
             );
             // Track cursor position
             comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
@@ -482,14 +530,19 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                                 line_idx += 1;
                                 continue;
                             }
+                            let line_search = app
+                                .search_paint_at(line_idx)
+                                .map(|needle| (needle, search_style));
                             render_expanded_context_line(
                                 &mut lines,
+                                &mut content_rows,
                                 &mut line_idx,
                                 current_line_idx,
                                 expanded_line,
                                 &app.theme,
                                 lw,
                                 app.relative_line_numbers,
+                                line_search,
                             );
                         }
                     }
@@ -558,14 +611,19 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                                 line_idx += 1;
                                 continue;
                             }
+                            let line_search = app
+                                .search_paint_at(line_idx)
+                                .map(|needle| (needle, search_style));
                             render_expanded_context_line(
                                 &mut lines,
+                                &mut content_rows,
                                 &mut line_idx,
                                 current_line_idx,
                                 expanded_line,
                                 &app.theme,
                                 lw,
                                 app.relative_line_numbers,
+                                line_search,
                             );
                         }
                     }
@@ -581,7 +639,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                     Span::styled(hunk_header_text, hunk_header_style),
                 ]));
                 line_idx += 1;
-                if is_hunk_reviewed {
+                if app.should_collapse_hunk(file_idx, hunk_idx) {
                     continue;
                 }
 
@@ -603,18 +661,14 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                         let style = base_style;
                         // A commit message is prose, not code: render it without
                         // line numbers, matching the side-by-side view.
-                        let line_num_str = if file.is_commit_message {
-                            " ".repeat(lw + 1)
-                        } else if app.relative_line_numbers {
-                            crate::ui::diff_view::relative_line_number_field(
-                                diff_line.new_lineno.or(diff_line.old_lineno),
-                                line_idx,
-                                current_line_idx,
-                                lw,
-                            )
-                        } else {
-                            crate::ui::diff_view::unified_line_number_field(diff_line, lw)
-                        };
+                        let line_num_str = crate::ui::diff_view::unified_line_number_field(
+                            diff_line,
+                            lw,
+                            app.relative_line_numbers,
+                            line_idx,
+                            current_line_idx,
+                            file.is_commit_message,
+                        );
                         let prefix = crate::ui::diff_view::unified_line_origin_marker(diff_line);
 
                         let indicator = cursor_indicator(line_idx, current_line_idx);
@@ -629,10 +683,17 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                             Span::styled(line_num_str, line_num_style),
                             Span::styled(format!("{prefix} "), style),
                         ];
+                        let content_start = line_spans.len();
+                        content_rows.insert(line_idx);
 
                         if let Some(ref highlighted) = diff_line.highlighted_spans {
                             for (span_style, span_text) in highlighted {
-                                line_spans.push(Span::styled(span_text.clone(), *span_style));
+                                let live_style = styles::patch_highlighted_span_bg(
+                                    *span_style,
+                                    &app.theme,
+                                    diff_line.origin,
+                                );
+                                line_spans.push(Span::styled(span_text.clone(), live_style));
                             }
                         } else {
                             line_spans.push(Span::styled(diff_line.content.clone(), style));
@@ -640,10 +701,11 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
 
                         // Mark add/del lines with their effective EOL style so we can paint full
                         // row backgrounds later (including wrapped visual rows).
-                        if matches!(
+                        let eol_marker = matches!(
                             diff_line.origin,
                             LineOrigin::Addition | LineOrigin::Deletion
-                        ) {
+                        )
+                        .then(|| {
                             let eol_style = match diff_line.highlighted_spans.as_ref() {
                                 // For syntax-highlighted lines (including empty highlighted lines),
                                 // use syntax diff background so row fill matches code spans.
@@ -660,8 +722,18 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                                 None => line_spans.last().map(|s| s.style).unwrap_or(style),
                             };
                             // Zero-width marker span carrying the background style.
-                            line_spans.push(Span::styled(String::new(), eol_style));
+                            Span::styled(String::new(), eol_style)
+                        });
+
+                        if let Some(needle) = app.search_paint_at(line_idx) {
+                            let content_spans = line_spans.split_off(content_start);
+                            line_spans.extend(crate::ui::text_utils::apply_search_highlight_spans(
+                                content_spans,
+                                needle,
+                                search_style,
+                            ));
                         }
+                        line_spans.extend(eol_marker);
 
                         lines.push(Line::from(line_spans));
                         line_idx += 1;
@@ -702,6 +774,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                                                 app.comment_vim_mode_label()
                                                     .as_ref()
                                                     .map(|(t, w)| (t.as_str(), *w)),
+                                                app.supports_keyboard_enhancement,
                                             );
                                         comment_cursor_logical_line =
                                             Some(line_idx + cursor_info.line_offset);
@@ -745,30 +818,49 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                                         let line_range = comment
                                             .line_range
                                             .or_else(|| Some(LineRange::single(old_ln)));
-                                        let comment_lines = comment_panel::format_comment_lines(
-                                            &app.theme,
-                                            comment_type_presentation(app, &comment.comment_type),
-                                            &comment.content,
-                                            line_range,
-                                            comment_width,
-                                            (comment.author != app.username)
-                                                .then_some(comment.author.as_str()),
-                                        );
                                         let box_top_row = line_idx;
-                                        for mut comment_line in comment_lines {
-                                            let is_current = line_idx == current_line_idx;
-                                            let indicator = if is_current { "▶" } else { " " };
-                                            comment_line.spans.insert(
-                                                0,
-                                                Span::styled(
-                                                    indicator,
-                                                    styles::current_line_indicator_style(
-                                                        &app.theme,
-                                                    ),
+                                        let rows = App::comment_display_lines(
+                                            comment,
+                                            inner.width as usize,
+                                        );
+                                        // The bar is recorded either way: it is
+                                        // painted above the box, so it can be on
+                                        // screen while the box itself is not.
+                                        if !comment_box_visible(
+                                            line_idx,
+                                            rows,
+                                            (visible_start, visible_end),
+                                        ) {
+                                            skip_comment_box(&mut lines, &mut line_idx, rows);
+                                        } else {
+                                            let comment_lines = comment_panel::format_comment_lines(
+                                                &app.theme,
+                                                comment_type_presentation(
+                                                    app,
+                                                    &comment.comment_type,
                                                 ),
+                                                &comment.content,
+                                                line_range,
+                                                comment_width,
+                                                (comment.author != app.username)
+                                                    .then_some(comment.author.as_str()),
                                             );
-                                            lines.push(comment_line);
-                                            line_idx += 1;
+                                            for mut comment_line in comment_lines {
+                                                let is_current = line_idx == current_line_idx;
+                                                let indicator =
+                                                    if is_current { "▶" } else { " " };
+                                                comment_line.spans.insert(
+                                                    0,
+                                                    Span::styled(
+                                                        indicator,
+                                                        styles::current_line_indicator_style(
+                                                            &app.theme,
+                                                        ),
+                                                    ),
+                                                );
+                                                lines.push(comment_line);
+                                                line_idx += 1;
+                                            }
                                         }
                                         push_comment_bar(
                                             &mut comment_bars,
@@ -810,6 +902,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                                     app.comment_vim_mode_label()
                                         .as_ref()
                                         .map(|(t, w)| (t.as_str(), *w)),
+                                    app.supports_keyboard_enhancement,
                                 );
                             comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
                             comment_cursor_column = 1 + cursor_info.column;
@@ -869,6 +962,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                                                 app.comment_vim_mode_label()
                                                     .as_ref()
                                                     .map(|(t, w)| (t.as_str(), *w)),
+                                                app.supports_keyboard_enhancement,
                                             );
                                         comment_cursor_logical_line =
                                             Some(line_idx + cursor_info.line_offset);
@@ -912,30 +1006,48 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                                         let line_range = comment
                                             .line_range
                                             .or_else(|| Some(LineRange::single(new_ln)));
-                                        let comment_lines = comment_panel::format_comment_lines(
-                                            &app.theme,
-                                            comment_type_presentation(app, &comment.comment_type),
-                                            &comment.content,
-                                            line_range,
-                                            comment_width,
-                                            (comment.author != app.username)
-                                                .then_some(comment.author.as_str()),
-                                        );
                                         let box_top_row = line_idx;
-                                        for mut comment_line in comment_lines {
-                                            let indicator =
-                                                cursor_indicator(line_idx, current_line_idx);
-                                            comment_line.spans.insert(
-                                                0,
-                                                Span::styled(
-                                                    indicator,
-                                                    styles::current_line_indicator_style(
-                                                        &app.theme,
-                                                    ),
+                                        let rows = App::comment_display_lines(
+                                            comment,
+                                            inner.width as usize,
+                                        );
+                                        // The bar is recorded either way: it is
+                                        // painted above the box, so it can be on
+                                        // screen while the box itself is not.
+                                        if !comment_box_visible(
+                                            line_idx,
+                                            rows,
+                                            (visible_start, visible_end),
+                                        ) {
+                                            skip_comment_box(&mut lines, &mut line_idx, rows);
+                                        } else {
+                                            let comment_lines = comment_panel::format_comment_lines(
+                                                &app.theme,
+                                                comment_type_presentation(
+                                                    app,
+                                                    &comment.comment_type,
                                                 ),
+                                                &comment.content,
+                                                line_range,
+                                                comment_width,
+                                                (comment.author != app.username)
+                                                    .then_some(comment.author.as_str()),
                                             );
-                                            lines.push(comment_line);
-                                            line_idx += 1;
+                                            for mut comment_line in comment_lines {
+                                                let indicator =
+                                                    cursor_indicator(line_idx, current_line_idx);
+                                                comment_line.spans.insert(
+                                                    0,
+                                                    Span::styled(
+                                                        indicator,
+                                                        styles::current_line_indicator_style(
+                                                            &app.theme,
+                                                        ),
+                                                    ),
+                                                );
+                                                lines.push(comment_line);
+                                                line_idx += 1;
+                                            }
                                         }
                                         push_comment_bar(
                                             &mut comment_bars,
@@ -977,6 +1089,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                                     app.comment_vim_mode_label()
                                         .as_ref()
                                         .map(|(t, w)| (t.as_str(), *w)),
+                                    app.supports_keyboard_enhancement,
                                 );
                             comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
                             comment_cursor_column = 1 + cursor_info.column;
@@ -1036,14 +1149,19 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                 // Render top expanded lines (↓ direction)
                 if let Some(top) = top_lines {
                     for expanded_line in top {
+                        let line_search = app
+                            .search_paint_at(line_idx)
+                            .map(|needle| (needle, search_style));
                         render_expanded_context_line(
                             &mut lines,
+                            &mut content_rows,
                             &mut line_idx,
                             current_line_idx,
                             expanded_line,
                             &app.theme,
                             lw,
                             app.relative_line_numbers,
+                            line_search,
                         );
                     }
                 }
@@ -1072,14 +1190,19 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
                 // Render bottom expanded lines
                 if let Some(bot) = bot_lines {
                     for expanded_line in bot {
+                        let line_search = app
+                            .search_paint_at(line_idx)
+                            .map(|needle| (needle, search_style));
                         render_expanded_context_line(
                             &mut lines,
+                            &mut content_rows,
                             &mut line_idx,
                             current_line_idx,
                             expanded_line,
                             &app.theme,
                             lw,
                             app.relative_line_numbers,
+                            line_search,
                         );
                     }
                 }
@@ -1121,12 +1244,18 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
     // Auto-scroll so the comment input box stays visible while the user types.
     // Without this, adding a comment near the bottom/top of the viewport would
     // place the input box off-screen and the user couldn't see what they type.
+    let wrap = app.diff_state.wrap_lines;
+    let viewport_width = inner.width as usize;
+    let gutter_wrap = app.wrap_style == WrapStyle::Gutter;
+    let content_start =
+        |idx: usize| (gutter_wrap && content_rows.contains(&idx)).then_some(GUTTER_SPANS);
     scroll_comment_input_into_view(
         &mut app.diff_state.scroll_offset,
         comment_input_box_range,
         comment_cursor_logical_line,
         inner.height as usize,
         lines.len(),
+        |idx| unified_row_height(&lines, idx, content_start(idx), wrap, viewport_width),
     );
 
     let visible_lines_unscrolled: Vec<Line> = lines
@@ -1152,8 +1281,6 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
     app.diff_state.max_content_width = max_content_width;
 
     let scroll_offset = app.diff_state.scroll_offset;
-    let wrap = app.diff_state.wrap_lines;
-    let viewport_width = inner.width as usize;
     let visible_lines_unscrolled_for_bg = visible_lines_unscrolled.clone();
     // Single pass: wrap each logical line once, producing both the visual
     // rows to render and the per-line height used by every row-mapping
@@ -1162,8 +1289,12 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
         if wrap && viewport_width > 0 {
             let mut heights = Vec::with_capacity(visible_lines_unscrolled_for_bg.len());
             let mut out: Vec<Line> = Vec::new();
-            for line in &visible_lines_unscrolled_for_bg {
-                let rows = crate::ui::text_utils::wrap_spans(&line.spans, viewport_width);
+            for (i, line) in visible_lines_unscrolled_for_bg.iter().enumerate() {
+                let rows = wrap_spans_hanging(
+                    &line.spans,
+                    content_start(scroll_offset + i),
+                    viewport_width,
+                );
                 heights.push(rows.len());
                 out.extend(rows.into_iter().map(Line::from));
             }
@@ -1217,6 +1348,7 @@ pub(super) fn render_unified_diff(frame: &mut Frame, app: &mut App, area: Rect) 
         scroll_offset: app.diff_state.scroll_offset,
         theme: &app.theme,
         comment_bars: &comment_bars,
+        fixed_gutters: false,
     };
 
     // Section-marker row tint (hunk headers + expand/hidden stubs). Painted
@@ -1338,12 +1470,8 @@ fn render_remote_threads_for_anchor(
 
         // Render the entire thread as one fused box so it reads as a
         // single discussion unit.
-        let thread_lines = comment_panel::format_remote_thread_lines(
-            &app.theme,
-            thread,
-            muted,
-            app.forge_display_name(),
-        );
+        let thread_lines =
+            comment_panel::format_remote_thread_lines(&app.theme, thread, muted, app.forge_kind());
         let box_top_row = *line_idx;
         for mut comment_line in thread_lines {
             let indicator = cursor_indicator(*line_idx, current_line_idx);
@@ -1366,35 +1494,45 @@ fn render_remote_threads_for_anchor(
 }
 
 /// Render a single expanded context line (shared by unified + side-by-side via unified path)
+#[allow(clippy::too_many_arguments)]
 fn render_expanded_context_line(
     lines: &mut Vec<Line<'_>>,
+    content_rows: &mut HashSet<usize>,
     line_idx: &mut usize,
     current_line_idx: usize,
     expanded_line: &crate::model::DiffLine,
     theme: &Theme,
     lw: usize,
     relative_line_numbers: bool,
+    search: Option<(&crate::ui::text_utils::SearchPattern, Style)>,
 ) {
     let indicator = cursor_indicator(*line_idx, current_line_idx);
-    let line_num = if relative_line_numbers {
-        crate::ui::diff_view::relative_line_number_field(
-            expanded_line.new_lineno,
-            *line_idx,
-            current_line_idx,
-            lw,
-        )
-    } else {
-        crate::ui::diff_view::expanded_context_lineno_field(expanded_line, lw)
-    };
-    let line_spans = vec![
+    let line_num = crate::ui::diff_view::expanded_context_lineno_field(
+        expanded_line,
+        lw,
+        relative_line_numbers,
+        *line_idx,
+        current_line_idx,
+    );
+    let mut line_spans = vec![
         Span::styled(indicator, styles::current_line_indicator_style(theme)),
         Span::styled(line_num, styles::expanded_context_style(theme)),
         Span::styled("  ", styles::expanded_context_style(theme)),
-        Span::styled(
-            expanded_line.content.clone(),
-            styles::expanded_context_style(theme),
-        ),
     ];
+    let content_start = line_spans.len();
+    content_rows.insert(*line_idx);
+    line_spans.push(Span::styled(
+        expanded_line.content.clone(),
+        styles::expanded_context_style(theme),
+    ));
+    if let Some((needle, hl)) = search {
+        let content_spans = line_spans.split_off(content_start);
+        line_spans.extend(crate::ui::text_utils::apply_search_highlight_spans(
+            content_spans,
+            needle,
+            hl,
+        ));
+    }
     lines.push(Line::from(line_spans));
     *line_idx += 1;
 }
@@ -1403,8 +1541,11 @@ fn render_expanded_context_line(
 mod remote_comments_snapshot_tests {
     //! Render-snapshot tests for inline remote review threads in the
     //! unified diff. We drive `ui::render` against `TestBackend` and check
-    //! for the `[github @author]` badge text on the expected row.
-    use crate::app::{App, DiffSource, InputMode, PullRequestDiffSource};
+    //! for the provider badge text on the expected row.
+    use crate::app::{
+        AnnotatedLine, App, DiffSource, DiffViewMode, InputMode, PullRequestDiffSource, SelPoint,
+        VisualSelection, WrapStyle,
+    };
     use crate::error::Result as TuicrResult;
     use crate::error::TuicrError;
     use crate::forge::remote_comments::{
@@ -1412,7 +1553,8 @@ mod remote_comments_snapshot_tests {
     };
     use crate::forge::traits::{ForgeRepository, PrSessionKey};
     use crate::model::{
-        DiffFile, DiffHunk, DiffLine, FileStatus, LineOrigin, ReviewSession, SessionDiffSource,
+        DiffFile, DiffHunk, DiffLine, FileStatus, LineOrigin, LineSide, ReviewSession,
+        SessionDiffSource,
     };
     use crate::syntax::SyntaxHighlighter;
     use crate::theme::Theme;
@@ -1636,6 +1778,17 @@ mod remote_comments_snapshot_tests {
         terminal.backend().buffer().clone()
     }
 
+    fn draw_diff(app: &mut App) -> Buffer {
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::diff_view::render_diff_view(frame, app, Rect::new(0, 0, 100, 12))
+            })
+            .expect("draw diff");
+        terminal.backend().buffer().clone()
+    }
+
     fn draw_unified_diff(app: &mut App) -> Buffer {
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1690,6 +1843,236 @@ mod remote_comments_snapshot_tests {
         }
     }
 
+    fn wrapping_diff_file(count: u32) -> DiffFile {
+        let lines: Vec<DiffLine> = (1..=count)
+            .map(|i| DiffLine {
+                origin: LineOrigin::Addition,
+                content: format!("line {i} {}", "x".repeat(120)),
+                old_lineno: None,
+                new_lineno: Some(i),
+                highlighted_spans: None,
+            })
+            .collect();
+        let hunks = vec![DiffHunk {
+            header: format!("@@ -0,0 +1,{count} @@"),
+            lines,
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: count,
+        }];
+        let content_hash = DiffFile::compute_content_hash(&hunks);
+        DiffFile {
+            old_path: None,
+            new_path: Some(PathBuf::from("src/lib.rs")),
+            status: FileStatus::Added,
+            hunks,
+            is_binary: false,
+            is_too_large: false,
+            is_commit_message: false,
+            content_hash,
+        }
+    }
+
+    #[test]
+    fn should_align_wrapped_diff_content_after_blank_gutters() {
+        for origin in [
+            LineOrigin::Addition,
+            LineOrigin::Deletion,
+            LineOrigin::Context,
+        ] {
+            for relative in [false, true] {
+                let mut file = wrapping_diff_file(1);
+                let line = &mut file.hunks[0].lines[0];
+                line.origin = origin;
+                line.old_lineno = (origin != LineOrigin::Addition).then_some(1);
+                line.new_lineno = (origin != LineOrigin::Deletion).then_some(1);
+                let mut app = make_revision_app(vec![file]);
+                app.relative_line_numbers = relative;
+                app.wrap_style = WrapStyle::Gutter;
+                app.set_diff_wrap(true);
+                let _ = draw_unified_diff(&mut app);
+                let inner = app.diff_inner_area.unwrap();
+                let gutter = crate::app::unified_gutter(app.lineno_width());
+                let content_width = (inner.width - gutter) as usize;
+                app.diff_files[0].hunks[0].lines[0].content = "x".repeat(2 * content_width + 5);
+                app.rebuild_annotations();
+                let buffer = draw_unified_diff(&mut app);
+                let annotation_idx = app
+                    .line_annotations
+                    .iter()
+                    .position(|annotation| {
+                        matches!(annotation, crate::app::AnnotatedLine::DiffLine { .. })
+                    })
+                    .unwrap();
+                let rows: Vec<usize> = app
+                    .diff_row_to_annotation
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(row, &idx)| (idx == annotation_idx).then_some(row))
+                    .collect();
+                assert_eq!(rows.len(), 3);
+                assert_eq!(
+                    crate::ui::row_height::annotation_row_height(&app, annotation_idx),
+                    3
+                );
+                for (i, row) in rows.into_iter().enumerate() {
+                    let y = inner.y + row as u16;
+                    assert_eq!(buffer[(inner.x + gutter, y)].symbol(), "x");
+                    if i == 0 {
+                        let marker = if origin == LineOrigin::Context {
+                            " "
+                        } else {
+                            "▌"
+                        };
+                        assert_eq!(buffer[(inner.x + gutter - 2, y)].symbol(), marker);
+                    } else {
+                        for x in inner.x..inner.x + gutter {
+                            assert_eq!(buffer[(x, y)].symbol(), " ");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn should_align_wrapped_code_after_comment_input_box() {
+        let mut file = wrapping_diff_file(2);
+        file.hunks[0].lines[0].content = "before the box".to_string();
+        file.hunks[0].lines[1].content = "y".repeat(190);
+        let mut app = make_revision_app(vec![file]);
+        app.wrap_style = WrapStyle::Gutter;
+        app.set_diff_wrap(true);
+        let _ = draw_unified_diff(&mut app);
+        app.enter_comment_mode(false, Some((1, LineSide::New)));
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal
+            .draw(|frame| super::render_unified_diff(frame, &mut app, Rect::new(0, 0, 100, 40)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(body_text(buffer).contains("Type your comment..."));
+        let inner = app.diff_inner_area.unwrap();
+        let gutter = crate::app::unified_gutter(app.lineno_width());
+        let rows: Vec<_> = (inner.y..inner.bottom())
+            .filter(|&y| buffer[(inner.x + gutter, y)].symbol() == "y")
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(buffer[(inner.x + gutter - 2, rows[0])].symbol(), "▌");
+        for &y in &rows[1..] {
+            for x in inner.x..inner.x + gutter {
+                assert_eq!(buffer[(x, y)].symbol(), " ");
+            }
+        }
+    }
+
+    #[test]
+    fn should_wrap_from_left_edge_by_default() {
+        let mut app = make_revision_app(vec![wrapping_diff_file(1)]);
+        app.set_diff_wrap(true);
+        let buffer = draw_unified_diff(&mut app);
+        let inner = app.diff_inner_area.unwrap();
+        let annotation_idx = app
+            .line_annotations
+            .iter()
+            .position(|annotation| matches!(annotation, AnnotatedLine::DiffLine { .. }))
+            .unwrap();
+        let continuation = app
+            .diff_row_to_annotation
+            .iter()
+            .enumerate()
+            .filter(|&(_, &idx)| idx == annotation_idx)
+            .nth(1)
+            .unwrap()
+            .0;
+        assert_eq!(
+            buffer[(inner.x, inner.y + continuation as u16)].symbol(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn should_select_word_wrapped_rows_by_their_drawn_text() {
+        for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+            let mut app = make_revision_app(vec![wrapping_diff_file(1)]);
+            app.diff_view_mode = mode;
+            app.wrap_style = WrapStyle::Gutter;
+            app.cursor_line_highlight = false;
+            app.set_diff_wrap(true);
+            let _ = draw_diff(&mut app);
+            let inner = app.diff_inner_area.unwrap();
+            let geom = app.pane_geometry(inner, LineSide::New);
+            let width = geom.content_width;
+            let content = format!("{} {} ccccc", "a".repeat(width - 3), "b".repeat(width - 2));
+            let total = content.chars().count();
+            app.diff_files[0].hunks[0].lines[0].content = content;
+            app.rebuild_annotations();
+            let _ = draw_diff(&mut app);
+            let annotation_idx = app
+                .line_annotations
+                .iter()
+                .position(|annotation| {
+                    matches!(
+                        annotation,
+                        AnnotatedLine::DiffLine { .. } | AnnotatedLine::SideBySideLine { .. }
+                    )
+                })
+                .unwrap();
+            let rows: Vec<u16> = app
+                .diff_row_to_annotation
+                .iter()
+                .enumerate()
+                .filter(|&(_, &idx)| idx == annotation_idx)
+                .map(|(row, _)| inner.y + row as u16)
+                .collect();
+            assert_eq!(rows.len(), 3, "{mode:?}");
+
+            // Rows hold "a… ", "b… " and "ccccc", so each starts after the
+            // previous row's text rather than at a multiple of the width.
+            let row_starts: Vec<usize> = rows
+                .iter()
+                .map(|&y| {
+                    app.cell_to_sel_point(geom.content_x_start, y)
+                        .unwrap()
+                        .char_offset
+                })
+                .collect();
+            assert_eq!(row_starts, [0, width - 2, 2 * width - 3], "{mode:?}");
+
+            let point = |char_offset| SelPoint {
+                annotation_idx,
+                char_offset,
+                side: LineSide::New,
+            };
+            app.visual_selection = Some(VisualSelection {
+                anchor: point(0),
+                head: point(total),
+            });
+            let buffer = draw_diff(&mut app);
+            let selected = |col: usize, y: u16| {
+                buffer[(geom.content_x_start + col as u16, y)].bg == app.theme.bg_highlight
+            };
+            assert!(selected(width - 3, rows[0]), "{mode:?}");
+            assert!(!selected(width - 2, rows[0]), "{mode:?}");
+            assert!(selected(4, rows[2]), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn should_show_comment_input_at_eof_when_lines_wrap() {
+        let mut app = make_revision_app(vec![wrapping_diff_file(40)]);
+        app.diff_state.wrap_lines = true;
+        let _ = draw_unified_diff(&mut app);
+        app.jump_to_bottom();
+        app.enter_comment_mode(false, Some((40, LineSide::New)));
+        let buffer = draw_unified_diff(&mut app);
+        let body = body_text(&buffer);
+        assert!(
+            body.contains("Type your comment..."),
+            "expected the comment input box to be visible in:\n{body}"
+        );
+    }
+
     #[test]
     fn should_render_commit_message_without_line_numbers_in_unified() {
         let mut app = make_revision_app(vec![commit_message_file(
@@ -1731,7 +2114,6 @@ mod remote_comments_snapshot_tests {
         let mut app = make_pr_app();
         app.forge_review_threads = vec![thread("t1", "alice", "looks good?", 2, false, false)];
         app.rebuild_annotations();
-        // when
         let buffer = draw(&mut app);
         // then — the badge appears somewhere in the rendered frame
         let body = body_text(&buffer);
@@ -1797,7 +2179,6 @@ mod remote_comments_snapshot_tests {
         let before = body_text(&draw(&mut app));
         assert!(before.contains("[github @alice]"));
 
-        // when
         assert!(app.set_remote_comments_visibility(PrCommentsVisibility::Hide));
         // then
         let after = body_text(&draw(&mut app));
@@ -1852,7 +2233,6 @@ mod remote_comments_snapshot_tests {
             }],
         }];
         app.rebuild_annotations();
-        // when
         let buffer = draw(&mut app);
         let body = body_text(&buffer);
         // then — the badge and body appear in the rendered frame
@@ -1973,6 +2353,167 @@ mod remote_comments_snapshot_tests {
         );
     }
 
+    /// Comment boxes outside the viewport are replaced with blank placeholder
+    /// rows instead of being formatted. The rows still have to be there, and in
+    /// the right number, or every row below the comment would shift — so this
+    /// also scrolls to the row `line_annotations` assigned the comment and
+    /// expects the box to be there.
+    #[test]
+    fn should_cull_comment_boxes_outside_the_viewport() {
+        use crate::app::AnnotatedLine;
+        use crate::model::{Comment, CommentType};
+
+        const NEEDLE: &str = "far-below-the-fold";
+
+        let lines: Vec<DiffLine> = (1..=120)
+            .map(|n| DiffLine {
+                origin: LineOrigin::Addition,
+                content: format!("line {n}"),
+                old_lineno: None,
+                new_lineno: Some(n),
+                highlighted_spans: None,
+            })
+            .collect();
+        let hunks = vec![DiffHunk {
+            header: "@@ -0,0 +1,120 @@".to_string(),
+            lines,
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 120,
+        }];
+        let content_hash = DiffFile::compute_content_hash(&hunks);
+        let path = PathBuf::from("src/lib.rs");
+        let file = DiffFile {
+            old_path: Some(path.clone()),
+            new_path: Some(path.clone()),
+            status: FileStatus::Modified,
+            hunks,
+            is_binary: false,
+            is_too_large: false,
+            is_commit_message: false,
+            content_hash,
+        };
+
+        let mut app = make_revision_app(vec![file]);
+        app.session
+            .get_file_mut(&path)
+            .expect("file registered in session")
+            .add_line_comment(
+                100,
+                Comment::new(NEEDLE.to_string(), CommentType::from_id("note"), None),
+            );
+        app.rebuild_annotations();
+
+        // Top of the file: the comment is ~100 rows below a 12-row viewport.
+        let buffer = draw_unified_diff(&mut app);
+        let body = body_text(&buffer);
+        assert!(
+            !body.contains(NEEDLE),
+            "off-screen comment should not be visible:\n{body}"
+        );
+        assert!(
+            body.contains("line 1"),
+            "diff content should still render:\n{body}"
+        );
+
+        // Scroll to the row the annotation builder says the comment occupies.
+        // If the culled box had emitted the wrong number of placeholder rows,
+        // this index would point somewhere else and the body would not appear.
+        let comment_row = app
+            .line_annotations
+            .iter()
+            .position(|a| matches!(a, AnnotatedLine::LineComment { .. }))
+            .expect("comment annotated in the document");
+        app.diff_state.scroll_offset = comment_row;
+        app.diff_state.cursor_line = comment_row;
+
+        let buffer = draw_unified_diff(&mut app);
+        let body = body_text(&buffer);
+        assert!(
+            body.contains(NEEDLE),
+            "comment scrolled into view should render at its annotated row:\n{body}"
+        );
+    }
+
+    #[test]
+    fn should_reach_last_line_scrolling_down_through_wrapped_content() {
+        // Many long lines that wrap to several visual rows each, so far fewer
+        // logical lines fit per screen than the viewport height. This is
+        // what makes `visible_line_count` (wrap-aware) diverge sharply from
+        // `viewport_height`. A short, uniquely-named last line lets us detect
+        // whether repeated `j` ever scrolls it into view.
+        let long: String = "x".repeat(200);
+        let mut lines: Vec<DiffLine> = (0..30)
+            .map(|i| DiffLine {
+                origin: LineOrigin::Addition,
+                content: long.clone(),
+                old_lineno: None,
+                new_lineno: Some(i + 1),
+                highlighted_spans: None,
+            })
+            .collect();
+        lines.push(DiffLine {
+            origin: LineOrigin::Addition,
+            content: "LASTLINEMARKER".to_string(),
+            old_lineno: None,
+            new_lineno: Some(31),
+            highlighted_spans: None,
+        });
+        let hunk = DiffHunk {
+            header: "@@ -0,0 +1,31 @@".to_string(),
+            lines,
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 31,
+        };
+        let hunks = vec![hunk];
+        let content_hash = DiffFile::compute_content_hash(&hunks);
+        let file = DiffFile {
+            old_path: Some(PathBuf::from("src/lib.rs")),
+            new_path: Some(PathBuf::from("src/lib.rs")),
+            status: FileStatus::Modified,
+            hunks,
+            is_binary: false,
+            is_too_large: false,
+            is_commit_message: false,
+            content_hash,
+        };
+        let mut app = make_revision_app(vec![file]);
+        app.set_diff_wrap(true);
+        app.rebuild_annotations();
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Drive `j` one keypress at a time, re-rendering between presses so
+        // `visible_line_count` is refreshed the way it would be in the real
+        // render loop. Far more presses than there are logical lines, so a
+        // working implementation has ample opportunity to reach the end.
+        let max_presses = app.total_lines() * 3;
+        for _ in 0..max_presses {
+            terminal
+                .draw(|frame| super::render_unified_diff(frame, &mut app, Rect::new(0, 0, 80, 20)))
+                .expect("draw");
+            app.cursor_down(1);
+        }
+        terminal
+            .draw(|frame| super::render_unified_diff(frame, &mut app, Rect::new(0, 0, 80, 20)))
+            .expect("draw");
+        let body = body_text(terminal.backend().buffer());
+
+        assert_eq!(
+            app.diff_state.cursor_line,
+            app.max_cursor_line(),
+            "cursor should saturate at the last navigable line"
+        );
+        assert!(
+            body.contains("LASTLINEMARKER"),
+            "scrolling down should eventually reveal the last line; view got stuck:\n{body}"
+        );
+    }
+
     #[test]
     fn should_extend_comment_bar_over_wrapped_rows_when_wrap_enabled() {
         use crate::model::{Comment, CommentType};
@@ -2065,5 +2606,78 @@ mod remote_comments_snapshot_tests {
                 "expected │ at ({bar_x},{y}) between cap ({cap_y}) and box top ({box_top_y}), got {glyph:?}"
             );
         }
+    }
+
+    #[test]
+    fn addition_line_background_reflects_live_theme_not_a_stale_cached_span() {
+        use ratatui::style::{Color, Style};
+
+        fn find_text_cell(buffer: &Buffer, needle: &str) -> (u16, u16) {
+            for y in buffer.area.y..buffer.area.y + buffer.area.height {
+                for x in buffer.area.x..buffer.area.x + buffer.area.width {
+                    if buffer[(x, y)].symbol() == &needle[..1] {
+                        let matches = needle.chars().enumerate().all(|(offset, ch)| {
+                            buffer[(x + offset as u16, y)].symbol() == ch.to_string()
+                        });
+                        if matches {
+                            return (x, y);
+                        }
+                    }
+                }
+            }
+            panic!("could not find {needle:?} in rendered buffer");
+        }
+
+        // Marker background baked into `highlighted_spans`, standing in for
+        // "highlighted under whatever theme was active when the diff was
+        // loaded." No real syntax highlighter produces this exact color.
+        let marker_bg = Color::Rgb(1, 2, 3);
+        let lines = vec![DiffLine {
+            origin: LineOrigin::Addition,
+            content: "added".to_string(),
+            old_lineno: None,
+            new_lineno: Some(1),
+            highlighted_spans: Some(vec![(
+                Style::default().fg(Color::White).bg(marker_bg),
+                "added".to_string(),
+            )]),
+        }];
+        let hunk = DiffHunk {
+            header: "@@ -0,0 +1,1 @@".to_string(),
+            lines,
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+        };
+        let hunks = vec![hunk];
+        let content_hash = DiffFile::compute_content_hash(&hunks);
+        let diff_file = DiffFile {
+            old_path: None,
+            new_path: Some(PathBuf::from("src/lib.rs")),
+            status: FileStatus::Added,
+            hunks,
+            is_binary: false,
+            is_too_large: false,
+            is_commit_message: false,
+            content_hash,
+        };
+
+        let mut app = make_revision_app(vec![diff_file]);
+        let expected_bg = app.theme.syntax_add_bg;
+        assert_ne!(
+            expected_bg, marker_bg,
+            "test needs the live theme's bg to differ from the stale marker"
+        );
+
+        let buffer = draw_unified_diff(&mut app);
+        let (x, y) = find_text_cell(&buffer, "added");
+
+        assert_eq!(
+            buffer[(x, y)].bg,
+            expected_bg,
+            "rendered addition-line background must come from the live theme, \
+             not the cached span's baked-in color"
+        );
     }
 }

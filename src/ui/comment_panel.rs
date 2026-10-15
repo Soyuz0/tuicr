@@ -8,6 +8,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
+use crate::forge::traits::ForgeKind;
 use crate::model::LineRange;
 use crate::theme::Theme;
 use crate::ui::styles;
@@ -47,6 +48,63 @@ pub(crate) fn wrap_segments(text: &str, content_area: usize) -> Vec<&str> {
         remaining = rest;
     }
     segments
+}
+
+fn comment_content_width(width: usize) -> usize {
+    // Reserve the prefix, a cell to prevent ratatui wrapping exact-fit rows,
+    // and a cell for the cursor at the end of a segment.
+    width.saturating_sub(BORDER_PREFIX_WIDTH + 2)
+}
+
+/// Move one displayed row using the same box width and wrapping as
+/// `format_comment_input_lines`. Retain the preferred screen column when
+/// the destination row is shorter.
+pub(crate) fn move_comment_cursor(
+    buffer: &str,
+    cursor: usize,
+    width: usize,
+    down: bool,
+    preferred_column: &mut Option<usize>,
+) -> usize {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    for line in buffer.split('\n') {
+        for segment in wrap_segments(line, comment_content_width(width)) {
+            rows.push(start..start + segment.len());
+            start += segment.len();
+        }
+        start += 1;
+    }
+    let current = rows
+        .iter()
+        .rposition(|row| row.start <= cursor)
+        .unwrap_or(0);
+    let target = if down {
+        current.checked_add(1)
+    } else {
+        current.checked_sub(1)
+    };
+    let Some(target) = target.filter(|&index| index < rows.len()) else {
+        return cursor;
+    };
+    let row = &rows[target];
+    let column =
+        *preferred_column.get_or_insert_with(|| buffer[rows[current].start..cursor].width());
+    let text = &buffer[row.clone()];
+    // At a soft-wrap boundary, the cursor belongs to the following row.
+    // A cursor can sit after a row's text only at a newline or the buffer's end.
+    let end_stop = rows
+        .get(target + 1)
+        .is_none_or(|next| next.start != row.end)
+        .then_some(text.len());
+    // Presentation selectors can shrink prefix widths; choose the last fitting boundary.
+    let byte = text
+        .char_indices()
+        .map(|(byte, _)| byte)
+        .chain(end_stop)
+        .rfind(|&byte| text[..byte].width() <= column)
+        .unwrap_or(0);
+    row.start + byte
 }
 
 /// Emit spans covering `line_text[start..end)` using the per-line markdown
@@ -118,6 +176,7 @@ pub fn format_comment_input_lines(
     is_editing: bool,
     width: usize,
     vim_mode: Option<(&str, bool)>,
+    supports_keyboard_enhancement: bool,
 ) -> (Vec<Line<'static>>, CommentCursorInfo) {
     let type_style = styles::comment_type_style(theme, comment_type.color);
     let border_style = styles::comment_border_style(theme, comment_type.color);
@@ -132,12 +191,13 @@ pub fn format_comment_input_lines(
         None => String::new(),
     };
 
-    let newline_hint = "Shift-Enter"; // requires extended-keys on in tmux; Alt-Enter also works
+    let newline_hint = if supports_keyboard_enhancement {
+        "Shift-Enter"
+    } else {
+        "Alt-Enter"
+    };
 
-    // "    │  " is the per-line content prefix; everything past that is content.
-    // Subtract two extra: one so ratatui never wraps an exact-fit line, and
-    // one so the terminal cursor at end-of-segment stays clear of the border.
-    let content_area = width.saturating_sub(BORDER_PREFIX_WIDTH + 2);
+    let content_area = comment_content_width(width);
 
     let mut result = Vec::new();
     let mut cursor_line_offset: usize = 1;
@@ -195,10 +255,7 @@ pub fn format_comment_input_lines(
         let buffer_lines: Vec<&str> = buffer.split('\n').collect();
         // Markdown-highlight the in-progress text; colors come from the active
         // syntect theme (same engine/theme as diff code highlighting).
-        let owned_lines: Vec<String> = buffer_lines.iter().map(|s| s.to_string()).collect();
-        let highlighted = theme
-            .syntax_highlighter()
-            .highlight_markdown_lines(&owned_lines);
+        let highlighted = theme.syntax_highlighter().highlight_markdown_body(buffer);
         let mut byte_offset = 0;
         // Tracks how many visual lines have been pushed so far (not counting the header).
         let mut total_visual_lines: usize = 0;
@@ -295,14 +352,14 @@ pub fn format_comment_input_lines(
 /// box; replies appear as `├─ ↳ @author ──` separator headers within the
 /// same box; the bottom rule appears once at the end.
 ///
-/// Visually distinct from local drafts: the `[github @author]` badge on
+/// Visually distinct from local drafts: the `[forge @author]` badge on
 /// the root header, and a muted palette throughout for resolved/outdated
 /// threads.
 pub fn format_remote_thread_lines(
     theme: &Theme,
     thread: &crate::forge::remote_comments::RemoteReviewThread,
     muted: bool,
-    forge_name: &str,
+    forge_kind: Option<ForgeKind>,
 ) -> Vec<Line<'static>> {
     let (badge_fg, border_fg, body_fg) = if muted {
         (theme.fg_dim, theme.fg_dim, theme.fg_dim)
@@ -338,7 +395,7 @@ pub fn format_remote_thread_lines(
     while let Some(comment) = iter.next() {
         let author = comment.author.as_deref().unwrap_or("unknown");
         if is_first {
-            let mut badge_text = format!("[{} @{author}", forge_name.to_ascii_lowercase());
+            let mut badge_text = format!("[{} @{author}", forge_badge_label(forge_kind));
             if thread.is_resolved {
                 badge_text.push_str(" resolved");
             } else if thread.is_outdated {
@@ -379,12 +436,12 @@ pub fn format_remote_thread_lines(
 }
 
 /// Format a remote review summary (the body of a `PullRequestReview`) as a
-/// box with a `[github @author <state>]` header. Renders at review scope —
+/// box with a `[forge @author <state>]` header. Renders at review scope —
 /// no line anchor — so the top corner is `╭`, not the line-anchored `├`.
 pub fn format_remote_review_summary_lines(
     theme: &Theme,
     summary: &crate::forge::remote_comments::RemoteReviewSummary,
-    forge_name: &str,
+    forge_kind: Option<ForgeKind>,
 ) -> Vec<Line<'static>> {
     let badge_fg = theme.diff_hunk_header;
     let border_fg = theme.diff_hunk_header;
@@ -395,7 +452,7 @@ pub fn format_remote_review_summary_lines(
     let body_style = Style::default().fg(body_fg);
 
     let author = summary.author.as_deref().unwrap_or("unknown");
-    let mut badge_text = format!("[{} @{author}", forge_name.to_ascii_lowercase());
+    let mut badge_text = format!("[{} @{author}", forge_badge_label(forge_kind));
     if let Some(state_label) = summary.state.badge_label() {
         badge_text.push(' ');
         badge_text.push_str(state_label);
@@ -424,27 +481,29 @@ pub fn format_remote_review_summary_lines(
     result
 }
 
-/// Format a comment as multiple lines with a box border (themed version).
-///
-/// `author` advertises the comment's author in the top-row badge and tints
-/// the box border. Callers pass `Some(name)` for non-self comments — the
-/// resulting badge reads `[TYPE @name]`, mirroring the `[github @author]`
-/// format used for remote PR threads. `None` keeps the existing neutral
-/// `[TYPE]` badge and theme border.
-/// Render `content` as markdown-highlighted, border-prefixed, pre-wrapped lines
-/// (no cursor). Colors come from the active syntect theme. Used for displayed
-/// comment bodies; the editor box does its own variant with cursor handling.
-fn markdown_body_lines(
+fn forge_badge_label(kind: Option<ForgeKind>) -> &'static str {
+    match kind {
+        Some(ForgeKind::GitHub) => "github",
+        Some(ForgeKind::GitLab) => "gitlab",
+        Some(ForgeKind::Gitea) => "gitea",
+        Some(ForgeKind::Bitbucket) => "bitbucket",
+        Some(ForgeKind::AzureDevOps) => "azure",
+        Some(ForgeKind::Gerrit) => "gerrit",
+        None => "forge",
+    }
+}
+
+/// Render `content` as markdown-highlighted, pre-wrapped lines. Colors come
+/// from the active syntect theme.
+pub(crate) fn markdown_body_lines(
     theme: &Theme,
     content: &str,
     content_area: usize,
-    border_style: Style,
 ) -> Vec<Line<'static>> {
     let lines: Vec<&str> = content.split('\n').collect();
-    let owned: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
-    // Highlight all lines together so multi-line constructs (e.g. fenced code)
+    // Highlight the body as a whole so multi-line constructs (e.g. fenced code)
     // carry state across lines.
-    let highlighted = theme.syntax_highlighter().highlight_markdown_lines(&owned);
+    let highlighted = theme.syntax_highlighter().highlight_markdown_body(content);
 
     let mut out = Vec::new();
     for (idx, text) in lines.iter().enumerate() {
@@ -452,15 +511,22 @@ fn markdown_body_lines(
         let mut seg_start = 0usize;
         for seg in wrap_segments(text, content_area) {
             let seg_end = seg_start + seg.len();
-            let mut spans = vec![Span::styled(BORDER_PREFIX, border_style)];
-            spans.extend(highlighted_window_spans(runs, text, seg_start, seg_end));
-            out.push(Line::from(spans));
+            out.push(Line::from(highlighted_window_spans(
+                runs, text, seg_start, seg_end,
+            )));
             seg_start = seg_end;
         }
     }
     out
 }
 
+/// Format a comment as multiple lines with a box border (themed version).
+///
+/// `author` advertises the comment's author in the top-row badge and tints
+/// the box border. Callers pass `Some(name)` for non-self comments — the
+/// resulting badge reads `[TYPE @name]`, mirroring the remote forge badge
+/// format used for remote PR threads. `None` keeps the existing neutral
+/// `[TYPE]` badge and theme border.
 pub fn format_comment_lines(
     theme: &Theme,
     comment_type: CommentTypePresentation,
@@ -515,12 +581,12 @@ pub fn format_comment_lines(
     ]));
 
     // Content lines — markdown-highlighted, pre-wrapped at content_area.
-    result.extend(markdown_body_lines(
-        theme,
-        content,
-        content_area,
-        border_style,
-    ));
+    let mut body_lines = markdown_body_lines(theme, content, content_area);
+    for line in &mut body_lines {
+        line.spans
+            .insert(0, Span::styled(BORDER_PREFIX, border_style));
+    }
+    result.extend(body_lines);
 
     // Bottom border — "    ╰" = 5 chars, fill to width
     result.push(Line::from(vec![Span::styled(
@@ -580,6 +646,55 @@ mod tests {
 
     fn test_theme() -> Theme {
         Theme::default()
+    }
+
+    /// The renderer replaces off-screen comment boxes with exactly
+    /// `App::comment_display_lines` blank rows, and the annotation builder sizes
+    /// every comment the same way. If that count ever drifted from what
+    /// `format_comment_lines` actually emits, the document would desync — the
+    /// cursor would land on the wrong row and culled boxes would leave the wrong
+    /// number of gaps. Pin the two together.
+    #[test]
+    fn comment_display_lines_matches_rendered_box_height() {
+        let theme = test_theme();
+        let bodies = [
+            "",
+            "single line",
+            "first\nsecond\nthird",
+            "trailing newline\n",
+            "\n\nleading blanks",
+            &"x".repeat(300),
+            &"日本語のテキストです ".repeat(20),
+            "`code` **bold** and a very long tail that will need to wrap at least once or twice",
+        ];
+        // Viewport widths, including degenerate ones narrower than the box chrome.
+        for viewport_width in [9usize, 12, 40, 80, 120] {
+            for body in bodies {
+                let comment = crate::model::Comment::new(
+                    body.to_string(),
+                    crate::model::CommentType::from_id("note"),
+                    None,
+                );
+                let rendered = format_comment_lines(
+                    &theme,
+                    CommentTypePresentation {
+                        label: "NOTE".to_string(),
+                        color: Color::Blue,
+                    },
+                    &comment.content,
+                    None,
+                    // What every call site passes: the viewport minus the
+                    // cursor-indicator column.
+                    viewport_width.saturating_sub(1),
+                    None,
+                );
+                assert_eq!(
+                    App::comment_display_lines(&comment, viewport_width),
+                    rendered.len(),
+                    "width={viewport_width} body={body:?}"
+                );
+            }
+        }
     }
 
     // -- wrap_segments tests --
@@ -700,6 +815,7 @@ mod tests {
             false,
             80,
             None,
+            true,
         );
 
         // then
@@ -728,6 +844,7 @@ mod tests {
             false,
             80,
             None,
+            true,
         );
 
         // then
@@ -755,6 +872,7 @@ mod tests {
             false,
             80,
             None,
+            true,
         );
 
         // then
@@ -783,6 +901,7 @@ mod tests {
             false,
             80,
             None,
+            true,
         );
 
         // then
@@ -810,6 +929,7 @@ mod tests {
             false,
             80,
             None,
+            true,
         );
 
         // then
@@ -838,12 +958,65 @@ mod tests {
             false,
             80,
             None,
+            true,
         );
 
         // then
         assert_eq!(cursor_info.line_offset, 1);
         // "a" = 1 display width, "좋" = 2 display width, total = 3
         assert_eq!(cursor_info.column, 7 + 3);
+    }
+
+    #[test]
+    fn should_show_shift_enter_hint_when_keyboard_enhancement_supported() {
+        let theme = test_theme();
+        let (lines, _) = format_comment_input_lines(
+            &theme,
+            CommentTypePresentation {
+                label: "NOTE".to_string(),
+                color: Color::Blue,
+            },
+            "",
+            0,
+            None,
+            false,
+            80,
+            None,
+            true,
+        );
+        let header = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(header.contains("Shift-Enter:newline"));
+        assert!(!header.contains("Alt-Enter:newline"));
+    }
+
+    #[test]
+    fn should_show_alt_enter_hint_when_keyboard_enhancement_not_supported() {
+        let theme = test_theme();
+        let (lines, _) = format_comment_input_lines(
+            &theme,
+            CommentTypePresentation {
+                label: "NOTE".to_string(),
+                color: Color::Blue,
+            },
+            "",
+            0,
+            None,
+            false,
+            80,
+            None,
+            false,
+        );
+        let header = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(header.contains("Alt-Enter:newline"));
+        assert!(!header.contains("Shift-Enter:newline"));
     }
 
     // -- markdown highlighting tests --
@@ -881,6 +1054,7 @@ mod tests {
             false,
             80,
             None,
+            true,
         )
         .0
     }
@@ -939,5 +1113,59 @@ mod tests {
             content_spans > 1,
             "expected markdown highlighting to split the line, got {content_spans} span(s)"
         );
+    }
+
+    #[test]
+    fn remote_thread_badge_uses_gitlab_for_gitlab_comments() {
+        let thread = crate::forge::remote_comments::RemoteReviewThread {
+            id: "thread".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: Some(1),
+            start_line: None,
+            side: crate::forge::remote_comments::RemoteCommentSide::Right,
+            is_resolved: false,
+            is_outdated: false,
+            comments: vec![crate::forge::remote_comments::RemoteReviewComment {
+                id: "comment".to_string(),
+                author: Some("alice".to_string()),
+                body: "body".to_string(),
+                created_at: None,
+                in_reply_to: None,
+                url: String::new(),
+            }],
+        };
+
+        let lines =
+            format_remote_thread_lines(&test_theme(), &thread, false, Some(ForgeKind::GitLab));
+        let header = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(header.contains("[gitlab @alice]"));
+        assert!(!header.contains("[github @alice]"));
+    }
+
+    #[test]
+    fn remote_summary_badge_uses_github_for_github_comments() {
+        let summary = crate::forge::remote_comments::RemoteReviewSummary {
+            id: "summary".to_string(),
+            author: Some("alice".to_string()),
+            body: "body".to_string(),
+            state: crate::forge::remote_comments::RemoteReviewState::Commented,
+            created_at: None,
+            url: String::new(),
+        };
+
+        let lines =
+            format_remote_review_summary_lines(&test_theme(), &summary, Some(ForgeKind::GitHub));
+        let header = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(header.contains("[github @alice]"));
     }
 }

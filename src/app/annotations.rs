@@ -108,6 +108,7 @@ impl App {
         }
 
         self.line_annotations.clear();
+        self.colored_hunks.clear();
 
         // Pre-index remote threads by (path, line, side) for quick lookup
         // during the file/hunk walk. Threads whose visibility is
@@ -131,10 +132,11 @@ impl App {
             }
         }
 
-        // The review-comments header is omitted in single-file view (see
-        // the matching guard in `src/ui/diff_unified.rs`), so the
-        // annotation list mirrors the render.
-        if !self.is_single_file_view {
+        // The review-comments header is omitted in single-file view and
+        // until the section has content (see the matching guard in
+        // `src/ui/diff_unified.rs`), so the annotation list mirrors the
+        // render.
+        if self.show_review_comments_header() {
             self.line_annotations
                 .push(AnnotatedLine::ReviewCommentsHeader);
         }
@@ -156,7 +158,7 @@ impl App {
 
         // Emit annotation entries for remote review-level threads (line: None).
         {
-            use crate::forge::remote_comments::{PrCommentsVisibility, thread_display_lines};
+            use crate::forge::remote_comments::PrCommentsVisibility;
             let visibility = self.session.remote_comments_visibility;
             if !matches!(visibility, PrCommentsVisibility::Hide) {
                 for (thread_idx, thread) in self.forge_review_threads.iter().enumerate() {
@@ -166,11 +168,11 @@ impl App {
                     let Some(_muted) = visibility.render_decision(thread) else {
                         continue;
                     };
-                    let n = thread_display_lines(thread);
-                    for _ in 0..n {
-                        self.line_annotations
-                            .push(AnnotatedLine::RemoteThreadLine { thread_idx });
-                    }
+                    Self::push_remote_thread_annotations(
+                        &mut self.line_annotations,
+                        thread_idx,
+                        thread,
+                    );
                 }
             }
         }
@@ -201,6 +203,11 @@ impl App {
             if self.is_single_file_view && file_idx != self.diff_state.current_file_idx {
                 continue;
             }
+            // Hidden by an include/exclude filter: emit no annotations, the
+            // same way the renderers emit no lines.
+            if !self.file_passes_filter(file) {
+                continue;
+            }
             let path = file.display_path();
 
             // File header (only when shown — same gate as the renderer).
@@ -209,11 +216,16 @@ impl App {
                     .push(AnnotatedLine::FileHeader { file_idx });
             }
 
-            // If reviewed, skip all content for this file. Single-file
-            // view ignores the reviewed-collapse since the user
-            // explicitly focused this file.
-            if self.session.is_file_reviewed(path) && !self.is_single_file_view {
+            // Reviewed files normally collapse to their header in continuous
+            // view. A summary jump can reveal its target file without clearing
+            // the persisted marker. Single-file view also shows reviewed file
+            // bodies, under a banner that needs a matching annotation row.
+            if self.should_collapse_file(file_idx) {
                 continue;
+            }
+            if self.session.is_file_reviewed(path) && self.is_single_file_view {
+                self.line_annotations
+                    .push(AnnotatedLine::ReviewedBanner { file_idx });
             }
 
             // File comments
@@ -246,10 +258,11 @@ impl App {
                 {
                     continue;
                 }
-                for _ in 0..crate::forge::remote_comments::thread_display_lines(thread) {
-                    self.line_annotations
-                        .push(AnnotatedLine::RemoteThreadLine { thread_idx });
-                }
+                Self::push_remote_thread_annotations(
+                    &mut self.line_annotations,
+                    thread_idx,
+                    thread,
+                );
             }
 
             if file.is_binary || file.hunks.is_empty() {
@@ -347,7 +360,7 @@ impl App {
                     // Hunk header
                     self.line_annotations
                         .push(AnnotatedLine::HunkHeader { file_idx, hunk_idx });
-                    if self.is_hunk_reviewed(file_idx, hunk_idx) {
+                    if self.should_collapse_hunk(file_idx, hunk_idx) {
                         continue;
                     }
 
@@ -442,6 +455,8 @@ impl App {
             // Spacing line
             self.line_annotations.push(AnnotatedLine::Spacing);
         }
+
+        self.refresh_search_matches();
     }
 
     fn push_comments(
@@ -518,6 +533,21 @@ impl App {
         RemoteThreadIndex { by_file }
     }
 
+    /// Push one annotation for every rendered row in a remote thread, retaining
+    /// the comment that owns each header, body, separator, and footer row.
+    fn push_remote_thread_annotations(
+        annotations: &mut Vec<AnnotatedLine>,
+        thread_idx: usize,
+        thread: &crate::forge::remote_comments::RemoteReviewThread,
+    ) {
+        for comment_idx in crate::forge::remote_comments::thread_display_comment_indices(thread) {
+            annotations.push(AnnotatedLine::RemoteThreadLine {
+                thread_idx,
+                comment_idx,
+            });
+        }
+    }
+
     fn push_remote_threads(
         annotations: &mut Vec<AnnotatedLine>,
         threads: &[crate::forge::remote_comments::RemoteReviewThread],
@@ -534,12 +564,7 @@ impl App {
         };
         for thread_idx in thread_indices {
             if let Some(thread) = threads.get(*thread_idx) {
-                let n = crate::forge::remote_comments::thread_display_lines(thread);
-                for _ in 0..n {
-                    annotations.push(AnnotatedLine::RemoteThreadLine {
-                        thread_idx: *thread_idx,
-                    });
-                }
+                Self::push_remote_thread_annotations(annotations, *thread_idx, thread);
             }
         }
     }

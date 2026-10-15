@@ -23,7 +23,8 @@ impl App {
         skip_confirm: bool,
     ) {
         use crate::forge::submit::{
-            CommentAnchor, InlineComment, ResolverAction, UnmappableItem, map_comment,
+            CommentAnchor, InlineComment, ResolverAction, SubmitContext, UnmappableItem,
+            map_comment,
         };
 
         let DiffSource::PullRequest(pr) = &self.diff_source else {
@@ -73,6 +74,8 @@ impl App {
             None => self.diff_files.iter().collect(),
         };
 
+        let submit_ctx = SubmitContext::new(&self.forge_config, &self.comment_types);
+
         let mut mappable: Vec<InlineComment> = Vec::new();
         let mut unmappable: Vec<UnmappableItem> = Vec::new();
         let mut total_local_drafts = 0_usize;
@@ -90,7 +93,7 @@ impl App {
                 }
                 total_local_drafts += 1;
                 bucket_mapping(
-                    map_comment(comment, CommentAnchor::FileLevel, file, &self.forge_config),
+                    map_comment(comment, CommentAnchor::FileLevel, file, submit_ctx),
                     &mut mappable,
                     &mut unmappable,
                 );
@@ -112,7 +115,7 @@ impl App {
                         }
                     };
                     bucket_mapping(
-                        map_comment(comment, anchor, file, &self.forge_config),
+                        map_comment(comment, anchor, file, submit_ctx),
                         &mut mappable,
                         &mut unmappable,
                     );
@@ -301,7 +304,9 @@ impl App {
     /// network round-trip on a background thread. The result is applied
     /// later in `poll_pr_submit_events`.
     pub fn spawn_pr_submit(&mut self) -> Result<()> {
-        use crate::forge::submit::{MovedToSummaryItem, ResolverAction, build_review_body};
+        use crate::forge::submit::{
+            MovedToSummaryItem, ResolverAction, SubmitContext, build_review_body,
+        };
         use crate::forge::traits::{CreateReviewRequest, PullRequestTarget};
 
         // Snapshot identity from the PR diff source first so the borrow on
@@ -345,7 +350,11 @@ impl App {
             .collect::<Vec<_>>();
         let review_comment_ids: Vec<String> =
             review_comments.iter().map(|c| c.id.clone()).collect();
-        let body = build_review_body(&review_comments, &summary_items, &self.forge_config);
+        let body = build_review_body(
+            &review_comments,
+            &summary_items,
+            SubmitContext::new(&self.forge_config, &self.comment_types),
+        );
 
         // Save the session BEFORE the network call — keeps the user's
         // local-draft work durable if anything goes sideways below.
@@ -381,9 +390,16 @@ impl App {
         let event = in_flight.event;
         let mappable = in_flight.mappable.clone();
         let commit_id = state.commit_id.clone();
+        let show_pr_checks = self.show_pr_checks;
+        let show_pr_comments = self.show_pr_comments;
 
         std::thread::spawn(move || {
-            let backend = create_forge_backend(&repository, local_checkout);
+            let backend = create_forge_backend(
+                &repository,
+                local_checkout,
+                show_pr_checks,
+                show_pr_comments,
+            );
             // Need PR details for repo/owner routing; refetch lightly via
             // the same target the user opened with.
             let target = PullRequestTarget::with_repository(
@@ -464,15 +480,20 @@ impl App {
     }
 
     /// Human-readable name of the forge backing the current PR/MR review.
-    /// Used to keep submit messaging accurate across GitHub and GitLab.
+    /// Used to keep submit messaging accurate across GitHub, GitLab, Bitbucket,
+    /// and Azure DevOps.
     pub fn forge_display_name(&self) -> &'static str {
         match &self.diff_source {
-            DiffSource::PullRequest(pr) => match pr.key.repository.kind {
-                crate::forge::traits::ForgeKind::GitHub => "GitHub",
-                crate::forge::traits::ForgeKind::GitLab => "GitLab",
-                crate::forge::traits::ForgeKind::AzureDevOps => "Azure DevOps",
-            },
+            DiffSource::PullRequest(pr) => pr.key.repository.kind.display_name(),
             _ => "forge",
+        }
+    }
+
+    /// Return the forge backing the active PR/MR diff, when reviewing one.
+    pub fn forge_kind(&self) -> Option<crate::forge::traits::ForgeKind> {
+        match &self.diff_source {
+            DiffSource::PullRequest(pr) => Some(pr.key.repository.kind),
+            _ => None,
         }
     }
 

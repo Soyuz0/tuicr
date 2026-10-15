@@ -239,8 +239,18 @@ fn build_app_full(
     commits: Vec<CommitInfo>,
     comment_type_configs: Option<Vec<crate::config::CommentTypeConfig>>,
 ) -> App {
+    build_app_rooted(PathBuf::from("/tmp"), commits, comment_type_configs)
+}
+
+/// `build_app_full` with an explicit VCS root, for tests that need the app
+/// rooted at a real on-disk checkout.
+fn build_app_rooted(
+    root_path: PathBuf,
+    commits: Vec<CommitInfo>,
+    comment_type_configs: Option<Vec<crate::config::CommentTypeConfig>>,
+) -> App {
     let vcs_info = VcsInfo {
-        root_path: PathBuf::from("/tmp"),
+        root_path,
         head_commit: "head".to_string(),
         branch_name: Some("main".to_string()),
         vcs_type: VcsType::Git,
@@ -380,8 +390,8 @@ impl crate::forge::traits::ForgeBackend for FakeForgeBackend {
     fn get_pull_request_diff(
         &self,
         _pr: &crate::forge::traits::PullRequestDetails,
-    ) -> Result<String> {
-        Ok(self.patch.clone())
+    ) -> Result<Vec<crate::model::FilePatch>> {
+        Ok(structured_patch(&self.patch))
     }
     fn fetch_file_lines(
         &self,
@@ -412,11 +422,10 @@ impl crate::forge::traits::ForgeBackend for FakeForgeBackend {
         _pr: &crate::forge::traits::PullRequestDetails,
         _start_sha: &str,
         _end_sha: &str,
-    ) -> Result<String> {
-        Ok(self
-            .range_patch
-            .clone()
-            .unwrap_or_else(|| self.patch.clone()))
+    ) -> Result<Vec<crate::model::FilePatch>> {
+        Ok(structured_patch(
+            self.range_patch.as_deref().unwrap_or(&self.patch),
+        ))
     }
     fn create_review(
         &self,
@@ -573,6 +582,49 @@ fn should_enter_pr_mode_when_opening_pr_via_fake_backend() {
     assert!(app.forge_backend.is_some());
 }
 
+/// Regression for issue #591: `:prs` back to the selector and opening a
+/// second PR errored with "needs a local clone" on Azure DevOps.
+///
+/// Entering PR mode replaces `vcs_info.root_path` with the synthetic
+/// `forge:host/owner/repo` session identity, so resolving the checkout from
+/// it found nothing for every PR after the first. `local_repo_root` keeps the
+/// real launch root around for exactly this.
+#[test]
+fn should_still_resolve_local_checkout_for_a_second_pr_open() {
+    // given an app rooted in a real checkout of the PR's repository
+    let _reviews = TestReviewsDir::new();
+    let dir = tempfile::tempdir().expect("failed to create test repo dir");
+    let repo_root = dir.path().to_path_buf();
+    let git = git2::Repository::init(&repo_root).expect("failed to init test repo");
+    git.remote("origin", "https://github.com/agavra/tuicr")
+        .expect("failed to add origin");
+
+    let repository = ForgeRepository::github("github.com", "agavra", "tuicr");
+    let mut app = build_app_rooted(repo_root.clone(), Vec::new(), None);
+    assert_eq!(app.local_checkout_for(&repository), Some(repo_root.clone()));
+
+    // when a first PR is opened
+    let summary = sample_pr(42, "first");
+    let backend = Box::new(FakeForgeBackend::open_pr_details(
+        test_pr_details(42, "first"),
+        crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+    ));
+    app.open_pr_with_backend(&summary, backend, Some(repo_root.clone()))
+        .unwrap();
+
+    // then the VCS root is the synthetic PR identity, not a directory
+    assert!(
+        app.vcs_info
+            .root_path
+            .to_string_lossy()
+            .starts_with("forge:"),
+        "expected a synthetic PR root, got {:?}",
+        app.vcs_info.root_path,
+    );
+    // and the next PR open still finds the local clone
+    assert_eq!(app.local_checkout_for(&repository), Some(repo_root));
+}
+
 fn sample_pr_commit(oid: &str, summary: &str) -> crate::forge::traits::PullRequestCommit {
     crate::forge::traits::PullRequestCommit {
         oid: oid.to_string(),
@@ -705,6 +757,10 @@ fn two_hunk_patch() -> &'static str {
 
 fn first_hunk_patch() -> &'static str {
     include_str!("../../../tests/fixtures/pr_refresh/first_hunk.patch")
+}
+
+fn structured_patch(patch: &str) -> Vec<crate::model::FilePatch> {
+    crate::vcs::diff_parser::git_fixture_file_patches(patch)
 }
 
 fn two_file_patch(changed_replacement: &str) -> String {
@@ -947,7 +1003,7 @@ fn should_preserve_hunk_marks_hidden_by_pr_range_diff() {
         started_at: Instant::now(),
         anchor: None,
     };
-    app.finish_pr_range_reload(&request, first_hunk_patch())
+    app.finish_pr_range_reload(&request, structured_patch(first_hunk_patch()))
         .unwrap();
 
     assert!(app.session.is_hunk_reviewed(&path, &hidden_key));
@@ -1189,7 +1245,7 @@ fn should_keep_saved_pr_session_through_quit_reopen_and_same_head_reload() {
 }
 
 #[test]
-fn should_use_persisted_new_head_session_instead_of_carrying_old_head_state() {
+fn should_reindex_recovered_pr_session() {
     // given an old-head PR session with reviewed state
     let _reviews = TestReviewsDir::new();
     let mut app = build_app();
@@ -1211,7 +1267,7 @@ fn should_use_persisted_new_head_session_instead_of_carrying_old_head_state() {
     let highlighter = app.theme.syntax_highlighter();
     let opened_b = crate::forge::pr_open::prepare_open_pr(
         details_b.clone(),
-        &two_file_patch("newer changed"),
+        structured_patch(&two_file_patch("newer changed")),
         Vec::new(),
         PullRequestReviewMetadata::default(),
         crate::forge::traits::PullRequestInfo::from_details(details_b.clone()),
@@ -1229,7 +1285,11 @@ fn should_use_persisted_new_head_session_instead_of_carrying_old_head_state() {
             CommentType::from_id("note"),
             None,
         ));
+    let persisted_path = crate::persistence::storage::session_path(&persisted_b).unwrap();
+    let pr_session_key = persisted_b.pr_session_key.as_ref().unwrap();
+    let slug = crate::slug::Slug::from(pr_session_key).to_string();
     write_session_file_without_manifest(&persisted_b);
+    let persisted_contents = std::fs::read(&persisted_path).unwrap();
 
     // when the PR reload advances to that head
     let backend_b = Box::new(FakeForgeBackend::open_pr_details(
@@ -1248,6 +1308,12 @@ fn should_use_persisted_new_head_session_instead_of_carrying_old_head_state() {
     let changed_review = app.session.files.get(&changed_path).unwrap();
     assert_eq!(changed_review.file_comments.len(), 1);
     assert_eq!(changed_review.file_comments[0].content, "new-head draft");
+    let resolved = crate::review_store::ReviewStore::new()
+        .resolve_pr_session(&slug)
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.path(), persisted_path);
+    assert_eq!(std::fs::read(&persisted_path).unwrap(), persisted_contents);
 }
 
 #[test]
@@ -1260,7 +1326,7 @@ fn should_error_on_corrupt_exact_session_file_when_reopening_pr() {
     let highlighter = theme.syntax_highlighter();
     let opened = crate::forge::pr_open::prepare_open_pr(
         details.clone(),
-        &two_file_patch("new changed"),
+        structured_patch(&two_file_patch("new changed")),
         Vec::new(),
         PullRequestReviewMetadata::default(),
         crate::forge::traits::PullRequestInfo::from_details(details.clone()),
@@ -1313,7 +1379,7 @@ fn should_keep_old_head_session_when_new_head_session_file_is_corrupt() {
     let highlighter = app.theme.syntax_highlighter();
     let opened_b = crate::forge::pr_open::prepare_open_pr(
         details_b.clone(),
-        &two_file_patch("newer changed"),
+        structured_patch(&two_file_patch("newer changed")),
         Vec::new(),
         PullRequestReviewMetadata::default(),
         crate::forge::traits::PullRequestInfo::from_details(details_b.clone()),
@@ -1395,7 +1461,7 @@ fn should_ignore_exact_session_file_when_pr_session_key_does_not_match() {
     let highlighter = theme.syntax_highlighter();
     let opened = crate::forge::pr_open::prepare_open_pr(
         details.clone(),
-        &two_file_patch("new changed"),
+        structured_patch(&two_file_patch("new changed")),
         Vec::new(),
         PullRequestReviewMetadata::default(),
         crate::forge::traits::PullRequestInfo::from_details(details.clone()),
@@ -1711,7 +1777,7 @@ fn should_build_new_head_session_by_carrying_only_unchanged_reviewed_state() {
     let pr_info_b = crate::forge::traits::PullRequestInfo::from_details(details_b.clone());
     let opened = crate::forge::pr_open::prepare_open_pr(
         details_b,
-        &two_file_patch("newer changed"),
+        structured_patch(&two_file_patch("newer changed")),
         Vec::new(),
         PullRequestReviewMetadata::default(),
         pr_info_b,
@@ -1768,7 +1834,7 @@ fn should_carry_unchanged_hunk_marks_inside_changed_file_when_pr_head_advances()
     let pr_info_b = crate::forge::traits::PullRequestInfo::from_details(details_b.clone());
     let opened = crate::forge::pr_open::prepare_open_pr(
         details_b,
-        &two_hunk_pr_patch("newer second"),
+        structured_patch(&two_hunk_pr_patch("newer second")),
         Vec::new(),
         PullRequestReviewMetadata::default(),
         pr_info_b,
@@ -1820,7 +1886,7 @@ fn should_carry_reviewed_state_through_finish_pr_reload_when_head_advances() {
     details_b.head_sha = "bbbbbbbbbbbbbbbb".to_string();
     app.finish_pr_reload(
         details_b.clone(),
-        two_file_patch("newer changed"),
+        structured_patch(&two_file_patch("newer changed")),
         Vec::new(),
         PullRequestReviewMetadata::default(),
         crate::forge::traits::PullRequestInfo::from_details(details_b),
@@ -1866,10 +1932,12 @@ fn should_keep_reviewed_state_through_finish_pr_reload_when_head_unchanged() {
         restore_overview_cursor: None,
     };
 
+    // Retargeting can change the base without changing the head.
+    details.base_sha = "retargeted-base".to_string();
     // when the async reload finish path refreshes the same head
     app.finish_pr_reload(
         details.clone(),
-        two_file_patch("new changed"),
+        structured_patch(&two_file_patch("new changed")),
         Vec::new(),
         PullRequestReviewMetadata::default(),
         crate::forge::traits::PullRequestInfo::from_details(details),
@@ -1880,6 +1948,10 @@ fn should_keep_reviewed_state_through_finish_pr_reload_when_head_unchanged() {
     // then reviewed file and hunk markers are preserved.
     assert!(app.session.is_file_reviewed(&stable_path));
     assert!(app.session.is_hunk_reviewed(&stable_path, &stable_key));
+    let DiffSource::PullRequest(pr) = &app.diff_source else {
+        panic!("expected PR");
+    };
+    assert_eq!(pr.base_sha, "retargeted-base");
 }
 
 #[test]
@@ -1894,7 +1966,9 @@ fn should_keep_session_when_pr_head_unchanged_on_reload() {
     ));
     app.open_pr_with_backend(&summary, backend, None).unwrap();
     let session_id_before = app.session.id.clone();
-    // when reloading with the same head
+    // when reloading with the same head but a different base
+    let mut details = details;
+    details.base_sha = "retargeted-base".to_string();
     let backend2 = Box::new(FakeForgeBackend::open_pr_details(
         details,
         crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
@@ -1905,6 +1979,10 @@ fn should_keep_session_when_pr_head_unchanged_on_reload() {
     // then
     assert!(!changed);
     assert_eq!(app.session.id, session_id_before);
+    let DiffSource::PullRequest(pr) = &app.diff_source else {
+        panic!("expected PR");
+    };
+    assert_eq!(pr.base_sha, "retargeted-base");
 }
 
 struct FailingForgeBackend;
@@ -1927,7 +2005,7 @@ impl crate::forge::traits::ForgeBackend for FailingForgeBackend {
     fn get_pull_request_diff(
         &self,
         _pr: &crate::forge::traits::PullRequestDetails,
-    ) -> Result<String> {
+    ) -> Result<Vec<crate::model::FilePatch>> {
         unreachable!()
     }
     fn fetch_file_lines(
@@ -1953,7 +2031,7 @@ impl crate::forge::traits::ForgeBackend for FailingForgeBackend {
         _pr: &crate::forge::traits::PullRequestDetails,
         _start_sha: &str,
         _end_sha: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<crate::model::FilePatch>> {
         unreachable!()
     }
     fn create_review(
@@ -1986,6 +2064,29 @@ fn should_apply_initial_load_event_to_pr_tab() {
     assert!(app.pr_load_rx.is_none());
     assert_eq!(app.pr_tab.view().rows.len(), 1);
     assert_eq!(app.pr_tab.view().rows[0].summary.number, 7);
+}
+
+#[test]
+fn should_surface_initial_pr_list_error_to_message_bar() {
+    let mut app = build_app();
+    let repository = ForgeRepository::github("github.com", "agavra", "tuicr");
+    app.forge_repository = Some(repository.clone());
+    app.pr_tab = PullRequestsTab::new(Some(repository.clone()));
+    app.pr_tab.start_initial_load();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pr_load_rx = Some(rx);
+    tx.send(PrLoadEvent::Initial {
+        canonical: repository,
+        result: Err("forge API response body".to_string()),
+    })
+    .unwrap();
+    drop(tx);
+
+    app.poll_pr_load_events();
+
+    let message = app.message.as_ref().expect("expected PR-list error");
+    assert_eq!(message.message_type, MessageType::Error);
+    assert_eq!(message.content, "forge API response body");
 }
 
 #[test]
@@ -2110,6 +2211,41 @@ fn should_treat_commits_as_alias_for_local_target_selector() {
 }
 
 #[test]
+fn should_open_pending_comment_summary_from_command_mode() {
+    let mut app = build_app();
+    app.input_mode = InputMode::Command;
+    app.command_buffer = "summary".to_string();
+
+    crate::handler::handle_command_action(&mut app, crate::input::Action::SubmitInput);
+
+    assert_eq!(app.input_mode, InputMode::Summary);
+    assert!(app.command_buffer.is_empty());
+    assert_eq!(app.summary_state.selected_comment, 0);
+    assert_eq!(app.summary_state.scroll_offset, 0);
+
+    app.summary_state.selected_comment = 5;
+    app.summary_state.scroll_offset = 15;
+    app.enter_summary_mode();
+    assert_eq!(app.summary_state.selected_comment, 0);
+    assert_eq!(app.summary_state.scroll_offset, 0);
+
+    crate::handler::handle_summary_action(&mut app, crate::input::Action::ExitMode);
+    assert_eq!(app.input_mode, InputMode::Normal);
+}
+
+#[test]
+fn should_complete_summary_command() {
+    let mut app = build_app();
+    app.input_mode = InputMode::Command;
+    app.command_buffer = "summ".to_string();
+
+    crate::handler::handle_command_action(&mut app, crate::input::Action::CompleteCommand);
+
+    assert_eq!(app.command_buffer, "summary");
+    assert!(app.command_completion.is_none());
+}
+
+#[test]
 fn should_complete_command_when_only_one_candidate_matches() {
     // given
     let mut app = build_app();
@@ -2127,7 +2263,7 @@ fn should_extend_to_common_command_prefix_before_cycling() {
     // given
     let mut app = build_app();
     app.input_mode = InputMode::Command;
-    app.command_buffer = "su".to_string();
+    app.command_buffer = "sub".to_string();
     // when
     crate::handler::handle_command_action(&mut app, crate::input::Action::CompleteCommand);
     // then
@@ -2287,6 +2423,7 @@ fn should_return_false_when_cancelling_with_no_in_flight_open() {
 fn should_surface_pr_open_error_to_message_bar_when_done_event_carries_error() {
     // given an app waiting on a synthetic open
     let mut app = build_app();
+    app.input_mode = InputMode::CommitSelect;
     app.forge_repository = Some(ForgeRepository::github("github.com", "agavra", "tuicr"));
     app.pr_tab = loaded_pr_tab(vec![sample_pr(42, "boom")]);
     app.target_tab = TargetTab::PullRequests;
@@ -2316,6 +2453,13 @@ fn should_surface_pr_open_error_to_message_bar_when_done_event_carries_error() {
         .expect("expected an error message on the bar");
     assert!(matches!(msg.message_type, MessageType::Error));
     assert!(msg.content.contains("auth failed"), "got {msg:?}");
+
+    app.enter_command_mode();
+    app.command_buffer = "messages".to_string();
+    crate::handler::handle_command_action(&mut app, crate::input::Action::SubmitInput);
+    assert_eq!(app.input_mode, InputMode::MessageDetails);
+    app.toggle_help();
+    assert_eq!(app.input_mode, InputMode::CommitSelect);
 }
 
 #[test]
@@ -2371,6 +2515,20 @@ fn should_cancel_in_flight_open_when_pressing_esc_in_selector() {
     assert!(app.pr_open_state.is_none());
 }
 
+#[test]
+fn should_show_quit_hint_message_without_quitting_in_commit_select_mode() {
+    // given
+    let mut app = build_app();
+    // when
+    crate::handler::handle_commit_select_action(&mut app, crate::input::Action::QuitHint);
+    // then
+    assert!(!app.should_quit);
+    assert_eq!(
+        app.message.as_ref().map(|m| m.content.as_str()),
+        Some("q no longer quits — use :q to quit")
+    );
+}
+
 // -----------------------------------------------------------------
 // Remote review threads (PR 4)
 // -----------------------------------------------------------------
@@ -2419,8 +2577,8 @@ impl crate::forge::traits::ForgeBackend for ThreadAwareForgeBackend {
     fn get_pull_request_diff(
         &self,
         _p: &crate::forge::traits::PullRequestDetails,
-    ) -> Result<String> {
-        Ok(self.patch.clone())
+    ) -> Result<Vec<crate::model::FilePatch>> {
+        Ok(structured_patch(&self.patch))
     }
     fn fetch_file_lines(
         &self,
@@ -2446,7 +2604,7 @@ impl crate::forge::traits::ForgeBackend for ThreadAwareForgeBackend {
         _pr: &crate::forge::traits::PullRequestDetails,
         _start_sha: &str,
         _end_sha: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<crate::model::FilePatch>> {
         unreachable!()
     }
     fn create_review(
@@ -2498,6 +2656,95 @@ fn should_populate_remote_threads_when_opening_pr_through_test_seam() {
         app.session.remote_comments_visibility,
         PrCommentsVisibility::Unresolved
     );
+}
+
+#[test]
+fn configured_comments_visibility_seeds_a_fresh_pr_session() {
+    let mut app = build_app();
+    app.initial_comments_visibility = Some(PrCommentsVisibility::All);
+    let summary = sample_pr(42, "answer");
+    let backend = Box::new(ThreadAwareForgeBackend::new(
+        test_pr_details(42, "answer"),
+        crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+        Vec::new(),
+    ));
+    app.open_pr_with_backend(&summary, backend, None).unwrap();
+    assert_eq!(
+        app.session.remote_comments_visibility,
+        PrCommentsVisibility::All
+    );
+}
+
+#[test]
+fn configured_comments_visibility_seeds_the_async_pr_open_path() {
+    let _reviews = TestReviewsDir::new();
+    let mut app = build_app();
+    app.initial_comments_visibility = Some(PrCommentsVisibility::All);
+    app.forge_repository = Some(ForgeRepository::gitlab("gitlab.com", "owner", "repo"));
+    app.pr_tab = loaded_pr_tab(vec![sample_pr(42, "answer")]);
+    app.target_tab = TargetTab::PullRequests;
+    let request = crate::app::PrOpenRequest {
+        repository: ForgeRepository::gitlab("gitlab.com", "owner", "repo"),
+        pr_number: 42,
+        started_at: std::time::Instant::now(),
+    };
+    app.pr_open_state = Some(request.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pr_open_rx = Some(rx);
+    let mut details = test_pr_details(42, "answer");
+    details.repository = ForgeRepository::gitlab("gitlab.com", "owner", "repo");
+    tx.send(crate::app::PrOpenEvent::Done {
+        request,
+        result: Ok((
+            details.clone(),
+            structured_patch(crate::forge::github::gh::tests_fixture::SIMPLE_PATCH),
+            Vec::new(),
+            crate::forge::traits::PullRequestReviewMetadata::default(),
+            crate::forge::traits::PullRequestInfo::from_details(details.clone()),
+        )),
+    })
+    .unwrap();
+
+    app.poll_pr_open_events();
+
+    assert!(
+        matches!(&app.diff_source, DiffSource::PullRequest(_)),
+        "the async open should have entered PR mode"
+    );
+    assert_eq!(
+        app.session.remote_comments_visibility,
+        PrCommentsVisibility::All
+    );
+}
+
+#[test]
+fn configured_comments_default_does_not_override_a_persisted_visibility() {
+    let _reviews = TestReviewsDir::new();
+    for (saved, configured) in [
+        (PrCommentsVisibility::Unresolved, PrCommentsVisibility::All),
+        (PrCommentsVisibility::All, PrCommentsVisibility::Hide),
+    ] {
+        let mut app = build_app();
+        let summary = sample_pr(42, "answer");
+        let backend = Box::new(ThreadAwareForgeBackend::new(
+            test_pr_details(42, "answer"),
+            crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+            Vec::new(),
+        ));
+        app.open_pr_with_backend(&summary, backend, None).unwrap();
+        app.session.remote_comments_visibility = saved;
+        crate::persistence::storage::save_session(&app.session).unwrap();
+
+        let mut app = build_app();
+        app.initial_comments_visibility = Some(configured);
+        let backend = Box::new(ThreadAwareForgeBackend::new(
+            test_pr_details(42, "answer"),
+            crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+            Vec::new(),
+        ));
+        app.open_pr_with_backend(&summary, backend, None).unwrap();
+        assert_eq!(app.session.remote_comments_visibility, saved);
+    }
 }
 
 #[test]
@@ -2601,7 +2848,12 @@ fn should_apply_remote_threads_event_when_relevant() {
         repository: pr_key.repository.clone(),
         pr_number: pr_key.number,
         head_sha: pr_key.head_sha.clone(),
-        threads: Ok(vec![sample_thread(2, "delayed", false, false)]),
+        // The same forge thread can appear more than once in a malformed or
+        // overlapping paginated response; the UI must keep one copy.
+        threads: Ok(vec![
+            sample_thread(2, "delayed", false, false),
+            sample_thread(2, "duplicate", false, false),
+        ]),
         summaries: Ok(Vec::new()),
     })
     .unwrap();
@@ -2829,4 +3081,45 @@ fn should_leave_state_unchanged_when_the_forge_rejects_a_resolve() {
         "a rejected write must not flip local state"
     );
     assert!(app.pr_resolve_rx.is_none());
+}
+
+#[test]
+fn pr_open_landing_mid_delete_prompt_drops_the_prompt() {
+    // given — a PR open is in flight and the user raised a Sessions-tab
+    // delete prompt on the selector meanwhile
+    let _reviews = TestReviewsDir::new();
+    let mut app = build_app();
+    app.forge_repository = Some(ForgeRepository::gitlab("gitlab.com", "owner", "repo"));
+    app.pr_tab = loaded_pr_tab(vec![sample_pr(42, "answer")]);
+    let request = crate::app::PrOpenRequest {
+        repository: ForgeRepository::gitlab("gitlab.com", "owner", "repo"),
+        pr_number: 42,
+        started_at: std::time::Instant::now(),
+    };
+    app.pr_open_state = Some(request.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pr_open_rx = Some(rx);
+    app.enter_confirm_mode(crate::app::ConfirmAction::DeleteSession);
+
+    // when — the open completes
+    let mut details = test_pr_details(42, "answer");
+    details.repository = ForgeRepository::gitlab("gitlab.com", "owner", "repo");
+    tx.send(crate::app::PrOpenEvent::Done {
+        request,
+        result: Ok((
+            details.clone(),
+            structured_patch(crate::forge::github::gh::tests_fixture::SIMPLE_PATCH),
+            Vec::new(),
+            crate::forge::traits::PullRequestReviewMetadata::default(),
+            crate::forge::traits::PullRequestInfo::from_details(details.clone()),
+        )),
+    })
+    .unwrap();
+    app.poll_pr_open_events();
+
+    // then — the prompt belonged to the selector; Normal mode cannot answer
+    // it, so it must not linger over the PR diff
+    assert!(matches!(&app.diff_source, DiffSource::PullRequest(_)));
+    assert_eq!(app.input_mode, InputMode::Normal);
+    assert_eq!(app.pending_confirm, None);
 }

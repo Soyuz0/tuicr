@@ -201,24 +201,35 @@ pub fn filter_threads(
         .collect()
 }
 
-/// Count the number of rendered lines a thread occupies in the diff view.
-/// Used by `App::rebuild_annotations` to push the matching number of
-/// annotations so cursor/hit-test math stays in sync with rendering.
+/// Map every rendered thread row to the comment whose content it displays.
+///
+/// The final closing rule belongs to the final comment. An empty thread has
+/// only its closing rule and uses index zero; it cannot resolve to content,
+/// but retaining that row preserves annotation/render parity for malformed
+/// forge data.
 ///
 /// Layout (must match `ui::comment_panel::format_remote_thread_lines`):
 /// - 1 header line for the root comment (`╭─ [github @author] L42 ──`)
 /// - 1 separator line per reply (`├─ ↳ @author ──`)
 /// - 1 body line per `\n`-split line in each comment's body
 /// - 1 footer line at the end of the thread (`╰────`)
-pub fn thread_display_lines(thread: &RemoteReviewThread) -> usize {
-    let mut total = 0;
-    for comment in &thread.comments {
-        // header (root) or separator (reply) + body lines
-        total += 1 + comment.body.split('\n').count();
+pub fn thread_display_comment_indices(thread: &RemoteReviewThread) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for (comment_idx, comment) in thread.comments.iter().enumerate() {
+        indices.extend(std::iter::repeat_n(
+            comment_idx,
+            1 + comment.body.split('\n').count(),
+        ));
     }
-    // single closing rule for the whole thread
-    total += 1;
-    total
+    indices.push(thread.comments.len().saturating_sub(1));
+    indices
+}
+
+/// Count the number of rendered lines a thread occupies in the diff view.
+/// Uses the shared row-to-comment mapping so annotations and navigation
+/// cannot drift apart.
+pub fn thread_display_lines(thread: &RemoteReviewThread) -> usize {
+    thread_display_comment_indices(thread).len()
 }
 
 /// Count the number of rendered lines a review summary occupies in the
@@ -245,6 +256,19 @@ pub fn group_threads_by_path(
         }
     }
     groups
+}
+
+/// Remove duplicate forge threads while preserving the first occurrence.
+///
+/// A thread's forge-assigned ID is stable across pagination and refreshes, so
+/// duplicate IDs are never separate discussions. Keeping this invariant at
+/// the cache boundary prevents one API anomaly from rendering a comment twice.
+pub fn dedupe_threads(threads: Vec<RemoteReviewThread>) -> Vec<RemoteReviewThread> {
+    let mut seen = std::collections::HashSet::new();
+    threads
+        .into_iter()
+        .filter(|thread| thread.id.is_empty() || seen.insert(thread.id.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -334,6 +358,21 @@ mod tests {
         assert_eq!(unresolved.len(), 2);
         assert_eq!(unresolved[0].id, "a");
         assert_eq!(unresolved[1].id, "c");
+    }
+
+    #[test]
+    fn should_dedupe_threads_by_forge_id_preserving_order() {
+        // given
+        let first = make_thread("same", "src/lib.rs", Some(10), false, false);
+        let duplicate = make_thread("same", "src/lib.rs", Some(20), false, false);
+        let other = make_thread("other", "src/main.rs", Some(30), false, false);
+        // when
+        let deduped = dedupe_threads(vec![first, duplicate, other]);
+        // then
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].id, "same");
+        assert_eq!(deduped[0].line, Some(10));
+        assert_eq!(deduped[1].id, "other");
     }
 
     #[test]

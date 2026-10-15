@@ -1,8 +1,10 @@
+mod cmark;
+
 use ratatui::style::{Color, Modifier, Style};
 use std::path::Path;
 use two_face::theme::EmbeddedThemeName;
 
-use crate::model::diff_types::LineOrigin;
+use crate::model::diff_types::{DiffFile, DiffHunk, LineOrigin};
 
 /// A single line of highlighted spans (style + text pairs).
 pub(crate) type HighlightedSpans = Vec<(Style, String)>;
@@ -42,6 +44,27 @@ pub(crate) fn needs_full_file_highlight(path: &Path) -> bool {
     )
 }
 
+/// Oniguruma's process-wide cap on backtracking steps per match attempt, in place of
+/// its 10,000,000-step default. Some Markdown lines with inline code send it into
+/// a catastrophic backtracking loop. This could be as low as 1000 but that is not much
+/// faster in benchmarks than 100,000, so setting it to that for extra headroom.
+const ONIGURUMA_RETRY_LIMIT: std::os::raw::c_ulong = 100_000;
+
+/// Applies [`ONIGURUMA_RETRY_LIMIT`] once per process.
+fn cap_oniguruma_retry_limit() {
+    unsafe extern "C" {
+        fn onig_set_retry_limit_in_match(limit: std::os::raw::c_ulong) -> std::os::raw::c_int;
+    }
+
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        // SAFETY: writes one C global, takes no pointers, has no preconditions.
+        unsafe {
+            onig_set_retry_limit_in_match(ONIGURUMA_RETRY_LIMIT);
+        }
+    });
+}
+
 /// Helper to highlight lines of code from a diff
 pub struct SyntaxHighlighter {
     pub syntax_set: syntect::parsing::SyntaxSet,
@@ -50,6 +73,8 @@ pub struct SyntaxHighlighter {
     pub add_bg: Color,
     /// Background color for deleted lines
     pub del_bg: Color,
+    /// Markdown construct colours, resolved from `theme` once at construction.
+    markdown_palette: cmark::MarkdownPalette,
 }
 
 pub(crate) struct DiffHighlightSequences {
@@ -80,12 +105,35 @@ impl SyntaxHighlighter {
 
     /// Create a new syntax highlighter with a preloaded syntect theme.
     pub fn with_theme(theme: syntect::highlighting::Theme, add_bg: Color, del_bg: Color) -> Self {
+        cap_oniguruma_retry_limit();
         let syntax_set = two_face::syntax::extra_newlines();
+        let markdown_palette = cmark::MarkdownPalette::resolve(&theme);
         Self {
             syntax_set,
             theme,
             add_bg,
             del_bg,
+            markdown_palette,
+        }
+    }
+
+    /// A highlighter that resolves no syntax at all, so `highlight_file_lines`
+    /// returns `None` for every path without doing any syntect work.
+    ///
+    /// The diff watcher uses this to parse a diff when it needs the content but not
+    /// the colours. `DiffFile::compute_content_hash` runs during parsing over line
+    /// text alone, and highlighting only ever assigns spans, so a diff parsed this
+    /// way fingerprints identically to a highlighted one. Measured at 3.1ms against
+    /// 197ms for the same 4,000-line diff.
+    pub(crate) fn plain() -> Self {
+        let theme = syntect::highlighting::Theme::default();
+        let markdown_palette = cmark::MarkdownPalette::resolve(&theme);
+        Self {
+            syntax_set: syntect::parsing::SyntaxSet::new(),
+            theme,
+            add_bg: Color::Reset,
+            del_bg: Color::Reset,
+            markdown_palette,
         }
     }
 
@@ -110,15 +158,15 @@ impl SyntaxHighlighter {
         Some(self.highlight_lines_with(syntax, lines))
     }
 
-    /// Highlight `lines` as Markdown, for the in-progress review comment box.
-    /// Colors come from the active syntect theme, matching code highlighting.
-    pub(crate) fn highlight_markdown_lines(&self, lines: &[String]) -> HighlightedLines {
-        let syntax = self
-            .syntax_set
-            .find_syntax_by_extension("md")
-            .or_else(|| self.syntax_set.find_syntax_by_name("Markdown"))
-            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
-        self.highlight_lines_with(syntax, lines)
+    /// Highlight a review comment body (`\n`-separated) as Markdown, returning
+    /// one entry per line. Colors come from the active syntect theme, matching
+    /// code highlighting.
+    ///
+    /// Parsed with `pulldown-cmark` rather than syntect's Markdown grammar; see
+    /// the `cmark` module for why. Fenced code blocks are still handed to
+    /// syntect for their contents.
+    pub(crate) fn highlight_markdown_body(&self, content: &str) -> HighlightedLines {
+        cmark::highlight(self, content)
     }
 
     /// Run syntect line-by-line against a resolved syntax, converting to
@@ -240,6 +288,46 @@ impl SyntaxHighlighter {
         }?;
 
         Some(self.apply_diff_background(spans, origin))
+    }
+
+    /// Recompute `highlighted_spans` for every line of `hunk` in place, using
+    /// this highlighter. Use it for all per-hunk coloring: `app/coloring.rs`
+    /// calls it as hunks scroll into view, and theme changes call it to
+    /// recolor. It reads only each line's cached `content`/`origin`, never
+    /// the patch text.
+    ///
+    /// Skip container-grammar files (`needs_full_file_highlight`): they need
+    /// full-file content this cache doesn't hold, so keep their existing spans
+    /// rather than color them out of context.
+    pub(crate) fn rehighlight_hunk_in_place(&self, hunk: &mut DiffHunk, file_path: &Path) {
+        if needs_full_file_highlight(file_path) {
+            return;
+        }
+
+        let line_contents: Vec<String> = hunk.lines.iter().map(|l| l.content.clone()).collect();
+        let line_origins: Vec<LineOrigin> = hunk.lines.iter().map(|l| l.origin).collect();
+        let sequences = Self::split_diff_lines_for_highlighting(&line_contents, &line_origins);
+        let old_highlighted = self.highlight_file_lines(file_path, &sequences.old_lines);
+        let new_highlighted = self.highlight_file_lines(file_path, &sequences.new_lines);
+
+        for (index, line) in hunk.lines.iter_mut().enumerate() {
+            line.highlighted_spans = self.highlighted_line_for_diff_with_background(
+                old_highlighted.as_deref(),
+                new_highlighted.as_deref(),
+                sequences.old_line_indices[index],
+                sequences.new_line_indices[index],
+                line.origin,
+            );
+        }
+    }
+
+    /// Recompute `highlighted_spans` for every hunk of `file` in place. See
+    /// `rehighlight_hunk_in_place` for what this can and can't fix.
+    pub(crate) fn rehighlight_file_in_place(&self, file: &mut DiffFile) {
+        let file_path = file.display_path().clone();
+        for hunk in &mut file.hunks {
+            self.rehighlight_hunk_in_place(hunk, &file_path);
+        }
     }
 
     fn syntect_to_ratatui_style(style: syntect::highlighting::Style) -> Style {
@@ -387,6 +475,29 @@ impl SyntaxHighlighter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::diff_types::DiffLine;
+
+    #[test]
+    fn should_apply_oniguruma_retry_limit_once() {
+        unsafe extern "C" {
+            fn onig_get_retry_limit_in_match() -> std::os::raw::c_ulong;
+        }
+        cap_oniguruma_retry_limit();
+        // SAFETY: reads one C global, takes no pointers, has no preconditions.
+        let limit = unsafe { onig_get_retry_limit_in_match() };
+        assert_eq!(limit, ONIGURUMA_RETRY_LIMIT);
+    }
+
+    #[test]
+    fn should_resolve_no_syntax_for_any_path() {
+        let plain = SyntaxHighlighter::plain();
+        assert!(
+            plain
+                .highlight_file_lines(Path::new("a.rs"), &["fn main() {}".to_string()])
+                .is_none(),
+            "plain highlighter must not resolve a syntax, or the probe is not cheap"
+        );
+    }
 
     #[test]
     fn should_find_syntax_for_uppercase_extension() {
@@ -665,5 +776,148 @@ mod tests {
                 "line {i} spans should not contain newline, got: {full_text:?}"
             );
         }
+    }
+
+    #[test]
+    fn rehighlight_hunk_in_place_updates_bg_when_highlighter_changes() {
+        let old_highlighter = SyntaxHighlighter::new(
+            EmbeddedThemeName::Base16EightiesDark,
+            Color::Red,
+            Color::Blue,
+        );
+        let new_highlighter = SyntaxHighlighter::new(
+            EmbeddedThemeName::Base16EightiesDark,
+            Color::Green,
+            Color::Magenta,
+        );
+
+        let mut hunk = DiffHunk {
+            header: "@@ -1,1 +1,1 @@".to_string(),
+            lines: vec![DiffLine {
+                origin: LineOrigin::Addition,
+                content: "let x = 1;".to_string(),
+                old_lineno: None,
+                new_lineno: Some(1),
+                highlighted_spans: None,
+            }],
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+        };
+
+        old_highlighter.rehighlight_hunk_in_place(&mut hunk, Path::new("test.rs"));
+        let baked_bg = hunk.lines[0]
+            .highlighted_spans
+            .as_ref()
+            .expect("should be highlighted")[0]
+            .0
+            .bg;
+        assert_eq!(baked_bg, Some(Color::Red));
+
+        // Simulate a theme swap: rehighlight in place with a different
+        // highlighter, without touching `content`/`origin`.
+        new_highlighter.rehighlight_hunk_in_place(&mut hunk, Path::new("test.rs"));
+        let updated_bg = hunk.lines[0]
+            .highlighted_spans
+            .as_ref()
+            .expect("should still be highlighted")[0]
+            .0
+            .bg;
+        assert_eq!(updated_bg, Some(Color::Green));
+    }
+
+    #[test]
+    fn rehighlight_hunk_in_place_skips_container_grammar_files() {
+        let highlighter = SyntaxHighlighter::new(
+            EmbeddedThemeName::Base16EightiesDark,
+            Color::Red,
+            Color::Blue,
+        );
+        let mut hunk = DiffHunk {
+            header: "@@ -1,1 +1,1 @@".to_string(),
+            lines: vec![DiffLine {
+                origin: LineOrigin::Addition,
+                content: "<script>let x = 1;</script>".to_string(),
+                old_lineno: None,
+                new_lineno: Some(1),
+                highlighted_spans: None,
+            }],
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+        };
+
+        highlighter.rehighlight_hunk_in_place(&mut hunk, Path::new("App.vue"));
+
+        assert!(
+            hunk.lines[0].highlighted_spans.is_none(),
+            "container-grammar files need full-file context this recipe doesn't have, \
+             so they should be left untouched rather than highlighted out of context"
+        );
+    }
+
+    #[test]
+    fn rehighlight_file_in_place_covers_every_hunk() {
+        let highlighter = SyntaxHighlighter::new(
+            EmbeddedThemeName::Base16EightiesDark,
+            Color::Red,
+            Color::Blue,
+        );
+        let mut file = DiffFile {
+            old_path: None,
+            new_path: Some(std::path::PathBuf::from("test.rs")),
+            status: crate::model::diff_types::FileStatus::Modified,
+            hunks: vec![
+                DiffHunk {
+                    header: "@@ -1,1 +1,1 @@".to_string(),
+                    lines: vec![DiffLine {
+                        origin: LineOrigin::Addition,
+                        content: "let a = 1;".to_string(),
+                        old_lineno: None,
+                        new_lineno: Some(1),
+                        highlighted_spans: None,
+                    }],
+                    old_start: 1,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 1,
+                },
+                DiffHunk {
+                    header: "@@ -10,1 +10,1 @@".to_string(),
+                    lines: vec![DiffLine {
+                        origin: LineOrigin::Deletion,
+                        content: "let b = 2;".to_string(),
+                        old_lineno: Some(10),
+                        new_lineno: None,
+                        highlighted_spans: None,
+                    }],
+                    old_start: 10,
+                    old_count: 1,
+                    new_start: 10,
+                    new_count: 0,
+                },
+            ],
+            is_binary: false,
+            is_too_large: false,
+            is_commit_message: false,
+            content_hash: 0,
+        };
+
+        highlighter.rehighlight_file_in_place(&mut file);
+
+        assert_eq!(
+            file.hunks[0].lines[0].highlighted_spans.as_ref().unwrap()[0]
+                .0
+                .bg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            file.hunks[1].lines[0].highlighted_spans.as_ref().unwrap()[0]
+                .0
+                .bg,
+            Some(Color::Blue)
+        );
     }
 }

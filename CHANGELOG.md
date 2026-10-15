@@ -2,6 +2,186 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.27.0] - 2026-09-23
+
+### Bug Fixes
+
+- **editor:** Open the PR revision with 'e', not the worktree copy (#627)
+- Address self-review findings (#729)
+- **forge:** Detect remotes in reftable and SHA-256 checkouts (#725)
+- **diff:** Show the commit message for a commit picked from the list (#727)
+- **editor:** Re-attach editor stdio to /dev/tty in --stdout mode (#740)
+- **navigation:** Target rendered hunk headers (#737)
+- **comments:** Copy all remote comment types at cursor (#733)
+
+### Documentation
+
+- Reserve README config entries for critical options (#731)
+
+### Features
+
+- **config:** Add pr_comments_visibility option (#730)
+- Add runtime theme picker with :theme command (#732)
+
+### Performance
+
+- **syntax:** Cap Oniguruma's backtracking budget (#726)
+
+### Skill
+
+- Put the tmux review pane where its caller is (#736)
+## [0.26.0] - 2026-09-15
+
+### Bug Fixes
+
+- **forge:** Use the comment type label in the submit prefix (#611)
+- Avoid keyboard probe for piped stdin (#678)
+- **cli:** Warn when review add --type is not a configured type (#682)
+- Stage deleted files with libgit2 (#684)
+- **forge:** Return GitLab MR commits oldest-first (#691)
+- Scroll side-by-side diffs horizontally (#693)
+- **input:** Type AltGr characters in the command, search and filter prompts (#694)
+- **cli:** Include comment author in review output (#690)
+- Persist reload reconciliation (#704)
+- **git:** Support SHA-256 repositories via CLI backend (#716)
+
+### Documentation
+
+- **skill:** Guide agents through seeding comments correctly (#680)
+- Add a CLI reference and correct stale forge claims (#705)
+- **skill:** Correct review comment author guidance (#706)
+
+### Features
+
+- **export:** Add export.session_header to drop the session slug (#676)
+- **config:** Add editor key to override $EDITOR for e/:edit (#677)
+- **forge:** Add Gitea pull request review support (#652)
+- **gerrit:** Add Gerrit Code Review as a supported forge (#692)
+- Add opt-in compact folders to the file tree (#698)
+- **pr:** Add named remote selection (#715)
+
+### Diff
+
+- Drop the frame and fold the header when the diff is the sole pane (#666)
+
+### Skill
+
+- Put the zellij review pane where its caller is (#687)
+## [0.25.0] - 2026-09-02
+
+### Bug Fixes
+
+- **ui:** Render a visible stand-in for whitespace leader keys in help (#646)
+- Address self-review findings (#651)
+- Update naersk lock for static.crates.io crate downloads (#661)
+- Resolve Azure DevOps remote owners as org/project (#654)
+- Apply .tuicrignore before parsing PR diffs (#668)
+- **pr:** Render Markdown in description panel (#671)
+- **gitlab:** Open merge requests through API (#665)
+
+### Features
+
+- **config:** Add confirm_quit to gate the bare q quit (#630)
+- **selector:** Add a Sessions tab to resume saved reviews (#669)
+- **help:** Pan the help popup with h/l (#673)
+
+### Side-by-side
+
+- Pick the comment side with the leader panel walk (#634)
+## [0.24.0] - 2026-08-25
+
+### Bug Fixes
+
+- **tui:** Resume from an editor without querying the cursor (#648)
+- Detect self-hosted GitLab before resolving SSH host (#631)
+
+### Documentation
+
+- Add pacman installation (#635)
+
+### Comment_panel
+
+- Adapt newline hint to terminal (#641)
+
+### Vcs/jj
+
+- Use as_chunks to parse diff metadata (#642)
+## [0.23.1] - 2026-08-20
+
+### Performance
+
+- **comments:** Parse comment markdown with pulldown-cmark (#628)
+- **comments:** Cull comment boxes outside the viewport (#600)
+## [0.23.0] - 2026-08-18
+
+### Bug Fixes
+
+- **vcs:** Quote file paths passed to jj and hg (#619)
+- Resolve the local clone for PRs opened after the first (#593)
+- **jj:** Remove Git staging concepts from local selector (#612)
+- **release:** Dynamically link GNU Linux binaries (#620)
+- **diff:** Keep hunk lines whose content starts with --- or +++ (#534)
+- **test:** Assert the real 50ms first-poll drain timeout (#621)
+
+### Documentation
+
+- Mark Hunk as a standalone binary (#614)
+
+### Features
+
+- Add a summary command (#582)
+
+### Performance
+
+- **tui:** Coalesce queued input events into one repaint (#617)
+
+### Refactor
+
+- **diff:** Use structured file metadata (#622)
+## [0.22.0] - 2026-08-13
+
+### Bug Fixes
+
+- Reindex recovered PR sessions (#561)
+- Prevent cursor-overflow panic on PR reload that shrinks the diff (#574)
+- Keep the TUI on screen when opening a windowed editor (#581)
+- Open Helix at the selected line (#590)
+- Run Herdr pane payload under bash so non-bash shells work (#594)
+- Keep a zz centering when opening a comment near EOF (#595)
+- **gitlab:** Submit multi-line range comments without schema errors (#598)
+- **release:** Build static musl binaries for Linux artifacts (#537)
+
+### Features
+
+- Copy open PR URL (#546)
+- **ui:** Copy the comment at the cursor with Y (#570)
+- **search:** Highlight search matches in the diff (#571)
+- Add diff_watch_interval + fix some bugs (#566)
+- **skills:** Add a cmux wrapper for launching tuicr (#589)
+
+### Performance
+
+- **git:** Speed up CLI backend startup (#568)
+## [0.21.0] - 2026-08-05
+
+### Bug Fixes
+
+- **tree:** Keep a directory's files together when a sibling shares its prefix (#528)
+- Label remote comments by forge (#530)
+- **ui:** Give the reviewed banner an annotation slot in single-file view (#535)
+- Deduplicate remote review threads (#550)
+- Cover Bitbucket variant in forge_badge_label (#564)
+
+### Documentation
+
+- Use official homebrew-core formula (#522) (#541)
+- Document remaining config keys (#527)
+
+### Features
+
+- **ui:** Always show the commit under review in the header (#529)
+- **ui:** Filter the file tree by include/exclude regex (#497)
+- **forge:** Add Bitbucket backend (#533)
 ## [0.20.0] - 2026-08-02
 
 ### Bug Fixes

@@ -3,14 +3,95 @@ use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
 use crate::ui::styles;
 
+pub fn render_message_details(frame: &mut Frame, app: &mut App) {
+    let Some(message) = app.message.as_ref() else {
+        return;
+    };
+    let content = message.content.clone();
+    let theme = &app.theme;
+    let area = frame.area();
+
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(styles::panel_style(theme))
+        .border_style(styles::border_style(theme, true));
+    let inner = block.inner(area);
+
+    let paragraph = Paragraph::new(content.as_str())
+        .style(
+            Style::default()
+                .fg(theme.message_error_fg)
+                .bg(theme.panel_bg),
+        )
+        .wrap(Wrap { trim: false });
+    app.help_state.total_lines = paragraph.line_count(inner.width);
+    app.help_state.viewport_height = inner.height as usize;
+    let max_offset = app
+        .help_state
+        .total_lines
+        .saturating_sub(app.help_state.viewport_height);
+    app.help_state.scroll_offset = app.help_state.scroll_offset.min(max_offset);
+    let scroll_indicator = match (
+        app.help_state.scroll_offset > 0,
+        app.help_state.scroll_offset < max_offset,
+    ) {
+        (true, true) => " ↑↓",
+        (true, false) => " ↑",
+        (false, true) => " ↓",
+        (false, false) => "",
+    };
+    frame.render_widget(
+        block.title(format!(
+            " Messages (j/k scroll, q/Esc close){scroll_indicator} "
+        )),
+        area,
+    );
+    frame.render_widget(
+        paragraph.scroll((
+            app.help_state.scroll_offset.min(u16::MAX as usize) as u16,
+            0,
+        )),
+        inner,
+    );
+}
+
+/// Printable stand-in for the configured leader key.
+///
+/// A whitespace leader (`leader = " "`) is a valid config value but renders as a
+/// blank in the help text, so substitute a visible glyph. The substitute must be
+/// exactly one display column wide: the help lines pad each chord to a fixed width.
+fn leader_display(leader: char) -> char {
+    if leader.is_whitespace() {
+        '\u{2423}'
+    } else {
+        leader
+    }
+}
+
+const COMMENT_MODE_KEY_WIDTH: usize = "Shift-Enter/Alt-Enter/Ctrl-J".len();
+
+fn comment_mode_row(key: &str, description: &str) -> Line<'static> {
+    let padding = COMMENT_MODE_KEY_WIDTH.saturating_sub(key.width());
+    Line::from(vec![
+        Span::styled(
+            format!("  {key}{}", " ".repeat(padding + 1)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(description.to_string()),
+    ])
+}
+
 pub fn render_help(frame: &mut Frame, app: &mut App) {
     let theme = &app.theme;
+    let leader = leader_display(app.leader_key);
     // Center over the diff pane (matches the submit-modal anchoring) so the
     // file list doesn't tug the popup's visual centre off to one side. Fall
     // back to the full frame when no diff area is laid out yet.
@@ -21,7 +102,7 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" Help (j/k scroll, / search) - Press ? or Esc to close ")
+        .title(" Help (j/k scroll, h/l pan, / search) - Press ? or Esc to close ")
         .borders(Borders::ALL)
         .style(styles::popup_style(theme))
         .border_style(styles::border_style(theme, true));
@@ -103,14 +184,21 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
                 "  /         ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Search within diff (case-insensitive)"),
+            Span::raw("Search within diff (case-insensitive regex)"),
         ]),
         Line::from(vec![
             Span::styled(
                 "  n/N       ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Next/prev search match"),
+            Span::raw("Next/prev search match (wraps)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Esc       ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Clear search highlighting"),
         ]),
         Line::from(vec![
             Span::styled(
@@ -135,38 +223,45 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled(
-                format!("  {}h/{}l     ", app.leader_key, app.leader_key),
+                format!("  {leader}h/{leader}l     "),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Focus file list/diff"),
+            Span::raw("Move focus left/right (side-by-side: between the two sides)"),
         ]),
         Line::from(vec![
             Span::styled(
-                format!("  {}k/{}j     ", app.leader_key, app.leader_key),
+                format!("  {leader}k/{leader}j     "),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw("Move focus up/down between panes"),
         ]),
         Line::from(vec![
             Span::styled(
-                format!("  {}e        ", app.leader_key),
+                format!("  {leader}e        "),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw("Toggle file list visibility"),
         ]),
         Line::from(vec![
             Span::styled(
-                format!("  {}s        ", app.leader_key),
+                format!("  {leader}s        "),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw("Toggle commit selector visibility (also `:set commits!`)"),
         ]),
         Line::from(vec![
             Span::styled(
-                format!("  {}f        ", app.leader_key),
+                format!("  {leader}f        "),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw("Toggle single-file view (also `:focus` / `:f`)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("  {leader}n        "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Toggle relative line numbers (also `:set relativenumber!`)"),
         ]),
         Line::from(vec![
             Span::styled(
@@ -188,7 +283,7 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            format!("Single-file view (`:focus`, `:f`, {}f)", app.leader_key),
+            format!("Single-file view (`:focus`, `:f`, {leader}f)"),
             Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         )),
         Line::from(""),
@@ -243,7 +338,7 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
                 "  Tab/S-Tab ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Switch Local / Pull Requests tab"),
+            Span::raw("Switch tabs"),
         ]),
         Line::from(vec![
             Span::styled(
@@ -257,7 +352,7 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
                 "  Space     ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Toggle local commit selection (no-op on PR tab)"),
+            Span::raw("Toggle commit selection (Local tab only)"),
         ]),
         Line::from(vec![
             Span::styled(
@@ -282,10 +377,24 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled(
-                "  Esc/q     ",
+                "  a         ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Quit / return"),
+            Span::raw("Show/hide empty saved reviews (Sessions tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  dd        ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Delete saved review, with confirm (Sessions tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Esc       ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Return to the diff"),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -348,6 +457,40 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
             ),
             Span::raw("Collapse all directories"),
         ]),
+        Line::from(vec![
+            Span::styled(
+                "  i         ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Filter to files matching a regex (hides others from tree + diff)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  e         ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Filter out files matching a regex"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  I/E       ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Clear the include/exclude filter"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  /         ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Search file paths; n/N step matches (selection only)"),
+        ]),
+        Line::from(Span::raw(
+            "  Patterns are case-insensitive and match the whole relative path.",
+        )),
+        Line::from(Span::raw(
+            "  :set noreviewed hides files already marked reviewed.",
+        )),
         Line::from(""),
         Line::from(Span::styled(
             "Comment Navigator",
@@ -418,7 +561,7 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled(
-                format!("  {}c        ", app.leader_key),
+                format!("  {leader}c        "),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw("Add review comment"),
@@ -446,10 +589,17 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled(
+                "  Y         ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Copy comment at cursor to clipboard"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "  e         ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Open focused file in $EDITOR"),
+            Span::raw("Open focused file in editor config / $EDITOR"),
         ]),
         Line::from(vec![
             Span::styled(
@@ -491,73 +641,23 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
             Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "  Tab/S-Tab ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Cycle comment type next/previous"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Enter     ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Save comment"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Ctrl-S    ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Save comment"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Shift-Enter/Alt-Enter/Ctrl-J",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Insert newline"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Ctrl-A/E  ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Line start/end"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Ctrl/Alt-Left/Right",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Word left/right"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Cmd-Left/Right",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Line start/end (macOS)"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Esc/Ctrl-C",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("Cancel"),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  comment_vim",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(if app.comment_vim_enabled {
+        comment_mode_row("Tab/S-Tab", "Cycle comment type next/previous"),
+        comment_mode_row("Enter", "Save comment"),
+        comment_mode_row("Ctrl-S", "Save comment"),
+        comment_mode_row("Shift-Enter/Alt-Enter/Ctrl-J", "Insert newline"),
+        comment_mode_row("Up/Down", "Previous/next displayed row (default editor)"),
+        comment_mode_row("Ctrl-A/E", "Line start/end"),
+        comment_mode_row("Ctrl/Alt-Left/Right", "Word left/right"),
+        comment_mode_row("Cmd-Left/Right", "Line start/end (macOS)"),
+        comment_mode_row("Esc/Ctrl-C", "Cancel"),
+        comment_mode_row(
+            "comment_vim",
+            if app.comment_vim_enabled {
                 "Vim ON (i/a:insert Esc:normal hjkl dd/ciw/x u; S-Enter:save S-Esc:discard :w/:q)"
             } else {
                 "Set comment_vim=true (or :vim) for vim modal editing"
-            }),
-        ]),
+            },
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "Commands",
@@ -606,7 +706,7 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
                 "  :edit     ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Open focused file in $EDITOR"),
+            Span::raw("Open focused file in editor config / $EDITOR"),
         ]),
         Line::from(vec![
             Span::styled(
@@ -614,6 +714,13 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw("Copy review to clipboard"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  :copy-url ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Copy the open PR URL to clipboard (PR mode)"),
         ]),
         Line::from(vec![
             Span::styled(
@@ -631,6 +738,20 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled(
+                "  :messages ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Open full details for the current error"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  :summary  ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Pending comments; j/k select, Enter jumps"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "  :stage    ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
@@ -645,13 +766,17 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled(
+                "  :theme    ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Open the theme picker; :theme <name> applies directly"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "  :focus    ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(
-                "Toggle single-file view (alias `:f`, {}f)",
-                app.leader_key
-            )),
+            Span::raw(format!("Toggle single-file view (alias `:f`, {leader}f)")),
         ]),
         Line::from(vec![
             Span::styled(
@@ -783,6 +908,13 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         ]),
         Line::from(vec![
             Span::styled(
+                "  :set reviewed",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  Show files marked reviewed (noreviewed hides, reviewed! toggles)"),
+        ]),
+        Line::from(vec![
+            Span::styled(
                 "  :clear    ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
@@ -852,6 +984,10 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
     let viewport_height = inner.height as usize;
     app.help_state.total_lines = total_lines;
     app.help_state.viewport_height = viewport_height;
+    app.help_state.viewport_width = inner.width as usize;
+    app.help_state.max_line_width = help_text.iter().map(Line::width).max().unwrap_or(0);
+    let max_horizontal_offset = app.help_state.max_horizontal_offset();
+    app.help_state.horizontal_offset = app.help_state.horizontal_offset.min(max_horizontal_offset);
     app.help_state.searchable_lines = help_text
         .iter()
         .map(|line| {
@@ -881,7 +1017,12 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
         })
         .collect();
 
-    let paragraph = Paragraph::new(visible_lines).style(styles::popup_style(theme));
+    let paragraph = Paragraph::new(visible_lines)
+        .style(styles::popup_style(theme))
+        .scroll((
+            0,
+            app.help_state.horizontal_offset.min(u16::MAX as usize) as u16,
+        ));
     frame.render_widget(paragraph, inner);
 
     // Render scroll indicators
@@ -916,4 +1057,66 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let [area] = vertical.areas(area);
     let [area] = horizontal.areas(area);
     area
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthChar;
+
+    #[test]
+    fn should_substitute_a_visible_glyph_for_a_whitespace_leader() {
+        // given
+        let leader = ' ';
+        // when
+        let displayed = leader_display(leader);
+        // then
+        assert_eq!(displayed, '\u{2423}');
+    }
+
+    #[test]
+    fn should_leave_an_ordinary_leader_unchanged() {
+        // given
+        let leader = ',';
+        // when
+        let displayed = leader_display(leader);
+        // then
+        assert_eq!(displayed, ',');
+    }
+
+    #[test]
+    fn should_keep_the_substitute_one_display_column_wide() {
+        // given
+        let leader = '\t';
+        // when
+        let displayed = leader_display(leader);
+        // then
+        assert_eq!(displayed.width(), Some(1));
+    }
+
+    #[test]
+    fn should_align_comment_mode_descriptions_after_the_key_column() {
+        let keys = [
+            "Tab/S-Tab",
+            "Enter",
+            "Ctrl-S",
+            "Shift-Enter/Alt-Enter/Ctrl-J",
+            "Ctrl-A/E",
+            "Ctrl/Alt-Left/Right",
+            "Cmd-Left/Right",
+            "Esc/Ctrl-C",
+            "comment_vim",
+        ];
+
+        let description_columns: Vec<usize> = keys
+            .iter()
+            .map(|key| {
+                comment_mode_row(key, "description").spans[0]
+                    .content
+                    .width()
+            })
+            .collect();
+
+        assert!(description_columns.iter().all(|&column| column == 31));
+    }
 }

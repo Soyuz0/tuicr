@@ -7,8 +7,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
+use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, DiffSource, InputMode, Message, MessageType};
+use crate::app::{App, DiffSource, FocusedPanel, InputMode, Message, MessageType};
 use crate::theme::Theme;
 use crate::ui::commit_row::CURSOR_GLYPH;
 use crate::ui::styles;
@@ -23,8 +24,13 @@ pub fn build_message_span(message: Option<&Message>, theme: &Theme) -> (Span<'st
             MessageType::Warning => (theme.message_warning_fg, theme.message_warning_bg),
             MessageType::Error => (theme.message_error_fg, theme.message_error_bg),
         };
-        let content = format!(" {} ", msg.content);
-        let width = content.len();
+        let detail = msg.content.replace(['\n', '\r'], " ");
+        let content = if msg.message_type == MessageType::Error {
+            format!(" [:messages] {detail} ")
+        } else {
+            format!(" {detail} ")
+        };
+        let width = content.width();
         (
             Span::styled(
                 content,
@@ -43,7 +49,7 @@ pub fn build_right_aligned_spans<'a>(
     message_width: usize,
     total_width: usize,
 ) -> Vec<Span<'a>> {
-    let left_width: usize = left_spans.iter().map(|s| s.content.len()).sum();
+    let left_width: usize = left_spans.iter().map(|s| s.content.width()).sum();
     let padding_width = total_width.saturating_sub(left_width + message_width);
     let padding = Span::raw(" ".repeat(padding_width));
 
@@ -144,10 +150,61 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 
     let total_width = area.width as usize;
     let brand_width = brand.content.chars().count();
-    let right_width = source_width + update_width;
-    let pad_width = total_width.saturating_sub(brand_width + right_width);
 
-    let mut spans = vec![brand, Span::raw(" ".repeat(pad_width)), source_span];
+    // When the diff is the only pane it has no frame/title row, so fold the
+    // current file name (left, after the brand) and its diff stats (right,
+    // after the source cluster) into this single header line.
+    let sole = app.is_diff_sole_pane();
+    let (stat_spans, stat_width): (Vec<Span>, usize) = if sole {
+        let line = crate::ui::diff_view::diff_stat_title(app);
+        let w = line
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>();
+        (line.spans, w)
+    } else {
+        (Vec::new(), 0)
+    };
+
+    let right_width = source_width + stat_width + update_width;
+
+    let (file_span, file_width) = if sole {
+        let label = if app.is_cursor_in_overview() || app.current_file_path().is_none() {
+            "Overview".to_string()
+        } else {
+            app.current_file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
+        // Leave a two-column minimum gap between the file name and the right
+        // cluster; truncate the path (keeping the basename) to whatever fits.
+        let avail = total_width.saturating_sub(brand_width + right_width + 2);
+        let label = crate::ui::diff_view::truncate_path_smart(&label, avail);
+        let text = format!(" {label} ");
+        let width = text.chars().count();
+        (
+            Some(Span::styled(
+                text,
+                Style::default()
+                    .fg(theme.fg_secondary)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            width,
+        )
+    } else {
+        (None, 0)
+    };
+
+    let pad_width = total_width.saturating_sub(brand_width + file_width + right_width);
+
+    let mut spans = vec![brand];
+    if let Some(file_span) = file_span {
+        spans.push(file_span);
+    }
+    spans.push(Span::raw(" ".repeat(pad_width)));
+    spans.push(source_span);
+    spans.extend(stat_spans);
     if update_width > 0 {
         spans.push(update_span);
     }
@@ -158,14 +215,39 @@ pub fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Short, lowercase description of the active review source. Returns `None`
-/// for plain working-tree review (no extra label needed beyond `vcs:branch`).
+/// Short form of the HEAD sha, or `None` when there is no real commit to name.
+///
+/// Pristine sessions store a synthetic `pristine:<head>:<hash>` key rather than
+/// a sha, and that mode already renders its own chip further down the header.
+/// An empty repository has no HEAD at all.
+fn head_commit_label(app: &App) -> Option<String> {
+    if app.is_pristine_mode {
+        return None;
+    }
+    let head = app.vcs_info.head_commit.as_str();
+    (!head.is_empty()).then(|| head[..7.min(head.len())].to_string())
+}
+
+/// Suffix a working-tree label with the commit being diffed against.
+fn with_head_commit(label: &str, app: &App) -> String {
+    match head_commit_label(app) {
+        Some(head) => format!("{label} \u{00b7} commit {head}"),
+        None => label.to_string(),
+    }
+}
+
+/// Short, lowercase description of the active review source, including the
+/// commit it is diffed against. Returns `None` only when there is nothing to
+/// add beyond `vcs:branch`, which now means an empty repository.
 fn header_source_chunk(app: &App) -> Option<String> {
     match &app.diff_source {
-        DiffSource::WorkingTree => None,
-        DiffSource::Staged => Some("staged".to_string()),
-        DiffSource::Unstaged => Some("unstaged".to_string()),
-        DiffSource::StagedAndUnstaged => Some("staged + unstaged".to_string()),
+        // The working-tree family all diff against HEAD but never named it, so
+        // the commit under review was only visible via `-r <sha>`. The
+        // commit-range arms below already identify their own revision.
+        DiffSource::WorkingTree => head_commit_label(app).map(|head| format!("commit {head}")),
+        DiffSource::Staged => Some(with_head_commit("staged", app)),
+        DiffSource::Unstaged => Some(with_head_commit("unstaged", app)),
+        DiffSource::StagedAndUnstaged => Some(with_head_commit("staged + unstaged", app)),
         DiffSource::CommitRange(commits) => {
             if commits.len() == 1 {
                 Some(format!("commit {}", &commits[0][..7.min(commits[0].len())]))
@@ -241,6 +323,8 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             InputMode::Search => " SEARCH ".to_string(),
             InputMode::Comment => " COMMENT ".to_string(),
             InputMode::Help => " HELP ".to_string(),
+            InputMode::MessageDetails => " ERROR ".to_string(),
+            InputMode::Summary => " SUMMARY ".to_string(),
             InputMode::Confirm => " CONFIRM ".to_string(),
             InputMode::CommitSelect => " SELECT ".to_string(),
             InputMode::VisualSelect => {
@@ -257,14 +341,25 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             InputMode::SubmitResolver => " RESOLVE ".to_string(),
             InputMode::SubmitConfirm => " SUBMIT ".to_string(),
             InputMode::SubmitActionPicker => " SUBMIT ".to_string(),
+            InputMode::ThemePicker => " THEME ".to_string(),
         };
 
         let mode_span = Span::styled(mode_str, styles::mode_style(theme));
 
         let hints: Cow<'static, str> = if app.message.is_some() {
             Cow::Borrowed("")
+        } else if app.file_tree_prompt_editing() {
+            // File-tree prompts are a sub-state of Normal, so the mode chip
+            // still reads NORMAL; the hint is what tells the user Enter/Esc
+            // are the way out.
+            Cow::Borrowed("   \u{21b5} apply \u{00b7} esc cancel")
+        } else if app.theme_picker_filtering() {
+            Cow::Borrowed("   \u{21b5} apply filter \u{00b7} esc cancel filter")
         } else {
             match app.input_mode {
+                InputMode::Normal if app.focused_panel == FocusedPanel::FileList => Cow::Borrowed(
+                    "   j/k move \u{00b7} \u{21b5} open \u{00b7} i/e filter \u{00b7} I/E clear \u{00b7} / search \u{00b7} r reviewed",
+                ),
                 InputMode::Normal => Cow::Borrowed(
                     "   j/k scroll \u{00b7} {/} file \u{00b7} m/M comment \u{00b7} r file \u{00b7} R hunk \u{00b7} c comment \u{00b7} ? help",
                 ),
@@ -272,8 +367,15 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     Cow::Borrowed("   tab complete \u{00b7} \u{21b5} execute \u{00b7} esc cancel")
                 }
                 InputMode::Search => Cow::Borrowed("   \u{21b5} search \u{00b7} esc cancel"),
+                InputMode::Comment if !app.comment_vim_enabled => {
+                    Cow::Borrowed("   ↑/↓ row \u{00b7} ctrl-s save \u{00b7} esc cancel")
+                }
                 InputMode::Comment => Cow::Borrowed("   ctrl-s save \u{00b7} esc cancel"),
                 InputMode::Help => Cow::Borrowed("   / search · n/N match · q/?/esc close"),
+                InputMode::MessageDetails => Cow::Borrowed("   j/k scroll · q/esc close"),
+                InputMode::Summary => {
+                    Cow::Borrowed("   j/k select \u{00b7} \u{21b5} jump \u{00b7} q/esc close")
+                }
                 InputMode::Confirm => Cow::Borrowed("   y yes \u{00b7} n no"),
                 InputMode::CommitSelect => Cow::Borrowed(
                     "   j/k navigate \u{00b7} space select \u{00b7} \u{21b5} confirm \u{00b7} esc back",
@@ -290,11 +392,24 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 InputMode::SubmitActionPicker => {
                     Cow::Borrowed("   j/k move \u{00b7} \u{21b5} submit \u{00b7} esc cancel")
                 }
+                InputMode::ThemePicker => Cow::Borrowed(
+                    "   j/k move \u{00b7} \u{21b5} apply \u{00b7} / filter \u{00b7} esc cancel",
+                ),
             }
         };
         let hints_span = Span::styled(hints, Style::default().fg(theme.fg_secondary));
 
-        vec![mode_span, hints_span]
+        let mut spans = vec![mode_span, hints_span];
+        if app.input_mode == InputMode::Normal
+            && app.message.is_none()
+            && let Some((current, total)) = app.search_match_position()
+        {
+            spans.push(Span::styled(
+                format!("   [{current}/{total}]"),
+                Style::default().fg(theme.fg_secondary),
+            ));
+        }
+        spans
     };
 
     // Right-aligned slot priority: active message > pr-flow spinners
@@ -526,7 +641,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod pr_header_snapshot_tests {
+mod header_snapshot_tests {
     //! Render-snapshot coverage for the status bar header in PR mode.
     //! Drives the full `render_header` against ratatui's `TestBackend`
     //! and asserts on the produced character grid.
@@ -640,10 +755,165 @@ mod pr_header_snapshot_tests {
         terminal.backend().buffer().clone()
     }
 
+    fn draw_app(app: &mut App, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .expect("draw frame");
+        terminal.backend().buffer().clone()
+    }
+
     fn row_text(buffer: &Buffer, y: u16) -> String {
         (0..buffer.area.width)
             .map(|x| buffer[(x, y)].symbol().to_string())
             .collect()
+    }
+
+    #[test]
+    fn should_make_full_long_error_accessible_from_status_bar() {
+        let mut app = build_pr_app(pr_source(false, false));
+        app.set_error(
+            "Submit failed: GitHub command failed: gh: Unprocessable Entity (HTTP 422)\n\
+             {\"message\":\"Unprocessable Entity\",\"errors\":[\"Review Can not approve your own pull request\"]}",
+        );
+
+        let status = draw_app(&mut app, 60, 12);
+        assert!(
+            row_text(&status, 11).contains("[:messages]"),
+            "status bar should advertise full error details"
+        );
+
+        app.open_message_details();
+        let buffer = draw_app(&mut app, 60, 12);
+        let rendered = (0..buffer.area.height)
+            .map(|y| row_text(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact = rendered
+            .replace('│', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            compact.contains("Submit failed: GitHub command failed: gh: Unprocessable Entity"),
+            "error prefix should remain visible, got:\n{rendered}"
+        );
+
+        app.help_scroll_to_bottom();
+        let buffer = draw_app(&mut app, 60, 12);
+        let rendered = (0..buffer.area.height)
+            .map(|y| row_text(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact = rendered
+            .replace('│', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            compact.contains("Review Can not approve your own pull request"),
+            "full error detail should remain reachable, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn should_scroll_to_end_of_oversized_error_details() {
+        let mut app = build_pr_app(pr_source(false, false));
+        app.set_error(format!(
+            "Submit failed: {}UNIQUE_END",
+            "long error ".repeat(200)
+        ));
+        app.open_message_details();
+
+        let _ = draw_app(&mut app, 60, 12);
+        app.help_scroll_to_bottom();
+        let buffer = draw_app(&mut app, 60, 12);
+        let rendered = (0..buffer.area.height)
+            .map(|y| row_text(&buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("UNIQUE_END"),
+            "last error detail should be reachable, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn should_scroll_error_details_with_mouse_wheel() {
+        let mut app = build_pr_app(pr_source(false, false));
+        app.set_error(format!("failed: {}", "long error ".repeat(200)));
+        app.open_message_details();
+        let _ = draw_app(&mut app, 60, 12);
+
+        crate::handler::handle_mouse_event(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+
+        assert!(app.help_state.scroll_offset > 0);
+    }
+
+    #[test]
+    fn should_open_error_details_with_messages_command_and_close_to_normal_mode() {
+        let mut app = build_pr_app(pr_source(false, false));
+        app.input_mode = InputMode::Command;
+        app.command_buffer = "messages".to_string();
+        app.set_error("failed to load target");
+
+        crate::handler::handle_command_action(&mut app, crate::input::Action::SubmitInput);
+        assert_eq!(app.input_mode, InputMode::MessageDetails);
+        app.toggle_help();
+
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn should_reset_scroll_when_another_error_replaces_the_open_message() {
+        let mut app = build_pr_app(pr_source(false, false));
+        app.set_error(format!("failed: {}", "long error ".repeat(200)));
+        app.open_message_details();
+        let _ = draw_app(&mut app, 60, 12);
+        app.help_scroll_to_bottom();
+        assert!(app.help_state.scroll_offset > 0);
+
+        app.set_error("replacement error");
+
+        assert_eq!(app.input_mode, InputMode::MessageDetails);
+        assert_eq!(app.help_state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn should_report_when_messages_command_has_no_current_error() {
+        let mut app = build_pr_app(pr_source(false, false));
+        app.input_mode = InputMode::Command;
+        app.command_buffer = "messages".to_string();
+
+        crate::handler::handle_command_action(&mut app, crate::input::Action::SubmitInput);
+
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(
+            app.message.as_ref().map(|message| message.content.as_str()),
+            Some("No current error")
+        );
+    }
+
+    #[test]
+    fn should_close_error_details_when_a_non_error_replaces_the_message() {
+        let mut app = build_pr_app(pr_source(false, false));
+        app.set_error("request failed");
+        app.open_message_details();
+
+        app.set_message("request recovered");
+
+        assert_eq!(app.input_mode, InputMode::Normal);
     }
 
     #[test]
@@ -678,6 +948,35 @@ mod pr_header_snapshot_tests {
         let line = row_text(&buffer, 0);
         assert!(line.contains("PR Mode"), "got: {line:?}");
         assert!(!line.contains("read only"), "got: {line:?}");
+    }
+
+    #[test]
+    fn should_fold_file_and_stats_into_header_when_diff_is_sole_pane() {
+        // given a PR app with no other panes (file list hidden, no commit pane)
+        let mut app = build_pr_app(pr_source(false, false));
+        app.show_file_list = false;
+        assert!(app.is_diff_sole_pane());
+        // when
+        let buffer = draw_header(&app);
+        // then: the diff title row is gone; its file label + stats fold into
+        // this header line (no diff files -> "Overview" and +0/-0).
+        let line = row_text(&buffer, 0);
+        assert!(line.contains("PR Mode"), "got: {line:?}");
+        assert!(line.contains("Overview"), "got: {line:?}");
+        assert!(line.contains("+0") && line.contains("-0"), "got: {line:?}");
+    }
+
+    #[test]
+    fn should_not_fold_file_into_header_when_other_panes_visible() {
+        // given the file list is visible -> diff keeps its own framed title
+        let mut app = build_pr_app(pr_source(false, false));
+        app.show_file_list = true;
+        assert!(!app.is_diff_sole_pane());
+        // when
+        let buffer = draw_header(&app);
+        // then the header does not carry the file label
+        let line = row_text(&buffer, 0);
+        assert!(!line.contains("Overview"), "got: {line:?}");
     }
 
     #[test]
@@ -803,5 +1102,93 @@ mod pr_header_snapshot_tests {
         // assertion at all proves the truncation no longer panics)
         let line = row_text(&buffer, 0);
         assert!(line.contains("agavra/tuicr#125"), "got: {line:?}");
+    }
+    fn build_local_app(diff_source: DiffSource, head_commit: &str) -> App {
+        let vcs_info = VcsInfo {
+            root_path: PathBuf::from("/repo"),
+            head_commit: head_commit.to_string(),
+            branch_name: Some("main".to_string()),
+            vcs_type: VcsType::Git,
+        };
+        let session = ReviewSession::new(
+            vcs_info.root_path.clone(),
+            vcs_info.head_commit.clone(),
+            vcs_info.branch_name.clone(),
+            SessionDiffSource::WorkingTree,
+        );
+        App::build(
+            Box::new(NoopVcs {
+                info: vcs_info.clone(),
+            }),
+            vcs_info,
+            Theme::dark(),
+            None,
+            false,
+            Vec::new(),
+            session,
+            diff_source,
+            InputMode::Normal,
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("build local app")
+    }
+
+    #[test]
+    fn should_show_head_commit_when_reviewing_the_working_tree() {
+        let app = build_local_app(DiffSource::WorkingTree, "abcdef0123456789");
+        assert_eq!(
+            super::header_source_chunk(&app),
+            Some("commit abcdef0".to_string())
+        );
+    }
+
+    #[test]
+    fn should_show_head_commit_alongside_staged_labels() {
+        let staged = build_local_app(DiffSource::Staged, "abcdef0123456789");
+        assert_eq!(
+            super::header_source_chunk(&staged),
+            Some("staged \u{00b7} commit abcdef0".to_string())
+        );
+
+        let both = build_local_app(DiffSource::StagedAndUnstaged, "abcdef0123456789");
+        assert_eq!(
+            super::header_source_chunk(&both),
+            Some("staged + unstaged \u{00b7} commit abcdef0".to_string())
+        );
+    }
+
+    #[test]
+    fn should_omit_head_commit_when_repository_has_no_head() {
+        let app = build_local_app(DiffSource::WorkingTree, "");
+        assert_eq!(super::header_source_chunk(&app), None);
+
+        let staged = build_local_app(DiffSource::Staged, "");
+        assert_eq!(
+            super::header_source_chunk(&staged),
+            Some("staged".to_string())
+        );
+    }
+
+    #[test]
+    fn should_not_duplicate_commit_for_a_revision_review() {
+        // `-r <sha>` already names its own revision; HEAD must not be appended.
+        let app = build_local_app(
+            DiffSource::CommitRange(vec!["fedcba9876543210".to_string()]),
+            "abcdef0123456789",
+        );
+        assert_eq!(
+            super::header_source_chunk(&app),
+            Some("commit fedcba9".to_string())
+        );
+    }
+
+    #[test]
+    fn should_render_head_commit_in_the_header() {
+        let app = build_local_app(DiffSource::WorkingTree, "abcdef0123456789");
+        let buffer = draw_header(&app);
+        let line = row_text(&buffer, 0);
+        assert!(line.contains("commit abcdef0"), "got: {line:?}");
     }
 }

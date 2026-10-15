@@ -5,7 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     App, DiffSource, ExpandDirection, FocusedPanel, GAP_EXPAND_BATCH, GapId, InputMode,
@@ -14,13 +14,16 @@ use crate::model::{DiffLine, FileStatus, LineOrigin, LineRange, LineSide};
 use crate::theme::Theme;
 use crate::ui::comment_panel;
 use crate::ui::diff_view::{
-    apply_horizontal_scroll, comment_type_presentation, cursor_indicator, cursor_indicator_spaced,
-    diff_stat_title, hunk_header_text_and_style, paint_cursor_line_highlight,
-    paint_visual_selection_overlay, populate_row_to_annotation, render_expander_line,
-    render_hidden_lines, scroll_comment_input_into_view,
+    apply_horizontal_scroll, comment_box_row, comment_type_presentation, cursor_indicator,
+    cursor_indicator_spaced, diff_stat_title, hunk_header_text_and_style,
+    paint_cursor_line_highlight, paint_visual_selection_overlay, populate_row_to_annotation,
+    render_expander_line, render_hidden_lines, scroll_comment_input_into_view, skip_comment_box,
 };
 use crate::ui::styles;
-use crate::ui::text_utils::{truncate_or_pad, truncate_or_pad_spans, wrap_spans};
+use crate::ui::text_utils::{
+    apply_search_highlight_pairs, apply_search_highlight_spans, apply_search_highlight_text,
+    truncate_or_pad, truncate_or_pad_pairs_by_chars, truncate_or_pad_spans, wrap_spans,
+};
 use crate::vcs::git::calculate_gap;
 
 #[derive(Clone, Default)]
@@ -33,21 +36,92 @@ struct SbsRowMeta {
     right_pad_style: Style,
 }
 
+type WrappedRows = Vec<Vec<Span<'static>>>;
+
+fn sbs_wrapped_sides(meta: &SbsRowMeta, content_width: usize) -> (WrappedRows, WrappedRows) {
+    (
+        wrap_spans(&meta.left_content, content_width),
+        wrap_spans(&meta.right_content, content_width),
+    )
+}
+
+fn sbs_row_height(
+    lines: &[Line],
+    sbs_meta: &std::collections::HashMap<usize, SbsRowMeta>,
+    idx: usize,
+    wrap: bool,
+    content_width: usize,
+    viewport_width: usize,
+) -> usize {
+    if !wrap || content_width == 0 {
+        return 1;
+    }
+    match sbs_meta.get(&idx) {
+        Some(meta) => {
+            let (left_rows, right_rows) = sbs_wrapped_sides(meta, content_width);
+            left_rows.len().max(right_rows.len())
+        }
+        None => lines
+            .get(idx)
+            .map_or(1, |line| wrap_spans(&line.spans, viewport_width).len()),
+    }
+}
+
 fn content_spans_for_diff_line(
     theme: &Theme,
     dl: &DiffLine,
     origin: LineOrigin,
+    search: Option<(&crate::ui::text_utils::SearchPattern, Style)>,
 ) -> Vec<Span<'static>> {
     let base = match origin {
         LineOrigin::Context => styles::diff_context_style(theme),
         LineOrigin::Addition => styles::diff_add_style(theme),
         LineOrigin::Deletion => styles::diff_del_style(theme),
     };
-    if let Some(ref h) = dl.highlighted_spans {
-        h.iter().map(|(s, t)| Span::styled(t.clone(), *s)).collect()
+    let spans: Vec<Span<'static>> = if let Some(ref h) = dl.highlighted_spans {
+        h.iter()
+            .map(|(s, t)| {
+                Span::styled(
+                    t.clone(),
+                    styles::patch_highlighted_span_bg(*s, theme, origin),
+                )
+            })
+            .collect()
     } else {
         vec![Span::styled(dl.content.clone(), base)]
+    };
+    match search {
+        Some((needle, hl)) => apply_search_highlight_spans(spans, needle, hl),
+        None => spans,
     }
+}
+
+fn searched_cell_spans(
+    pairs: &[(Style, String)],
+    width: usize,
+    pad_style: Style,
+    search: Option<(&crate::ui::text_utils::SearchPattern, Style)>,
+) -> Vec<Span<'static>> {
+    if let Some((needle, hl)) = search
+        && let Some(highlighted) = apply_search_highlight_pairs(pairs, needle, hl)
+    {
+        return truncate_or_pad_spans(&highlighted, width, pad_style);
+    }
+    truncate_or_pad_spans(pairs, width, pad_style)
+}
+
+fn plain_cell_spans(
+    content: &str,
+    style: Style,
+    width: usize,
+    search: Option<(&crate::ui::text_utils::SearchPattern, Style)>,
+) -> Vec<Span<'static>> {
+    if let Some((needle, hl)) = search
+        && let Some(highlighted) = apply_search_highlight_text(content, style, needle, hl)
+    {
+        return truncate_or_pad_pairs_by_chars(&highlighted, width, style);
+    }
+    vec![Span::styled(truncate_or_pad(content, width), style)]
 }
 
 fn column_pad_style(theme: &Theme, dl: &DiffLine, origin: LineOrigin) -> Style {
@@ -80,6 +154,59 @@ fn pad_spans_to_width(
         spans.push(Span::styled(" ".repeat(width - cur), pad_style));
     }
     spans
+}
+
+fn pan_spans(
+    spans: &[Span<'static>],
+    scroll_x: usize,
+    width: usize,
+    pad_style: Style,
+) -> Vec<Span<'static>> {
+    let mut skipped = 0;
+    let mut visible_width = 0;
+    let mut visible = Vec::new();
+    for span in spans {
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let ch_width = ch.width().unwrap_or(if ch == '\t' { 1 } else { 0 });
+            if skipped < scroll_x {
+                skipped += ch_width;
+            } else if visible_width + ch_width <= width {
+                text.push(ch);
+                visible_width += ch_width;
+            } else {
+                if !text.is_empty() {
+                    visible.push(Span::styled(text, span.style));
+                }
+                return pad_spans_to_width(visible, width, pad_style);
+            }
+        }
+        if !text.is_empty() {
+            visible.push(Span::styled(text, span.style));
+        }
+        if visible_width == width {
+            break;
+        }
+    }
+    pad_spans_to_width(visible, width, pad_style)
+}
+
+fn pan_sbs_row(meta: &SbsRowMeta, scroll_x: usize, content_width: usize) -> Line<'static> {
+    let mut spans = meta.left_prefix.clone();
+    spans.extend(pan_spans(
+        &meta.left_content,
+        scroll_x,
+        content_width,
+        meta.left_pad_style,
+    ));
+    spans.extend(meta.right_prefix.clone());
+    spans.extend(pan_spans(
+        &meta.right_content,
+        scroll_x,
+        content_width,
+        meta.right_pad_style,
+    ));
+    Line::from(spans)
 }
 
 struct SideSpec {
@@ -116,6 +243,63 @@ fn sbs_row_prefixes(
         Span::styled(right.marker.to_string(), right.marker_style),
     ];
     (left_prefix, right_prefix)
+}
+
+/// Move the `▶` caret onto the active side for the cursor row. The per-line
+/// builders always place the caret in the far-left slot (old side). When the
+/// cursor's effective side is `New`, blank that slot and redraw the caret in
+/// the divider's trailing space, just left of the new line number, so it
+/// points at the side a comment would attach to. Run as a post-render overlay
+/// so it's independent of the wrapped/unwrapped row-build paths.
+fn paint_sbs_active_side_caret(
+    frame: &mut Frame,
+    inner: Rect,
+    app: &App,
+    lw: usize,
+    content_width: usize,
+    row_heights: &[usize],
+) {
+    // Only the New side needs moving; Old keeps the left-slot caret.
+    if !matches!(app.get_line_at_cursor(), Some((_, LineSide::New))) {
+        return;
+    }
+    let scroll_offset = app.diff_state.scroll_offset;
+    let cursor_line = app.diff_state.cursor_line;
+    if cursor_line < scroll_offset {
+        return;
+    }
+    let logical_offset = cursor_line - scroll_offset;
+    if logical_offset >= app.diff_state.visible_line_count.max(1) {
+        return;
+    }
+    // First visual row of the cursor's logical line (wrap-aware).
+    let visual_row: u16 = if app.diff_state.wrap_lines {
+        (0..logical_offset)
+            .map(|i| row_heights.get(i).copied().unwrap_or(1) as u16)
+            .sum()
+    } else {
+        logical_offset as u16
+    };
+    if visual_row >= inner.height {
+        return;
+    }
+    let y = inner.y + visual_row;
+    let style = styles::current_line_indicator_style(&app.theme);
+
+    // Blank the far-left caret slot.
+    frame.buffer_mut()[(inner.x, y)].set_char(' ');
+
+    // Caret goes in the divider's trailing space: after the left gutter
+    // (`sbs_left_gutter`) and the left content column, `" │ "` occupies three
+    // cells and the third (index +2) is the space just left of the new lineno.
+    let caret_x = inner.x + crate::app::sbs_left_gutter(lw) + content_width as u16 + 2;
+    if caret_x < inner.x + inner.width {
+        let cell = &mut frame.buffer_mut()[(caret_x, y)];
+        cell.set_char('▶');
+        if let Some(fg) = style.fg {
+            cell.set_fg(fg);
+        }
+    }
 }
 
 /// Continuation-row prefixes shared by every wrapped line: blank in place of
@@ -160,11 +344,25 @@ struct SideBySideContext<'a> {
     // half-open range; off-screen rows push `Line::default()` placeholders.
     visible_start: usize,
     visible_end: usize,
+    search_style: Style,
 }
 
 impl SideBySideContext<'_> {
     fn is_visible(&self, line_idx: usize) -> bool {
         line_idx >= self.visible_start && line_idx < self.visible_end
+    }
+
+    /// Same question for a multi-row comment box: does any of it land on screen?
+    fn box_visible(&self, top: usize, rows: usize) -> bool {
+        crate::ui::diff_view::comment_box_visible(top, rows, (self.visible_start, self.visible_end))
+    }
+
+    fn search_for(
+        &self,
+        line_idx: usize,
+    ) -> Option<(&crate::ui::text_utils::SearchPattern, Style)> {
+        let needle = self.app.search_paint_at(line_idx)?;
+        Some((needle, self.search_style))
     }
 
     fn display_lineno(&self, source_line: Option<u32>, line_idx: usize) -> Option<u32> {
@@ -181,14 +379,19 @@ impl SideBySideContext<'_> {
 pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focused_panel == FocusedPanel::Diff;
 
-    let title = crate::ui::diff_view::diff_title(app, area.width);
-
-    let block = Block::default()
-        .title(title)
-        .title_top(diff_stat_title(app).right_aligned())
-        .borders(Borders::ALL)
+    // When the diff is the only pane, drop the frame entirely — including its
+    // title row. The file name and stats are folded into the top header line
+    // instead (see status_bar::render_header) so there's a single header line.
+    let sole = app.is_diff_sole_pane();
+    let mut block = Block::default()
+        .borders(if sole { Borders::NONE } else { Borders::ALL })
         .style(styles::panel_style(&app.theme))
         .border_style(styles::border_style(&app.theme, focused));
+    if !sole {
+        block = block
+            .title(crate::ui::diff_view::diff_title(app, area.width))
+            .title_top(diff_stat_title(app).right_aligned());
+    }
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -230,6 +433,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
         sbs_meta: std::cell::RefCell::new(std::collections::HashMap::new()),
         visible_start,
         visible_end,
+        search_style: styles::search_match_style(&app.theme),
     };
 
     // Build all diff lines for side-by-side view
@@ -256,7 +460,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
 
     // The `═══ Review Comments ═══` label is redundant in single-file
     // view -- see the matching guard in `src/ui/diff_unified.rs`.
-    if !app.is_single_file_view {
+    if app.show_review_comments_header() {
         let general_indicator = cursor_indicator_spaced(line_idx, ctx.current_line_idx);
         lines.push(Line::from(vec![
             Span::styled(
@@ -279,7 +483,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
         let summary_lines = comment_panel::format_remote_review_summary_lines(
             &app.theme,
             summary,
-            app.forge_display_name(),
+            app.forge_kind(),
         );
         for mut summary_line in summary_lines {
             let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
@@ -308,6 +512,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
                 app.comment_vim_mode_label()
                     .as_ref()
                     .map(|(t, w)| (t.as_str(), *w)),
+                app.supports_keyboard_enhancement,
             );
             comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
             comment_cursor_column = 1 + cursor_info.column;
@@ -326,6 +531,11 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
                 line_idx += 1;
             }
         } else {
+            let rows = App::comment_display_lines(comment, ctx.panel_width);
+            if !ctx.box_visible(line_idx, rows) {
+                skip_comment_box(&mut lines, &mut line_idx, rows);
+                continue;
+            }
             let comment_lines = comment_panel::format_comment_lines(
                 &app.theme,
                 comment_type_presentation(app, &comment.comment_type),
@@ -363,7 +573,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
                     &app.theme,
                     thread,
                     muted,
-                    app.forge_display_name(),
+                    app.forge_kind(),
                 );
                 for mut comment_line in thread_lines {
                     let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
@@ -390,6 +600,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
             app.comment_vim_mode_label()
                 .as_ref()
                 .map(|(t, w)| (t.as_str(), *w)),
+            app.supports_keyboard_enhancement,
         );
         comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
         comment_cursor_column = 1 + cursor_info.column;
@@ -413,12 +624,17 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
         &mut line_idx,
         ctx.current_line_idx,
         ctx.panel_width.saturating_sub(1),
+        (ctx.visible_start, ctx.visible_end),
     );
 
     for (file_idx, file) in app.diff_files.iter().enumerate() {
         // Single-file view: hide everything except the cursor's file. See
         // src/ui/diff_unified.rs for the matching guard.
         if app.is_single_file_view && file_idx != app.diff_state.current_file_idx {
+            continue;
+        }
+        // See the matching filter guard in src/ui/diff_unified.rs.
+        if !app.file_passes_filter(file) {
             continue;
         }
         let path = file.display_path();
@@ -438,10 +654,9 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
             line_idx += 1;
         }
 
-        // If file is reviewed (and we're in multi-file view), skip the
-        // body. Single-file view keeps the focused file visible under a
-        // dimmed banner.
-        if is_reviewed && !app.is_single_file_view {
+        // Reviewed files normally collapse in continuous view. A summary jump
+        // may reveal one target body without changing its reviewed marker.
+        if app.should_collapse_file(file_idx) {
             continue;
         }
         if is_reviewed && app.is_single_file_view {
@@ -449,7 +664,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
             lines.push(Line::from(vec![
                 Span::styled(indicator, styles::current_line_indicator_style(&app.theme)),
                 Span::styled(
-                    "  Marked reviewed -- r to re-open",
+                    crate::ui::diff_view::REVIEWED_BANNER_TEXT,
                     Style::default()
                         .fg(app.theme.fg_secondary)
                         .add_modifier(Modifier::DIM),
@@ -486,6 +701,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
                         app.comment_vim_mode_label()
                             .as_ref()
                             .map(|(t, w)| (t.as_str(), *w)),
+                        app.supports_keyboard_enhancement,
                     );
                     comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
                     comment_cursor_column = 1 + cursor_info.column;
@@ -508,6 +724,11 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
                         line_idx += 1;
                     }
                 } else {
+                    let rows = App::comment_display_lines(comment, ctx.panel_width);
+                    if !ctx.box_visible(line_idx, rows) {
+                        skip_comment_box(&mut lines, &mut line_idx, rows);
+                        continue;
+                    }
                     let comment_lines = comment_panel::format_comment_lines(
                         &app.theme,
                         comment_type_presentation(app, &comment.comment_type),
@@ -551,7 +772,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
                 &app.theme,
                 thread,
                 muted,
-                app.forge_display_name(),
+                app.forge_kind(),
             ) {
                 let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
                 comment_line.spans.insert(
@@ -576,6 +797,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
                 app.comment_vim_mode_label()
                     .as_ref()
                     .map(|(t, w)| (t.as_str(), *w)),
+                app.supports_keyboard_enhancement,
             );
             comment_cursor_logical_line = Some(line_idx + cursor_info.line_offset);
             comment_cursor_column = 1 + cursor_info.column;
@@ -735,7 +957,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
                     Span::styled(hunk_header_text, hunk_header_style),
                 ]));
                 line_idx += 1;
-                if is_hunk_reviewed {
+                if app.should_collapse_hunk(file_idx, hunk_idx) {
                     continue;
                 }
 
@@ -855,12 +1077,15 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
     app.comment_input_annotation_offset = annotation_offset;
 
     // Auto-scroll so the comment input box stays visible while the user types.
+    let wrap = app.diff_state.wrap_lines;
+    let viewport_width = inner.width as usize;
     scroll_comment_input_into_view(
         &mut app.diff_state.scroll_offset,
         comment_input_box_range,
         comment_cursor_logical_line,
         inner.height as usize,
         lines.len(),
+        |idx| sbs_row_height(&lines, &sbs_meta, idx, wrap, content_width, viewport_width),
     );
 
     let visible_lines_unscrolled: Vec<Line> = lines
@@ -880,14 +1105,17 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
         })
         .collect();
 
-    let max_content_width = line_widths.iter().copied().max().unwrap_or(0);
+    let max_content_width = sbs_meta
+        .values()
+        .flat_map(|meta| [&meta.left_content, &meta.right_content])
+        .map(|spans| spans.iter().map(|span| span.content.width()).sum::<usize>())
+        .max()
+        .unwrap_or(0);
 
     app.sync_viewport_width(inner.width as usize);
     app.diff_state.max_content_width = max_content_width;
 
     let scroll_offset = app.diff_state.scroll_offset;
-    let wrap = app.diff_state.wrap_lines;
-    let viewport_width = inner.width as usize;
     let visible_lines_unscrolled_for_overlay = visible_lines_unscrolled.clone();
     // Single pass: wrap each logical line once, producing both the visual
     // rows to render and the per-line height used by every row-mapping
@@ -901,17 +1129,8 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
             let logical_idx = scroll_offset + i;
             match sbs_meta.get(&logical_idx) {
                 Some(m) => {
-                    let left_rows = if m.left_content.is_empty() {
-                        vec![Vec::new()]
-                    } else {
-                        wrap_spans(&m.left_content, content_width)
-                    };
-                    let right_rows = if m.right_content.is_empty() {
-                        vec![Vec::new()]
-                    } else {
-                        wrap_spans(&m.right_content, content_width)
-                    };
-                    let n = left_rows.len().max(right_rows.len()).max(1);
+                    let (left_rows, right_rows) = sbs_wrapped_sides(m, content_width);
+                    let n = left_rows.len().max(right_rows.len());
                     heights.push(n);
                     let empty_row: Vec<Span> = Vec::new();
                     for k in 0..n {
@@ -953,7 +1172,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
         scroll_offset,
     );
 
-    let max_scroll_x = max_content_width.saturating_sub(viewport_width);
+    let max_scroll_x = max_content_width.saturating_sub(content_width);
     if app.diff_state.scroll_x > max_scroll_x {
         app.diff_state.scroll_x = max_scroll_x;
     }
@@ -966,7 +1185,17 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
         Some(out) => out,
         None => visible_lines_unscrolled
             .into_iter()
-            .map(|line| apply_horizontal_scroll(line, scroll_x))
+            .enumerate()
+            .map(|(i, line)| {
+                if scroll_x == 0 || comment_box_row(&line).is_some() {
+                    line
+                } else {
+                    sbs_meta
+                        .get(&(scroll_offset + i))
+                        .map(|meta| pan_sbs_row(meta, scroll_x, content_width))
+                        .unwrap_or_else(|| apply_horizontal_scroll(line, scroll_x))
+                }
+            })
             .collect(),
     };
 
@@ -981,6 +1210,7 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
         scroll_offset: app.diff_state.scroll_offset,
         theme: &app.theme,
         comment_bars: &comment_bars,
+        fixed_gutters: true,
     };
 
     // Section-marker row tint (hunk headers + expand/hidden stubs).
@@ -996,6 +1226,9 @@ pub(super) fn render_side_by_side_diff(frame: &mut Frame, app: &mut App, area: R
         &row_heights,
         app,
     );
+
+    // Move the `▶` caret onto the active side for the cursor row.
+    paint_sbs_active_side_caret(frame, inner, app, lw, content_width, &row_heights);
 
     // Painted last so the cell overlay wins over cursor-line bg on overlap.
     if let Some(sel) = app.visual_selection {
@@ -1061,22 +1294,24 @@ fn render_sbs_expanded_context_line(
         .map(|n| format!("{n:>lw$} "))
         .unwrap_or_else(|| " ".repeat(lw + 1));
     let ec_style = styles::expanded_context_style(theme);
-    let line_spans = vec![
+    let content_cell = plain_cell_spans(
+        &expanded_line.content,
+        ec_style,
+        content_width,
+        ctx.search_for(*line_idx),
+    );
+    let mut line_spans = vec![
         Span::styled(indicator, styles::current_line_indicator_style(theme)),
         Span::styled(old_line_num.clone(), ec_style),
         Span::styled(" ", ec_style),
-        Span::styled(
-            truncate_or_pad(&expanded_line.content, content_width),
-            ec_style,
-        ),
+    ];
+    line_spans.extend(content_cell.clone());
+    line_spans.extend([
         Span::styled(" │ ", styles::dim_style(theme)),
         Span::styled(new_line_num.clone(), ec_style),
         Span::styled(" ", ec_style),
-        Span::styled(
-            truncate_or_pad(&expanded_line.content, content_width),
-            ec_style,
-        ),
-    ];
+    ]);
+    line_spans.extend(content_cell);
     lines.push(Line::from(line_spans));
 
     let dim = styles::dim_style(theme);
@@ -1090,7 +1325,10 @@ fn render_sbs_expanded_context_line(
         Span::styled(new_line_num, ec_style),
         Span::styled(" ", ec_style),
     ];
-    let content = vec![Span::styled(expanded_line.content.clone(), ec_style)];
+    let mut content = vec![Span::styled(expanded_line.content.clone(), ec_style)];
+    if let Some((needle, hl)) = ctx.search_for(*line_idx) {
+        content = apply_search_highlight_spans(content, needle, hl);
+    }
     ctx.sbs_meta.borrow_mut().insert(
         *line_idx,
         SbsRowMeta {
@@ -1228,18 +1466,25 @@ fn render_context_line_side_by_side(
             Span::styled(" ".to_string(), styles::diff_context_style(ctx.theme)),
         ];
 
-        // Left side content - use syntax highlighting if available
-        if let Some(ref highlighted) = diff_line.highlighted_spans {
-            let content_spans = truncate_or_pad_spans(
+        let search = ctx.search_for(line_idx);
+        let content_cell = if let Some(ref highlighted) = diff_line.highlighted_spans {
+            searched_cell_spans(
                 highlighted,
                 ctx.content_width,
                 styles::diff_context_style(ctx.theme),
-            );
-            spans.extend(content_spans);
+                search,
+            )
         } else {
-            let content = truncate_or_pad(&diff_line.content, ctx.content_width);
-            spans.push(Span::styled(content, styles::diff_context_style(ctx.theme)));
-        }
+            plain_cell_spans(
+                &diff_line.content,
+                styles::diff_context_style(ctx.theme),
+                ctx.content_width,
+                search,
+            )
+        };
+
+        // Left side content - use syntax highlighting if available
+        spans.extend(content_cell.clone());
 
         // Separator
         spans.push(Span::styled(" │ ", styles::dim_style(ctx.theme)));
@@ -1253,21 +1498,12 @@ fn render_context_line_side_by_side(
         ));
 
         // Right side content - use same highlighting
-        if let Some(ref highlighted) = diff_line.highlighted_spans {
-            let content_spans = truncate_or_pad_spans(
-                highlighted,
-                ctx.content_width,
-                styles::diff_context_style(ctx.theme),
-            );
-            spans.extend(content_spans);
-        } else {
-            let content = truncate_or_pad(&diff_line.content, ctx.content_width);
-            spans.push(Span::styled(content, styles::diff_context_style(ctx.theme)));
-        }
+        spans.extend(content_cell);
 
         lines.push(Line::from(spans));
 
-        let content = content_spans_for_diff_line(ctx.theme, diff_line, LineOrigin::Context);
+        let content =
+            content_spans_for_diff_line(ctx.theme, diff_line, LineOrigin::Context, search);
         let ctx_style = styles::diff_context_style(ctx.theme);
         let (lp, rp) = sbs_row_prefixes(
             ctx.theme,
@@ -1379,6 +1615,7 @@ fn render_deletion_addition_pair_side_by_side(
                     ctx.content_width,
                     ctx.lineno_width,
                     ctx.display_lineno(del_line.old_lineno, line_idx),
+                    ctx.search_for(line_idx),
                 );
             } else {
                 add_empty_column_spans(&mut spans, ctx.content_width, ctx.lineno_width);
@@ -1395,6 +1632,7 @@ fn render_deletion_addition_pair_side_by_side(
                     ctx.content_width,
                     ctx.lineno_width,
                     ctx.display_lineno(add_line.new_lineno, line_idx),
+                    ctx.search_for(line_idx),
                 );
             } else {
                 add_empty_column_spans(&mut spans, ctx.content_width, ctx.lineno_width);
@@ -1406,7 +1644,12 @@ fn render_deletion_addition_pair_side_by_side(
             let (left_content, left_pad, left_marker, left_lineno, left_marker_style) =
                 match del_opt {
                     Some(dl) => (
-                        content_spans_for_diff_line(ctx.theme, dl, LineOrigin::Deletion),
+                        content_spans_for_diff_line(
+                            ctx.theme,
+                            dl,
+                            LineOrigin::Deletion,
+                            ctx.search_for(line_idx),
+                        ),
                         column_pad_style(ctx.theme, dl, LineOrigin::Deletion),
                         "▌",
                         ctx.display_lineno(dl.old_lineno, line_idx),
@@ -1417,7 +1660,12 @@ fn render_deletion_addition_pair_side_by_side(
             let (right_content, right_pad, right_marker, right_lineno, right_marker_style) =
                 match add_opt {
                     Some(al) => (
-                        content_spans_for_diff_line(ctx.theme, al, LineOrigin::Addition),
+                        content_spans_for_diff_line(
+                            ctx.theme,
+                            al,
+                            LineOrigin::Addition,
+                            ctx.search_for(line_idx),
+                        ),
                         column_pad_style(ctx.theme, al, LineOrigin::Addition),
                         "▌",
                         ctx.display_lineno(al.new_lineno, line_idx),
@@ -1544,12 +1792,18 @@ fn render_standalone_addition_side_by_side(
             ctx.content_width,
             ctx.lineno_width,
             ctx.display_lineno(diff_line.new_lineno, line_idx),
+            ctx.search_for(line_idx),
         );
 
         lines.push(Line::from(spans));
 
         let w = ctx.lineno_width;
-        let right_content = content_spans_for_diff_line(ctx.theme, diff_line, LineOrigin::Addition);
+        let right_content = content_spans_for_diff_line(
+            ctx.theme,
+            diff_line,
+            LineOrigin::Addition,
+            ctx.search_for(line_idx),
+        );
         let right_pad = column_pad_style(ctx.theme, diff_line, LineOrigin::Addition);
         let (lp, rp) = sbs_row_prefixes(
             ctx.theme,
@@ -1679,6 +1933,7 @@ fn add_deletion_spans(
     content_width: usize,
     lw: usize,
     display_lineno: Option<u32>,
+    search: Option<(&crate::ui::text_utils::SearchPattern, Style)>,
 ) {
     let line_num = display_lineno
         .map(|n| format!("{n:>lw$}"))
@@ -1693,12 +1948,24 @@ fn add_deletion_spans(
     // Use syntax highlighting if available
     if let Some(ref highlighted) = diff_line.highlighted_spans {
         let syntax_pad_style = Style::default().fg(theme.diff_del).bg(theme.syntax_del_bg);
-        let content_spans = truncate_or_pad_spans(highlighted, content_width, syntax_pad_style);
+        let patched: Vec<(Style, String)> = highlighted
+            .iter()
+            .map(|(s, t)| {
+                (
+                    styles::patch_highlighted_span_bg(*s, theme, LineOrigin::Deletion),
+                    t.clone(),
+                )
+            })
+            .collect();
+        let content_spans = searched_cell_spans(&patched, content_width, syntax_pad_style, search);
         spans.extend(content_spans);
     } else {
-        // Fall back to plain text
-        let content = truncate_or_pad(&diff_line.content, content_width);
-        spans.push(Span::styled(content, styles::diff_del_style(theme)));
+        spans.extend(plain_cell_spans(
+            &diff_line.content,
+            styles::diff_del_style(theme),
+            content_width,
+            search,
+        ));
     }
 }
 
@@ -1710,6 +1977,7 @@ fn add_addition_spans(
     content_width: usize,
     lw: usize,
     display_lineno: Option<u32>,
+    search: Option<(&crate::ui::text_utils::SearchPattern, Style)>,
 ) {
     let line_num = display_lineno
         .map(|n| format!("{n:>lw$}"))
@@ -1724,12 +1992,24 @@ fn add_addition_spans(
     // Use syntax highlighting if available
     if let Some(ref highlighted) = diff_line.highlighted_spans {
         let syntax_pad_style = Style::default().fg(theme.diff_add).bg(theme.syntax_add_bg);
-        let content_spans = truncate_or_pad_spans(highlighted, content_width, syntax_pad_style);
+        let patched: Vec<(Style, String)> = highlighted
+            .iter()
+            .map(|(s, t)| {
+                (
+                    styles::patch_highlighted_span_bg(*s, theme, LineOrigin::Addition),
+                    t.clone(),
+                )
+            })
+            .collect();
+        let content_spans = searched_cell_spans(&patched, content_width, syntax_pad_style, search);
         spans.extend(content_spans);
     } else {
-        // Fall back to plain text
-        let content = truncate_or_pad(&diff_line.content, content_width);
-        spans.push(Span::styled(content, styles::diff_add_style(theme)));
+        spans.extend(plain_cell_spans(
+            &diff_line.content,
+            styles::diff_add_style(theme),
+            content_width,
+            search,
+        ));
     }
 }
 
@@ -1785,7 +2065,7 @@ fn add_remote_threads_to_line(
             ctx.theme,
             thread,
             muted,
-            ctx.app.forge_display_name(),
+            ctx.app.forge_kind(),
         );
         let box_top_row = line_idx;
         for mut comment_line in thread_lines {
@@ -1849,6 +2129,7 @@ fn add_comments_to_line(
                             .comment_vim_mode_label()
                             .as_ref()
                             .map(|(t, w)| (t.as_str(), *w)),
+                        ctx.app.supports_keyboard_enhancement,
                     );
                     let box_top_row = line_idx;
                     let box_end = line_idx + input_lines.len().saturating_sub(1);
@@ -1882,26 +2163,33 @@ fn add_comments_to_line(
                     let line_range = comment
                         .line_range
                         .or_else(|| Some(LineRange::single(line_num)));
-                    let comment_lines = comment_panel::format_comment_lines(
-                        ctx.theme,
-                        comment_type_presentation(ctx.app, &comment.comment_type),
-                        &comment.content,
-                        line_range,
-                        ctx.panel_width.saturating_sub(1),
-                        (comment.author != ctx.app.username).then_some(comment.author.as_str()),
-                    );
                     let box_top_row = line_idx;
-                    for mut comment_line in comment_lines {
-                        let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
-                        comment_line.spans.insert(
-                            0,
-                            Span::styled(
-                                indicator,
-                                styles::current_line_indicator_style(ctx.theme),
-                            ),
+                    let rows = App::comment_display_lines(comment, ctx.panel_width);
+                    // The bar is recorded either way: it is painted above the
+                    // box, so it can be on screen while the box itself is not.
+                    if !ctx.box_visible(line_idx, rows) {
+                        skip_comment_box(lines, &mut line_idx, rows);
+                    } else {
+                        let comment_lines = comment_panel::format_comment_lines(
+                            ctx.theme,
+                            comment_type_presentation(ctx.app, &comment.comment_type),
+                            &comment.content,
+                            line_range,
+                            ctx.panel_width.saturating_sub(1),
+                            (comment.author != ctx.app.username).then_some(comment.author.as_str()),
                         );
-                        lines.push(comment_line);
-                        line_idx += 1;
+                        for mut comment_line in comment_lines {
+                            let indicator = cursor_indicator(line_idx, ctx.current_line_idx);
+                            comment_line.spans.insert(
+                                0,
+                                Span::styled(
+                                    indicator,
+                                    styles::current_line_indicator_style(ctx.theme),
+                                ),
+                            );
+                            lines.push(comment_line);
+                            line_idx += 1;
+                        }
                     }
                     crate::ui::diff_view::push_comment_bar(
                         &mut ctx.comment_bars.borrow_mut(),
@@ -1930,6 +2218,7 @@ fn add_comments_to_line(
                 .comment_vim_mode_label()
                 .as_ref()
                 .map(|(t, w)| (t.as_str(), *w)),
+            ctx.app.supports_keyboard_enhancement,
         );
         let box_top_row = line_idx;
         let box_end = line_idx + input_lines.len().saturating_sub(1);
@@ -1973,7 +2262,8 @@ mod remote_comments_side_by_side_snapshot_tests {
     };
     use crate::forge::traits::{ForgeRepository, PrSessionKey};
     use crate::model::{
-        DiffFile, DiffHunk, DiffLine, FileStatus, LineOrigin, ReviewSession, SessionDiffSource,
+        DiffFile, DiffHunk, DiffLine, FileStatus, LineOrigin, LineSide, ReviewSession,
+        SessionDiffSource,
     };
     use crate::syntax::SyntaxHighlighter;
     use crate::theme::Theme;
@@ -2089,6 +2379,10 @@ mod remote_comments_side_by_side_snapshot_tests {
     }
 
     fn make_pr_app() -> App {
+        make_pr_app_with(vec![sample_diff_file()])
+    }
+
+    fn make_pr_app_with(diff_files: Vec<DiffFile>) -> App {
         let pr = PullRequestDiffSource {
             key: PrSessionKey::new(repo(), 125, "headsha".to_string()),
             base_sha: "basesha".to_string(),
@@ -2121,7 +2415,7 @@ mod remote_comments_side_by_side_snapshot_tests {
             Theme::dark(),
             None,
             false,
-            vec![sample_diff_file()],
+            diff_files,
             session,
             DiffSource::PullRequest(Box::new(pr)),
             InputMode::Normal,
@@ -2154,13 +2448,83 @@ mod remote_comments_side_by_side_snapshot_tests {
             .join("\n")
     }
 
+    /// Side-by-side mirror of the unified culling test: the skip/emit wiring
+    /// here goes through `ctx.box_visible` and a by-value `line_idx`, so it
+    /// needs its own coverage.
+    #[test]
+    fn should_cull_comment_boxes_outside_the_viewport() {
+        use crate::app::AnnotatedLine;
+        use crate::model::{Comment, CommentType};
+
+        const NEEDLE: &str = "far-below-the-fold";
+
+        let lines: Vec<DiffLine> = (1..=120)
+            .map(|n| DiffLine {
+                origin: LineOrigin::Addition,
+                content: format!("line {n}"),
+                old_lineno: None,
+                new_lineno: Some(n),
+                highlighted_spans: None,
+            })
+            .collect();
+        let hunks = vec![DiffHunk {
+            header: "@@ -0,0 +1,120 @@".to_string(),
+            lines,
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 120,
+        }];
+        let content_hash = DiffFile::compute_content_hash(&hunks);
+        let path = PathBuf::from("src/lib.rs");
+        let file = DiffFile {
+            old_path: Some(path.clone()),
+            new_path: Some(path.clone()),
+            status: FileStatus::Modified,
+            hunks,
+            is_binary: false,
+            is_too_large: false,
+            is_commit_message: false,
+            content_hash,
+        };
+
+        let mut app = make_pr_app_with(vec![file]);
+        app.session
+            .get_file_mut(&path)
+            .expect("file registered in session")
+            .add_line_comment(
+                100,
+                Comment::new(NEEDLE.to_string(), CommentType::from_id("note"), None),
+            );
+        app.rebuild_annotations();
+
+        let body = body_text(&draw(&mut app));
+        assert!(
+            !body.contains(NEEDLE),
+            "off-screen comment should not be visible:\n{body}"
+        );
+
+        let comment_row = app
+            .line_annotations
+            .iter()
+            .position(|a| matches!(a, AnnotatedLine::LineComment { .. }))
+            .expect("comment annotated in the document");
+        app.diff_state.scroll_offset = comment_row;
+        app.diff_state.cursor_line = comment_row;
+
+        let body = body_text(&draw(&mut app));
+        assert!(
+            body.contains(NEEDLE),
+            "comment scrolled into view should render at its annotated row:\n{body}"
+        );
+    }
+
     #[test]
     fn should_render_remote_comment_inline_in_side_by_side_diff() {
         // given
         let mut app = make_pr_app();
         app.forge_review_threads = vec![thread()];
         app.rebuild_annotations();
-        // when
         let buffer = draw(&mut app);
         // then
         let body = body_text(&buffer);
@@ -2176,7 +2540,6 @@ mod remote_comments_side_by_side_snapshot_tests {
         let mut app = make_pr_app();
         app.forge_review_threads = vec![thread()];
         app.set_remote_comments_visibility(PrCommentsVisibility::Hide);
-        // when
         let buffer = draw(&mut app);
         // then
         let body = body_text(&buffer);
@@ -2311,6 +2674,60 @@ mod remote_comments_side_by_side_snapshot_tests {
             rows_with_l, 1,
             "wrap-off should produce exactly one row of L, got {rows_with_l}"
         );
+    }
+
+    #[test]
+    fn should_pan_both_columns_when_wrap_is_disabled() {
+        let mut app = make_pr_app();
+        app.diff_files = vec![diff_file_with_pair(
+            &format!("0000LEFT{}", "L".repeat(100)),
+            &format!("0000RIGHT{}", "R".repeat(100)),
+        )];
+        app.set_diff_wrap(false);
+        app.rebuild_annotations();
+
+        let _ = draw_sbs(&mut app, 80, 20);
+        app.scroll_right(4);
+        let buf = draw_sbs(&mut app, 80, 20);
+
+        assert_eq!(app.diff_state.scroll_x, 4);
+        let body = body_text(&buf);
+        assert!(body.contains("LEFT"), "left column did not pan:\n{body}");
+        assert!(body.contains("RIGHT"), "right column did not pan:\n{body}");
+        assert!(
+            !body.contains("0000LEFT"),
+            "left column stayed put:\n{body}"
+        );
+        assert!(
+            !body.contains("0000RIGHT"),
+            "right column stayed put:\n{body}"
+        );
+
+        let row = (0..buf.area.height)
+            .find(|&y| {
+                (0..buf.area.width)
+                    .map(|x| char_at(&buf, x, y))
+                    .collect::<String>()
+                    .contains("LEFT")
+            })
+            .expect("panned diff row");
+        let lw = app.lineno_width();
+        let content_width = (78 - crate::app::sbs_overhead(lw) as usize) / 2;
+        let left_start = 1 + crate::app::sbs_left_gutter(lw);
+        let divider = left_start + content_width as u16 + 1;
+        let right_start = left_start + content_width as u16 + lw as u16 + 5;
+        assert_eq!(char_at(&buf, left_start, row), "L");
+        assert_eq!(char_at(&buf, divider, row), "│");
+        assert_eq!(char_at(&buf, right_start, row), "R");
+
+        app.enter_comment_mode(false, Some((1, LineSide::New)));
+        app.comment_buffer = "COMMENT".to_string();
+        app.comment_cursor = app.comment_buffer.len();
+        let buf = draw_sbs(&mut app, 80, 20);
+        let (cursor_x, cursor_y) = app.comment_cursor_screen_pos.expect("comment cursor");
+        assert_eq!(app.diff_state.scroll_x, 4);
+        assert!(body_text(&buf).contains("COMMENT"));
+        assert_eq!(char_at(&buf, cursor_x - 1, cursor_y), "T");
     }
 
     #[test]
@@ -2451,6 +2868,54 @@ mod remote_comments_side_by_side_snapshot_tests {
         assert_eq!(
             checked, 1,
             "expected the commit message body to render exactly once, got {checked}"
+        );
+    }
+
+    fn wrapping_diff_file(count: u32) -> DiffFile {
+        let lines: Vec<DiffLine> = (1..=count)
+            .map(|i| DiffLine {
+                origin: LineOrigin::Addition,
+                content: format!("line {i} {}", "x".repeat(200)),
+                old_lineno: None,
+                new_lineno: Some(i),
+                highlighted_spans: None,
+            })
+            .collect();
+        let hunks = vec![DiffHunk {
+            header: format!("@@ -0,0 +1,{count} @@"),
+            lines,
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: count,
+        }];
+        let content_hash = DiffFile::compute_content_hash(&hunks);
+        DiffFile {
+            old_path: None,
+            new_path: Some(PathBuf::from("src/lib.rs")),
+            status: FileStatus::Added,
+            hunks,
+            is_binary: false,
+            is_too_large: false,
+            is_commit_message: false,
+            content_hash,
+        }
+    }
+
+    #[test]
+    fn should_show_comment_input_at_eof_when_lines_wrap() {
+        let mut app = make_pr_app();
+        app.diff_files = vec![wrapping_diff_file(40)];
+        app.set_diff_wrap(true);
+        app.rebuild_annotations();
+        let _ = draw_sbs(&mut app, 160, 20);
+        app.jump_to_bottom();
+        app.enter_comment_mode(false, Some((40, LineSide::New)));
+        let buf = draw_sbs(&mut app, 160, 20);
+        let body = body_text(&buf);
+        assert!(
+            body.contains("Type your comment..."),
+            "expected the comment input box to be visible in:\n{body}"
         );
     }
 }

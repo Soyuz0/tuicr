@@ -2,14 +2,14 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 
 use crate::app::{
-    self, App, CommandCompletionState, ExpandDirection, FileTreeItem, FocusedPanel, GapCursorHit,
-    InputMode, TargetTab, VisualSelection,
+    self, App, CommandCompletionState, ExpandDirection, FileTreeItem, FileTreePrompt, FocusedPanel,
+    GapCursorHit, InputMode, TargetTab, VisualSelection,
 };
 use crate::forge::remote_comments::PrCommentsVisibility;
 use crate::forge::submit::SubmitEvent;
 use crate::input::Action;
 use crate::model::{ClearScope, LineSide};
-use crate::output::{export_to_clipboard, generate_export_content};
+use crate::output::{copy_text_to_clipboard, export_to_clipboard, generate_export_content};
 use crate::text_edit::{
     delete_char_before, delete_word_before, next_char_boundary, prev_char_boundary,
 };
@@ -20,6 +20,10 @@ const WHEEL_LINES: usize = 3;
 /// interchangeable.
 const WHEEL_COLS: usize = 4;
 
+/// Shown when a bare `q` is pressed in a mode that used to quit on it.
+/// Transitional — drop this a few releases after the `q` removal has landed.
+const QUIT_HINT_MESSAGE: &str = "q no longer quits — use :q to quit";
+
 const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec::new(&["q", "quit"], CommandKind::Quit),
     CommandSpec::new(&["q!", "quit!"], CommandKind::ForceQuit),
@@ -28,12 +32,14 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec::new(&["e", "reload"], CommandKind::Reload),
     CommandSpec::new(&["edit"], CommandKind::Edit),
     CommandSpec::new(&["clip", "export"], CommandKind::Export),
+    CommandSpec::new(&["copy-url"], CommandKind::CopyUrl),
     CommandSpec::new(
         &["clear"],
         CommandKind::Clear(ClearScope::CommentsAndReviewed),
     ),
     CommandSpec::new(&["clearc"], CommandKind::Clear(ClearScope::CommentsOnly)),
     CommandSpec::new(&["help", "h"], CommandKind::Help),
+    CommandSpec::new(&["messages"], CommandKind::MessageDetails),
     CommandSpec::new(&["version"], CommandKind::Version),
     CommandSpec::new(&["update"], CommandKind::Update),
     CommandSpec::new(&["set wrap"], CommandKind::SetWrap),
@@ -57,6 +63,12 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec::new(&["set commits"], CommandKind::SetCommitsVisible(true)),
     CommandSpec::new(&["set nocommits"], CommandKind::SetCommitsVisible(false)),
     CommandSpec::new(&["set commits!"], CommandKind::ToggleCommits),
+    CommandSpec::new(&["set reviewed"], CommandKind::SetShowReviewed(true)),
+    CommandSpec::new(&["set noreviewed"], CommandKind::SetShowReviewed(false)),
+    CommandSpec::new(
+        &["reviewed", "set reviewed!"],
+        CommandKind::ToggleShowReviewed,
+    ),
     CommandSpec::new(&["diff"], CommandKind::Diff),
     CommandSpec::new(&["focus", "f"], CommandKind::Focus),
     CommandSpec::new(&["stage"], CommandKind::Stage),
@@ -65,6 +77,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         CommandKind::Targets(TargetTab::Local),
     ),
     CommandSpec::new(&["prs"], CommandKind::Targets(TargetTab::PullRequests)),
+    CommandSpec::new(
+        &["sessions", "reviews"],
+        CommandKind::Targets(TargetTab::Sessions),
+    ),
     CommandSpec::new(&["submit"], CommandKind::SubmitPicker),
     CommandSpec::new(
         &["submit comment"],
@@ -79,6 +95,8 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         CommandKind::Submit(SubmitEvent::RequestChanges),
     ),
     CommandSpec::new(&["submit draft"], CommandKind::Submit(SubmitEvent::Draft)),
+    CommandSpec::new(&["summary"], CommandKind::Summary),
+    CommandSpec::new(&["theme"], CommandKind::ThemePicker),
     CommandSpec::new(
         &["comments unresolved"],
         CommandKind::Comments(PrCommentsVisibility::Unresolved),
@@ -121,8 +139,11 @@ enum CommandKind {
     Reload,
     Edit,
     Export,
+    CopyUrl,
     Clear(ClearScope),
     Help,
+    MessageDetails,
+    Summary,
     Version,
     Update,
     SetWrap,
@@ -133,6 +154,8 @@ enum CommandKind {
     SetVim(bool),
     SetCommitsVisible(bool),
     ToggleCommits,
+    SetShowReviewed(bool),
+    ToggleShowReviewed,
     Diff,
     Focus,
     Stage,
@@ -142,6 +165,7 @@ enum CommandKind {
     Comments(PrCommentsVisibility),
     /// Resolve (`true`) or reopen (`false`) the thread under the cursor.
     ResolveThread(bool),
+    ThemePicker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +194,11 @@ pub fn handle_mouse_event(app: &mut App, event: MouseEvent) {
             let over_diff = app.diff_area.is_some_and(|r| r.contains(pos));
             let over_commit_list = app.commit_list_inner_area.is_some_and(|r| r.contains(pos));
             match app.input_mode {
-                InputMode::Help => handle_help_action(app, action),
+                InputMode::Help | InputMode::MessageDetails => handle_help_action(app, action),
+                InputMode::Summary => handle_summary_action(app, action),
+                InputMode::ThemePicker => {
+                    app.move_theme_picker_selection(if scroll_up { -1 } else { 1 });
+                }
                 InputMode::CommitSelect | InputMode::Normal if over_commit_list => {
                     wheel_commit_list(app, scroll_up);
                 }
@@ -361,6 +389,20 @@ fn handle_left_click(app: &mut App, pos: Position) {
     }
 }
 
+fn handle_copy_pr_url(app: &mut App) {
+    let app::DiffSource::PullRequest(pr) = &app.diff_source else {
+        app.set_warning(":copy-url only applies in PR mode");
+        return;
+    };
+    let url = pr.url.clone();
+
+    match copy_text_to_clipboard(&url) {
+        Ok(true) => app.set_message("PR URL copied to clipboard (via terminal)"),
+        Ok(false) => app.set_message("PR URL copied to clipboard"),
+        Err(e) => app.set_warning(format!("Failed to copy PR URL: {e}")),
+    }
+}
+
 /// Export review: either to clipboard or set pending stdout output based on app.output_to_stdout.
 /// When output_to_stdout is true, stores the content and sets should_quit.
 fn handle_export(app: &mut App) {
@@ -392,6 +434,29 @@ fn handle_export(app: &mut App) {
             Ok(msg) => app.set_message(msg),
             Err(e) => app.set_warning(format!("{e}")),
         }
+    }
+}
+
+/// Copy just the comment under the cursor (`Y`). Unlike `y`, the rest of the
+/// review stays out of the clipboard, so a single comment can go straight into
+/// a chat message or an agent prompt.
+fn handle_copy_comment_at_cursor(app: &mut App) {
+    let Some(content) = app
+        .comment_content_at_cursor()
+        .or_else(|| app.remote_comment_content_at_cursor())
+    else {
+        if app.cursor_on_remote_thread() {
+            let forge = app.forge_display_name();
+            app.set_message(format!("No copyable comment in this {forge} thread"));
+        } else {
+            app.set_message("No comment at cursor");
+        }
+        return;
+    };
+    match copy_text_to_clipboard(&content) {
+        Ok(true) => app.set_message("Comment copied to clipboard (via terminal)"),
+        Ok(false) => app.set_message("Comment copied to clipboard"),
+        Err(e) => app.set_warning(format!("{e}")),
     }
 }
 
@@ -504,6 +569,8 @@ pub fn handle_help_action(app: &mut App, action: Action) {
     match action {
         Action::CursorDown(n) => app.help_scroll_down(n),
         Action::CursorUp(n) => app.help_scroll_up(n),
+        Action::ScrollLeft(n) => app.help_scroll_left(n),
+        Action::ScrollRight(n) => app.help_scroll_right(n),
         Action::HalfPageDown => app.help_scroll_down(app.help_state.viewport_height / 2),
         Action::HalfPageUp => app.help_scroll_up(app.help_state.viewport_height / 2),
         Action::PageDown => app.help_scroll_down(app.help_state.viewport_height),
@@ -520,6 +587,42 @@ pub fn handle_help_action(app: &mut App, action: Action) {
             app.search_prev_in_help();
         }
         Action::ToggleHelp => app.toggle_help(),
+        Action::Quit => app.should_quit = true,
+        _ => {}
+    }
+}
+
+/// Handle selection, scrolling, activation, and dismissal in the pending-comments summary view.
+pub fn handle_summary_action(app: &mut App, action: Action) {
+    match action {
+        Action::CursorDown(n) => app.summary_select_down(n),
+        Action::CursorUp(n) => app.summary_select_up(n),
+        Action::HalfPageDown => {
+            app.summary_scroll_down(app.summary_state.viewport_height / 2);
+        }
+        Action::HalfPageUp => {
+            app.summary_scroll_up(app.summary_state.viewport_height / 2);
+        }
+        Action::PageDown => app.summary_scroll_down(app.summary_state.viewport_height),
+        Action::PageUp => app.summary_scroll_up(app.summary_state.viewport_height),
+        Action::GoToTop => app.summary_select_first(),
+        Action::GoToBottom => app.summary_select_last(),
+        Action::MouseScrollDown(n) => app.summary_scroll_down(n),
+        Action::MouseScrollUp(n) => app.summary_scroll_up(n),
+        Action::SubmitInput => {
+            let selected_target = app
+                .summary_state
+                .targets
+                .get(app.summary_state.selected_comment)
+                .cloned()
+                .flatten();
+            if let Some(target) = selected_target {
+                app.jump_to_summary_comment(target);
+            } else if !app.summary_state.targets.is_empty() {
+                app.set_warning("That comment is hidden by the current diff or filters");
+            }
+        }
+        Action::ExitMode => app.exit_summary_mode(),
         Action::Quit => app.should_quit = true,
         _ => {}
     }
@@ -559,6 +662,14 @@ pub fn handle_command_action(app: &mut App, action: Action) {
                 dispatch_command(app, spec.kind)
             } else if let Some((lineno, side)) = parse_lineno_command(&cmd) {
                 app.go_to_source_line(lineno, side);
+                CommandAfterDispatch::ExitCommandMode
+            } else if let Some(name) = cmd.strip_prefix("theme ") {
+                let name = name.trim();
+                if name.is_empty() {
+                    app.set_message(format!("Unknown command: {cmd}"));
+                } else {
+                    app.apply_theme(name);
+                }
                 CommandAfterDispatch::ExitCommandMode
             } else {
                 app.set_message(format!("Unknown command: {cmd}"));
@@ -785,6 +896,10 @@ fn dispatch_command(app: &mut App, kind: CommandKind) -> CommandAfterDispatch {
             handle_export(app);
             CommandAfterDispatch::ExitCommandMode
         }
+        CommandKind::CopyUrl => {
+            handle_copy_pr_url(app);
+            CommandAfterDispatch::ExitCommandMode
+        }
         CommandKind::Clear(scope) => {
             app.clear_comments(scope);
             CommandAfterDispatch::ExitCommandMode
@@ -794,6 +909,23 @@ fn dispatch_command(app: &mut App, kind: CommandKind) -> CommandAfterDispatch {
             // path resets `input_mode` to Normal, which would clobber Help.
             app.exit_command_mode();
             app.toggle_help();
+            CommandAfterDispatch::KeepMode
+        }
+        CommandKind::MessageDetails => {
+            app.exit_command_mode();
+            app.open_message_details();
+            CommandAfterDispatch::KeepMode
+        }
+        CommandKind::Summary => {
+            // See Help above: leave command mode before opening the view so
+            // the common post-dispatch cleanup cannot clobber Summary.
+            app.exit_command_mode();
+            app.enter_summary_mode();
+            CommandAfterDispatch::KeepMode
+        }
+        CommandKind::ThemePicker => {
+            app.exit_command_mode();
+            app.enter_theme_picker_mode();
             CommandAfterDispatch::KeepMode
         }
         CommandKind::Version => {
@@ -836,6 +968,14 @@ fn dispatch_command(app: &mut App, kind: CommandKind) -> CommandAfterDispatch {
             app.toggle_commit_selector();
             CommandAfterDispatch::ExitCommandMode
         }
+        CommandKind::SetShowReviewed(show) => {
+            app.set_show_reviewed(show);
+            CommandAfterDispatch::ExitCommandMode
+        }
+        CommandKind::ToggleShowReviewed => {
+            app.toggle_show_reviewed();
+            CommandAfterDispatch::ExitCommandMode
+        }
         CommandKind::Diff => {
             app.toggle_diff_view_mode();
             CommandAfterDispatch::ExitCommandMode
@@ -858,6 +998,10 @@ fn dispatch_command(app: &mut App, kind: CommandKind) -> CommandAfterDispatch {
                 }
                 (TargetTab::PullRequests, Err(e)) => {
                     app.set_error(format!("Failed to open PR selector: {e}"));
+                    CommandAfterDispatch::ExitCommandMode
+                }
+                (TargetTab::Sessions, Err(e)) => {
+                    app.set_error(format!("Failed to open session selector: {e}"));
                     CommandAfterDispatch::ExitCommandMode
                 }
             }
@@ -1061,6 +1205,22 @@ pub fn handle_search_action(app: &mut App, action: Action) {
 
 /// Handle actions in Comment mode (text input for comments)
 pub fn handle_comment_action(app: &mut App, action: Action) {
+    if matches!(
+        action,
+        Action::InsertChar(_)
+            | Action::Paste(_)
+            | Action::DeleteChar
+            | Action::DeleteWord
+            | Action::ClearLine
+            | Action::TextCursorLeft
+            | Action::TextCursorRight
+            | Action::TextCursorLineStart
+            | Action::TextCursorLineEnd
+            | Action::TextCursorWordLeft
+            | Action::TextCursorWordRight
+    ) {
+        app.comment_preferred_column = None;
+    }
     match action {
         Action::InsertChar(c) => {
             app.comment_buffer.insert(app.comment_cursor, c);
@@ -1079,6 +1239,15 @@ pub fn handle_comment_action(app: &mut App, action: Action) {
         Action::SubmitInput => app.save_comment(),
         Action::CycleCommentType => app.cycle_comment_type(),
         Action::CycleCommentTypeReverse => app.cycle_comment_type_reverse(),
+        Action::TextCursorUp | Action::TextCursorDown => {
+            app.comment_cursor = crate::ui::comment_panel::move_comment_cursor(
+                &app.comment_buffer,
+                app.comment_cursor,
+                app.diff_state.viewport_width.saturating_sub(1),
+                matches!(action, Action::TextCursorDown),
+                &mut app.comment_preferred_column,
+            );
+        }
         Action::TextCursorLeft => {
             app.comment_cursor = prev_char_boundary(&app.comment_buffer, app.comment_cursor);
         }
@@ -1111,8 +1280,14 @@ pub fn handle_comment_action(app: &mut App, action: Action) {
 
 /// Handle actions in Confirm mode (Y/N prompts)
 pub fn handle_confirm_action(app: &mut App, action: Action) {
+    // Only the quit prompts end the session. A Sessions-tab delete answers
+    // in place and returns to the selector.
+    let quits = app.pending_confirm != Some(app::ConfirmAction::DeleteSession);
     match action {
         Action::ConfirmYes => {
+            if let Some(app::ConfirmAction::DeleteSession) = app.pending_confirm {
+                app.sessions_tab_delete_selected();
+            }
             if let Some(app::ConfirmAction::CopyAndQuit) = app.pending_confirm {
                 let slug = app.session_slug();
                 if app.output_to_stdout {
@@ -1142,11 +1317,11 @@ pub fn handle_confirm_action(app: &mut App, action: Action) {
                 }
             }
             app.exit_confirm_mode();
-            app.should_quit = true;
+            app.should_quit = quits;
         }
         Action::ConfirmNo => {
             app.exit_confirm_mode();
-            app.should_quit = true;
+            app.should_quit = quits;
         }
         Action::Quit => app.should_quit = true,
         _ => {}
@@ -1170,7 +1345,9 @@ pub fn handle_commit_select_action(app: &mut App, action: Action) {
     match action {
         Action::TargetSelectorTabNext => app.cycle_target_tab(true),
         Action::TargetSelectorTabPrev => app.cycle_target_tab(false),
+        Action::EnterCommandMode => app.enter_command_mode(),
         Action::Quit => app.should_quit = true,
+        Action::QuitHint => app.set_message(QUIT_HINT_MESSAGE),
         Action::ExitMode => {
             // Esc during an in-flight PR open aborts the load and stays
             // in the selector. Takes precedence over the
@@ -1189,7 +1366,29 @@ pub fn handle_commit_select_action(app: &mut App, action: Action) {
         other => match app.target_tab {
             TargetTab::Local => handle_local_target_action(app, other),
             TargetTab::PullRequests => handle_pr_target_action(app, other),
+            TargetTab::Sessions => handle_sessions_target_action(app, other),
         },
+    }
+}
+
+fn handle_sessions_target_action(app: &mut App, action: Action) {
+    match action {
+        Action::CommitSelectUp => app.sessions_tab_cursor_up(),
+        Action::CommitSelectDown => app.sessions_tab_cursor_down(),
+        Action::ConfirmCommitSelect => {
+            if let Err(e) = app.sessions_tab_select() {
+                app.set_error(format!("Failed to open session: {e}"));
+            }
+        }
+        Action::SessionsTabToggleShowEmpty => app.sessions_tab_toggle_show_empty(),
+        Action::SessionsTabDelete => {
+            if app.sessions_tab.cursor_session().is_some() {
+                app.enter_confirm_mode(app::ConfirmAction::DeleteSession);
+            }
+        }
+        // Space is a no-op: sessions are picked, not multi-selected.
+        Action::ToggleCommitSelect => {}
+        _ => {}
     }
 }
 
@@ -1329,6 +1528,7 @@ pub fn handle_visual_action(app: &mut App, action: Action) {
         }
         Action::ExitMode => app.exit_visual_mode(),
         Action::Quit => app.should_quit = true,
+        Action::QuitHint => app.set_message(QUIT_HINT_MESSAGE),
         Action::ScrollViewDown(n) | Action::MouseScrollDown(n) => app.scroll_view_down(n),
         Action::ScrollViewUp(n) | Action::MouseScrollUp(n) => app.scroll_view_up(n),
         Action::HalfPageDown => app.page_down(app.diff_state.viewport_height / 2),
@@ -1342,7 +1542,27 @@ pub fn handle_visual_action(app: &mut App, action: Action) {
 
 /// Handle actions when file list panel is focused
 pub fn handle_file_list_action(app: &mut App, action: Action) {
+    // An open `i`/`e`/`/` prompt owns keyboard input until it is submitted or
+    // cancelled. The wheel still scrolls the list underneath it.
+    if app.file_tree_prompt_editing()
+        && !matches!(
+            action,
+            Action::MouseScrollDown(_) | Action::MouseScrollUp(_)
+        )
+    {
+        handle_file_tree_prompt_action(app, action);
+        return;
+    }
     match action {
+        Action::FileTreeFilterInclude => app.begin_file_tree_prompt(FileTreePrompt::Include),
+        Action::FileTreeFilterExclude => app.begin_file_tree_prompt(FileTreePrompt::Exclude),
+        Action::FileTreeClearInclude => app.clear_include_filter(),
+        Action::FileTreeClearExclude => app.clear_exclude_filter(),
+        Action::FileTreeSearch => app.begin_file_tree_prompt(FileTreePrompt::Search),
+        // With a tree search active, n/N step file matches. Otherwise they
+        // fall through to the diff search so the shared binding still works.
+        Action::SearchNext if app.file_tree_search_active() => app.file_tree_search_next(),
+        Action::SearchPrev if app.file_tree_search_active() => app.file_tree_search_prev(),
         Action::CursorDown(n) => app.file_list_down(n),
         Action::CursorUp(n) => app.file_list_up(n),
         Action::ScrollLeft(n) => app.file_list_state.scroll_left(n),
@@ -1368,6 +1588,54 @@ pub fn handle_file_list_action(app: &mut App, action: Action) {
             }
         }
         _ => handle_shared_normal_action(app, action),
+    }
+}
+
+/// Handle input while a file-tree prompt (`i` include, `e` exclude, `/`
+/// search) is open. Mirrors `handle_pr_filter_action` for the target selector.
+fn handle_file_tree_prompt_action(app: &mut App, action: Action) {
+    match action {
+        Action::InsertChar(c) => app.file_tree_prompt_insert_char(c),
+        Action::Paste(text) => app.file_tree_prompt_insert_str(&text),
+        Action::DeleteChar => app.file_tree_prompt_delete_char(),
+        Action::DeleteWord => app.file_tree_prompt_delete_word(),
+        Action::ClearLine => app.file_tree_prompt_clear_line(),
+        Action::SubmitInput => app.commit_file_tree_prompt(),
+        Action::ExitMode => app.cancel_file_tree_prompt(),
+        _ => {}
+    }
+}
+
+/// Handle actions in `InputMode::ThemePicker`. Mirrors
+/// `handle_file_list_action`'s prompt-editing gate: while the `/` filter
+/// draft is open, input goes to `handle_theme_picker_filter_action` instead
+/// of list navigation.
+pub fn handle_theme_picker_action(app: &mut App, action: Action) {
+    if app.theme_picker_filtering() {
+        handle_theme_picker_filter_action(app, action);
+        return;
+    }
+    match action {
+        Action::CursorDown(n) => app.move_theme_picker_selection(n as isize),
+        Action::CursorUp(n) => app.move_theme_picker_selection(-(n as isize)),
+        Action::ThemePickerFilter => app.begin_theme_picker_filter(),
+        Action::SubmitInput => app.confirm_theme_picker(),
+        Action::ExitMode => app.cancel_theme_picker(),
+        Action::Quit => app.should_quit = true,
+        _ => {}
+    }
+}
+
+/// Handle input while the theme picker's `/` filter draft is open. Mirrors
+/// `handle_file_tree_prompt_action`.
+fn handle_theme_picker_filter_action(app: &mut App, action: Action) {
+    match action {
+        Action::InsertChar(c) => app.theme_picker_filter_insert_char(c),
+        Action::DeleteChar => app.theme_picker_filter_delete_char(),
+        Action::ClearLine => app.theme_picker_filter_clear_line(),
+        Action::SubmitInput => app.commit_theme_picker_filter(),
+        Action::ExitMode => app.cancel_theme_picker_filter(),
+        _ => {}
     }
 }
 
@@ -1404,10 +1672,14 @@ pub fn handle_comment_navigator_action(app: &mut App, action: Action) {
 /// right message when the comment is read-only or absent.
 fn edit_comment_at_cursor(app: &mut App, cursor_at_end: bool) {
     if app.cursor_on_locked_comment() {
-        app.set_message("Comment already pushed to GitHub — read only in tuicr");
+        let forge = app.forge_display_name();
+        app.set_message(format!(
+            "Comment already pushed to {forge} — read only in tuicr"
+        ));
     } else if !app.enter_edit_mode(cursor_at_end) {
         if app.cursor_on_remote_thread() {
-            app.set_message("GitHub comment — read only in tuicr");
+            let forge = app.forge_display_name();
+            app.set_message(format!("{forge} comment — read only in tuicr"));
         } else {
             app.set_message("No comment at cursor");
         }
@@ -1487,6 +1759,7 @@ fn handle_shared_normal_action(app: &mut App, action: Action) {
                 app.should_quit = true;
             }
         }
+        Action::QuitHint => app.set_message(QUIT_HINT_MESSAGE),
         Action::ExitMode => {
             app.show_file_list = false;
             app.focused_panel = FocusedPanel::Diff;
@@ -1575,12 +1848,14 @@ fn handle_shared_normal_action(app: &mut App, action: Action) {
         // `A` (vim only) edits with the text cursor at end-of-line.
         Action::EditCommentAtEnd if app.comment_vim_enabled => edit_comment_at_cursor(app, true),
         Action::ExportToClipboard => handle_export(app),
+        Action::CopyCommentAtCursor => handle_copy_comment_at_cursor(app),
         Action::SearchNext => {
             app.search_next_in_diff();
         }
         Action::SearchPrev => {
             app.search_prev_in_diff();
         }
+        Action::ClearSearchHighlight => app.clear_search_highlight(),
         Action::EnterVisualMode => {
             if app.get_line_at_cursor().is_some() {
                 app.enter_visual_mode_at_cursor();
@@ -1641,6 +1916,7 @@ pub fn handle_submit_action_picker_action(app: &mut App, action: Action) {
         Action::SubmitPickerConfirm => app.submit_picker_confirm(),
         Action::ExitMode => app.cancel_submit_action_picker(),
         Action::Quit => app.should_quit = true,
+        Action::QuitHint => app.set_message(QUIT_HINT_MESSAGE),
         _ => {}
     }
 }
@@ -1666,7 +1942,7 @@ pub fn handle_submit_confirm_action(app: &mut App, action: Action) {
 }
 
 #[cfg(test)]
-mod relative_line_number_command_tests {
+mod command_tests {
     use super::{CommandKind, command_spec_for};
 
     #[test]
@@ -1682,6 +1958,36 @@ mod relative_line_number_command_tests {
         assert_eq!(
             command_spec_for("set relativenumber!").map(|spec| spec.kind),
             Some(CommandKind::ToggleRelativeLineNumbers)
+        );
+    }
+
+    #[test]
+    fn parses_copy_url_command() {
+        assert_eq!(
+            command_spec_for("copy-url").map(|spec| spec.kind),
+            Some(CommandKind::CopyUrl)
+        );
+    }
+
+    #[test]
+    fn parses_every_reviewed_visibility_command_form() {
+        // Mirrors `:set commits` / `:set nocommits` / `:set commits!`, plus a
+        // bare toggle alias in the shape of `:wrap`.
+        assert_eq!(
+            command_spec_for("set reviewed").map(|spec| spec.kind),
+            Some(CommandKind::SetShowReviewed(true))
+        );
+        assert_eq!(
+            command_spec_for("set noreviewed").map(|spec| spec.kind),
+            Some(CommandKind::SetShowReviewed(false))
+        );
+        assert_eq!(
+            command_spec_for("set reviewed!").map(|spec| spec.kind),
+            Some(CommandKind::ToggleShowReviewed)
+        );
+        assert_eq!(
+            command_spec_for("reviewed").map(|spec| spec.kind),
+            Some(CommandKind::ToggleShowReviewed)
         );
     }
 }

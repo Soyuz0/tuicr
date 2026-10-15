@@ -6,7 +6,7 @@
 //!
 //! Key invariants enforced here:
 //! - The current local checkout is never treated as the source of truth.
-//!   Diffs are parsed from `gh pr diff`; SHAs are captured from PR metadata.
+//!   File identity comes from forge metadata; SHAs come from PR metadata.
 //! - `.tuicrignore` is applied only when the caller supplies a local
 //!   checkout path. Outside a checkout, the unfiltered diff is shown.
 //! - No checkout mutation. We never spawn `git checkout/fetch/reset/stash`
@@ -19,10 +19,10 @@ use crate::forge::traits::{
     ForgeBackend, PrSessionKey, PullRequestCommit, PullRequestDetails, PullRequestInfo,
     PullRequestReviewMetadata, PullRequestTarget,
 };
-use crate::model::{DiffFile, ReviewSession, SessionDiffSource};
+use crate::model::{DiffFile, FilePatch, ReviewSession, SessionDiffSource};
 use crate::syntax::SyntaxHighlighter;
 use crate::tuicrignore;
-use crate::vcs::diff_parser::{DiffFormat, parse_unified_diff};
+use crate::vcs::diff_parser::parse_file_patches;
 
 /// Everything the App needs to enter PR review mode.
 #[derive(Debug)]
@@ -42,6 +42,15 @@ pub struct OpenedPullRequest {
     pub pr_info: PullRequestInfo,
 }
 
+/// Send-safe data fetched before the main thread materializes diff hunks.
+pub type PrFetchData = (
+    PullRequestDetails,
+    Vec<FilePatch>,
+    Vec<PullRequestCommit>,
+    PullRequestReviewMetadata,
+    PullRequestInfo,
+);
+
 /// Open a PR target through a forge backend and prepare review state.
 ///
 /// `local_checkout` is optional: when provided, `.tuicrignore` rules at the
@@ -53,10 +62,10 @@ pub fn open_pull_request(
     local_checkout: Option<&Path>,
     highlighter: &SyntaxHighlighter,
 ) -> Result<OpenedPullRequest> {
-    let (details, patch, commits, review_metadata, pr_info) = fetch_pr_data(backend, target)?;
+    let (details, patches, commits, review_metadata, pr_info) = fetch_pr_data(backend, target)?;
     prepare_open_pr(
         details,
-        &patch,
+        patches,
         commits,
         review_metadata,
         pr_info,
@@ -65,8 +74,8 @@ pub fn open_pull_request(
     )
 }
 
-/// Network-only half of the PR open path: fetch PR metadata, the raw
-/// patch text, and the commit list. Safe to run on a background thread
+/// Network-only half of the PR open path: fetch PR metadata, structured file
+/// patches, and the commit list. Safe to run on a background thread
 /// because it does no syntax parsing and holds nothing that isn't `Send`.
 ///
 /// `get_pull_request` must complete first because everything else keys off the
@@ -81,14 +90,11 @@ pub fn open_pull_request(
 pub fn fetch_pr_data(
     backend: &(dyn ForgeBackend + Sync),
     target: PullRequestTarget,
-) -> Result<(
-    PullRequestDetails,
-    String,
-    Vec<PullRequestCommit>,
-    PullRequestReviewMetadata,
-    PullRequestInfo,
-)> {
-    let pr_info = backend.get_pull_request_info(target)?;
+) -> Result<PrFetchData> {
+    let mut pr_info = backend.get_pull_request_info(target)?;
+    if let Some(base_sha) = backend.resolve_diff_base_sha(&pr_info.details) {
+        pr_info.details.base_sha = base_sha;
+    }
     let details = pr_info.details.clone();
 
     let (patch, commits, review_metadata) = std::thread::scope(|scope| {
@@ -117,32 +123,39 @@ pub fn fetch_pr_data(
     Ok((details, patch?, commits, review_metadata, pr_info))
 }
 
-/// CPU-only half of the PR open path: parse the patch, apply
-/// `.tuicrignore`, and build the session. Runs on the main thread because
-/// `SyntaxHighlighter` is not trivially `Send`-cloneable.
+/// CPU-only half of the PR open path: apply `.tuicrignore` to the raw
+/// patches, then parse the hunks and build the session. Filtering before the
+/// parse keeps an ignored large file from being highlighted at all. Runs on
+/// the main thread because `SyntaxHighlighter` is not trivially
+/// `Send`-cloneable.
 pub fn prepare_open_pr(
     details: PullRequestDetails,
-    patch: &str,
+    patches: Vec<FilePatch>,
     commits: Vec<PullRequestCommit>,
     review_metadata: PullRequestReviewMetadata,
     pr_info: PullRequestInfo,
     local_checkout: Option<&Path>,
     highlighter: &SyntaxHighlighter,
 ) -> Result<OpenedPullRequest> {
-    let parsed = match parse_unified_diff(patch, DiffFormat::GitStyle, highlighter) {
-        Ok(files) => files,
-        Err(TuicrError::NoChanges) => {
-            return Err(TuicrError::Forge(format!(
-                "Pull request #{} has no file changes",
-                details.number
-            )));
-        }
-        Err(e) => return Err(e),
+    let had_patches = !patches.is_empty();
+    let patches = match local_checkout {
+        Some(root) => tuicrignore::filter_file_patches(root, patches),
+        None => patches,
     };
 
-    let diff_files = match local_checkout {
-        Some(root) => tuicrignore::filter_diff_files(root, parsed),
-        None => parsed,
+    let diff_files = if had_patches && patches.is_empty() {
+        Vec::new()
+    } else {
+        match parse_file_patches(patches, highlighter) {
+            Ok(files) => files,
+            Err(TuicrError::NoChanges) => {
+                return Err(TuicrError::Forge(format!(
+                    "Pull request #{} has no file changes",
+                    details.number
+                )));
+            }
+            Err(e) => return Err(e),
+        }
     };
 
     let key = PrSessionKey::from_details(&details);
@@ -239,9 +252,34 @@ mod tests {
         // `Mutex` rather than `RefCell` so the fake is `Sync`, which the
         // concurrent fetch in `fetch_pr_data` requires of a forge backend.
         calls: Mutex<Vec<&'static str>>,
+        /// Stands in for a backend whose `base_sha` is the base branch tip
+        /// rather than the merge base the patch is taken from. `None` models
+        /// a backend that already reports the merge base (GitLab).
+        diff_base_sha: Option<String>,
+    }
+
+    impl StaticBackend {
+        fn new(details: PullRequestDetails, patch: &str) -> Self {
+            Self {
+                details,
+                patch: patch.to_string(),
+                calls: Mutex::new(Vec::new()),
+                diff_base_sha: None,
+            }
+        }
+
+        fn with_diff_base_sha(mut self, sha: &str) -> Self {
+            self.diff_base_sha = Some(sha.to_string());
+            self
+        }
     }
 
     impl ForgeBackend for StaticBackend {
+        fn resolve_diff_base_sha(&self, _pr: &PullRequestDetails) -> Option<String> {
+            self.calls.lock().unwrap().push("resolve_diff_base_sha");
+            self.diff_base_sha.clone()
+        }
+
         fn list_pull_requests(&self, _query: PullRequestListQuery) -> Result<PagedPullRequests> {
             unimplemented!()
         }
@@ -249,9 +287,11 @@ mod tests {
             self.calls.lock().unwrap().push("get_pull_request");
             Ok(self.details.clone())
         }
-        fn get_pull_request_diff(&self, _pr: &PullRequestDetails) -> Result<String> {
+        fn get_pull_request_diff(&self, _pr: &PullRequestDetails) -> Result<Vec<FilePatch>> {
             self.calls.lock().unwrap().push("get_pull_request_diff");
-            Ok(self.patch.clone())
+            Ok(crate::vcs::diff_parser::git_fixture_file_patches(
+                &self.patch,
+            ))
         }
         fn fetch_file_lines(&self, _req: ForgeFileLinesRequest) -> Result<Vec<DiffLine>> {
             unimplemented!()
@@ -273,8 +313,10 @@ mod tests {
             _pr: &PullRequestDetails,
             _start_sha: &str,
             _end_sha: &str,
-        ) -> Result<String> {
-            Ok(self.patch.clone())
+        ) -> Result<Vec<FilePatch>> {
+            Ok(crate::vcs::diff_parser::git_fixture_file_patches(
+                &self.patch,
+            ))
         }
         fn create_review(
             &self,
@@ -299,11 +341,7 @@ index 1111111..2222222 100644
     #[test]
     fn should_parse_pr_diff_and_build_session_keyed_by_head_sha() {
         // given
-        let backend = StaticBackend {
-            details: details(),
-            patch: SIMPLE_PATCH.to_string(),
-            calls: Mutex::new(Vec::new()),
-        };
+        let backend = StaticBackend::new(details(), SIMPLE_PATCH);
         let target = PullRequestTarget::with_repository(repo(), 125, "125");
         let highlighter = SyntaxHighlighter::default();
         // when
@@ -321,17 +359,22 @@ index 1111111..2222222 100644
             opened.session.repo_path,
             PathBuf::from("forge:github.com/agavra/tuicr"),
         );
-        // and — both forge calls were made, in order
+        // and — the forge calls were made, in order. The diff base is
+        // resolved between metadata and patch so `base_sha` is already
+        // pinned to the patch's old side by the time anything reads it.
         assert_eq!(
             backend.calls.lock().unwrap().as_slice(),
-            &["get_pull_request", "get_pull_request_diff"],
+            &[
+                "get_pull_request",
+                "resolve_diff_base_sha",
+                "get_pull_request_diff"
+            ],
         );
     }
 
-    /// Patch fixture covering add/modify/delete/rename in a single PR
-    /// diff, mirroring what `gh pr diff --patch --color never` would
-    /// emit. Acts as a regression guard against future changes to the
-    /// shared diff parser.
+    /// Patch fixture covering add/modify/delete/rename in a single PR diff.
+    /// Tests pair its file blocks with explicit metadata before invoking the
+    /// shared hunk parser.
     const MULTI_STATUS_PATCH: &str = r##"diff --git a/added.rs b/added.rs
 new file mode 100644
 index 0000000..abc1234
@@ -366,11 +409,7 @@ rename to new_name.rs
     #[test]
     fn should_parse_multi_status_pr_patch_into_correct_diff_files() {
         // given a backend serving a patch with add/modify/delete/rename
-        let backend = StaticBackend {
-            details: details(),
-            patch: MULTI_STATUS_PATCH.to_string(),
-            calls: Mutex::new(Vec::new()),
-        };
+        let backend = StaticBackend::new(details(), MULTI_STATUS_PATCH);
         let target = PullRequestTarget::with_repository(repo(), 125, "125");
         let highlighter = SyntaxHighlighter::default();
         // when
@@ -405,11 +444,7 @@ rename to new_name.rs
     #[test]
     fn should_surface_empty_pr_as_forge_error() {
         // given a PR with no file changes (empty patch)
-        let backend = StaticBackend {
-            details: details(),
-            patch: String::new(),
-            calls: Mutex::new(Vec::new()),
-        };
+        let backend = StaticBackend::new(details(), "");
         let target = PullRequestTarget::with_repository(repo(), 125, "125");
         let highlighter = SyntaxHighlighter::default();
         // when
@@ -420,5 +455,117 @@ rename to new_name.rs
             msg.contains("Pull request #125 has no file changes"),
             "unexpected error message: {msg}"
         );
+    }
+
+    #[test]
+    fn should_drop_ignored_patches_before_parsing_them() {
+        // given a checkout whose .tuicrignore excludes dist/, and a PR diff
+        // whose ignored patch body is malformed (a hunk header the parser
+        // rejects)
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(dir.path().join(".tuicrignore"), "dist/\n")
+            .expect("failed to write .tuicrignore");
+        let patches = vec![
+            FilePatch::new(
+                None,
+                Some(std::path::PathBuf::from("src/main.rs")),
+                crate::model::FileStatus::Modified,
+                "@@ -1,3 +1,3 @@\n pub fn answer() -> u32 {\n-    41\n+    42\n }\n",
+            ),
+            FilePatch::new(
+                None,
+                Some(std::path::PathBuf::from("dist/bundle.js")),
+                crate::model::FileStatus::Modified,
+                "@@not-a-hunk\n+minified one-liner\n",
+            ),
+        ];
+        let highlighter = SyntaxHighlighter::default();
+        // when
+        let opened = prepare_open_pr(
+            details(),
+            patches,
+            Vec::new(),
+            crate::forge::traits::PullRequestReviewMetadata::default(),
+            crate::forge::traits::PullRequestInfo::from_details(details()),
+            Some(dir.path()),
+            &highlighter,
+        )
+        .expect("ignored patch must never reach the parser");
+        // then only the kept file was parsed into the review
+        let kept: Vec<String> = opened
+            .diff_files
+            .iter()
+            .map(|f| f.display_path().display().to_string())
+            .collect();
+        assert_eq!(kept, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn should_open_an_empty_review_when_every_pr_patch_is_ignored() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        std::fs::write(dir.path().join(".tuicrignore"), "dist/\n")
+            .expect("failed to write .tuicrignore");
+        let highlighter = SyntaxHighlighter::default();
+
+        let opened = prepare_open_pr(
+            details(),
+            vec![FilePatch::new(
+                None,
+                Some(std::path::PathBuf::from("dist/bundle.js")),
+                crate::model::FileStatus::Modified,
+                "@@ -1 +1 @@\n-old\n+new\n",
+            )],
+            Vec::new(),
+            crate::forge::traits::PullRequestReviewMetadata::default(),
+            crate::forge::traits::PullRequestInfo::from_details(details()),
+            Some(dir.path()),
+            &highlighter,
+        )
+        .expect("an ignored-only PR should open as an empty review");
+
+        assert!(opened.diff_files.is_empty());
+    }
+
+    #[test]
+    fn should_pin_base_sha_to_the_resolved_diff_base_before_downstream_reads() {
+        // given — a backend reporting the base branch tip as base_sha, with
+        // the real three-dot merge base available separately.
+        let backend =
+            StaticBackend::new(details(), SIMPLE_PATCH).with_diff_base_sha("mergebase111");
+        let target = PullRequestTarget::with_repository(repo(), 125, "125");
+        let highlighter = SyntaxHighlighter::default();
+        // when
+        let opened = open_pull_request(&backend, target, None, &highlighter).unwrap();
+        // then — both the standalone details and the copy carried on pr_info
+        // report the merge base, so PR-mode entry, the info panel, and the
+        // reload paths can't disagree about the old side.
+        assert_eq!(opened.details.base_sha, "mergebase111");
+        assert_eq!(opened.pr_info.details.base_sha, "mergebase111");
+        // and — resolution happened before the patch was fetched, so nothing
+        // downstream ever observes the unrefined tip.
+        let calls = backend.calls.lock().unwrap();
+        let resolved_at = calls
+            .iter()
+            .position(|c| *c == "resolve_diff_base_sha")
+            .expect("expected a resolve_diff_base_sha call");
+        let diff_at = calls
+            .iter()
+            .position(|c| *c == "get_pull_request_diff")
+            .expect("expected a get_pull_request_diff call");
+        assert!(resolved_at < diff_at);
+    }
+
+    #[test]
+    fn should_keep_reported_base_sha_when_backend_needs_no_refinement() {
+        // given — a backend whose base_sha is already the merge base
+        // (GitLab's diff_refs.base_sha), modeled by returning None.
+        let backend = StaticBackend::new(details(), SIMPLE_PATCH);
+        let target = PullRequestTarget::with_repository(repo(), 125, "125");
+        let highlighter = SyntaxHighlighter::default();
+        // when
+        let opened = open_pull_request(&backend, target, None, &highlighter).unwrap();
+        // then — untouched.
+        assert_eq!(opened.details.base_sha, "1234567890abcdef");
+        assert_eq!(opened.pr_info.details.base_sha, "1234567890abcdef");
     }
 }

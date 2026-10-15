@@ -29,12 +29,16 @@ pub struct CliArgs {
     pub file_path: Option<String>,
     /// Whole-repo annotation mode.
     pub all_files: bool,
+    /// Source line (new side) to put the cursor on at startup.
+    pub start_line: Option<u32>,
     /// Direct PR target from `tuicr pr <target>`.
     pub pr_target: Option<String>,
     /// Whether a direct target uses existing auto-detection or explicit ADO.
     pub pr_target_kind: PullRequestTargetKind,
-    /// Override the GitHub repo used for PR operations.
+    /// Override the forge repository used for PR operations.
     pub repo_url: Option<String>,
+    /// Use a named VCS remote for PR operations.
+    pub remote: Option<String>,
     /// Non-interactive review session operation.
     pub review_command: Option<ReviewCommand>,
     /// Update the installed tuicr binary and exit.
@@ -109,6 +113,11 @@ struct TuiOptions {
     )]
     file_path: Option<String>,
 
+    /// Start with the cursor on this line of the file (new side). Requires
+    /// --file or --path; with several files, applies to the first.
+    #[arg(long = "line", value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    start_line: Option<u32>,
+
     /// Review every tracked file in the cwd's git repo.
     #[arg(
         short = 'A',
@@ -126,14 +135,23 @@ struct TuiOptions {
     #[arg(long = "no-update-check", action = ArgAction::SetTrue)]
     no_update_check: bool,
 
-    /// Override the GitHub repo for PR operations (HTTPS, SCP-style SSH,
-    /// or ssh:// URLs accepted).
+    /// Override the forge repo for PR operations. Accepts GitHub, GitLab, or
+    /// Azure DevOps URLs (HTTPS, SCP-style SSH, or ssh:// forms).
     #[arg(
         long = "repo-url",
         value_name = "URL",
         value_parser = parse_repo_url
     )]
     repo_url: Option<String>,
+
+    /// Use a named remote's fetch URL for PR operations (Git only).
+    #[arg(
+        long,
+        value_name = "NAME",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        conflicts_with = "repo_url"
+    )]
+    remote: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -221,6 +239,8 @@ pub enum ReviewCommand {
 
         /// Comment classification. Defaults to `none` (no type, no `[TYPE]`
         /// prefix); pass a type configured via `comment_types` to classify.
+        /// An id absent from a configured `comment_types` warns on stderr but
+        /// is still stored.
         #[arg(long = "type", value_name = "TYPE", default_value = "none", value_parser = non_empty_comment_type)]
         comment_type: String,
 
@@ -260,6 +280,49 @@ pub enum ReviewCommand {
     /// Print comments stored in a persisted session.
     #[command(alias = "get")]
     Comments {
+        /// Session slug from `tuicr review list` (local or PR), or path to a
+        /// session JSON file.
+        #[arg(long, value_name = "SESSION")]
+        session: String,
+
+        /// Repo selector used to resolve a local session slug (path or
+        /// `owner/repo`). PR slugs and JSON paths resolve without it.
+        #[arg(long, value_name = "PATH|OWNER/REPO", default_value = ".")]
+        repo: PathBuf,
+    },
+
+    /// Delete one local draft comment from a persisted session.
+    Delete {
+        /// Session slug from `tuicr review list` (local or PR), or path to a
+        /// session JSON file.
+        #[arg(long, value_name = "SESSION")]
+        session: String,
+
+        /// Id of the comment to delete, as reported by `tuicr review comments`.
+        #[arg(long = "comment-id", value_name = "ID")]
+        comment_id: String,
+
+        /// Repo selector used to resolve a local session slug (path or
+        /// `owner/repo`). PR slugs and JSON paths resolve without it.
+        #[arg(long, value_name = "PATH|OWNER/REPO", default_value = ".")]
+        repo: PathBuf,
+    },
+
+    /// Clear all comments in a persisted session, keeping review marks.
+    Clearc {
+        /// Session slug from `tuicr review list` (local or PR), or path to a
+        /// session JSON file.
+        #[arg(long, value_name = "SESSION")]
+        session: String,
+
+        /// Repo selector used to resolve a local session slug (path or
+        /// `owner/repo`). PR slugs and JSON paths resolve without it.
+        #[arg(long, value_name = "PATH|OWNER/REPO", default_value = ".")]
+        repo: PathBuf,
+    },
+
+    /// Clear all comments and review marks in a persisted session.
+    Clear {
         /// Session slug from `tuicr review list` (local or PR), or path to a
         /// session JSON file.
         #[arg(long, value_name = "SESSION")]
@@ -361,9 +424,11 @@ impl From<Cli> for CliArgs {
             path_filter: options.path_filter,
             file_path: options.file_path,
             all_files: options.all_files,
+            start_line: options.start_line,
             pr_target,
             pr_target_kind,
             repo_url: options.repo_url,
+            remote: options.remote,
             review_command,
             update_command,
             update_version,
@@ -381,8 +446,10 @@ impl TuiOptions {
             || self.working_tree
             || self.path_filter.is_some()
             || self.file_path.is_some()
+            || self.start_line.is_some()
             || self.all_files
             || self.repo_url.is_some()
+            || self.remote.is_some()
     }
 
     fn merge(self, later: TuiOptions) -> Self {
@@ -395,20 +462,16 @@ impl TuiOptions {
             working_tree: self.working_tree || later.working_tree,
             path_filter: later.path_filter.or(self.path_filter),
             file_path: later.file_path.or(self.file_path),
+            start_line: later.start_line.or(self.start_line),
             all_files: self.all_files || later.all_files,
             repo_url: later.repo_url.or(self.repo_url),
+            remote: later.remote.or(self.remote),
         }
     }
 }
 
 impl Cli {
     fn try_into_args(self) -> std::result::Result<CliArgs, clap::Error> {
-        if self.ado_uses_repo_url() {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::ArgumentConflict,
-                "`--repo-url` is GitHub-only and cannot be used with `tuicr ado`; pass a full Azure DevOps PR URL or run from the Azure Repos checkout",
-            ));
-        }
         match (
             self.tui_options.has_any_explicit_value(),
             self.non_tui_command_name(),
@@ -419,7 +482,31 @@ impl Cli {
                     "TUI options cannot be used with `tuicr {command_name}`; run `tuicr {command_name} --help` for command options"
                 ),
             )),
-            _ => Ok(self.into()),
+            _ => {
+                let args: CliArgs = self.into();
+                if args.start_line.is_some() && args.pr_target.is_some() {
+                    return Err(clap::Error::raw(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        "--line cannot be used with `tuicr pr`\n",
+                    ));
+                }
+                if args.start_line.is_some()
+                    && args.file_path.is_none()
+                    && args.path_filter.is_none()
+                {
+                    return Err(clap::Error::raw(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "--line requires --file or --path\n",
+                    ));
+                }
+                if args.remote.is_some() && args.repo_url.is_some() {
+                    return Err(clap::Error::raw(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        "--remote cannot be used with --repo-url",
+                    ));
+                }
+                Ok(args)
+            }
         }
     }
 
@@ -428,20 +515,6 @@ impl Cli {
             Some(Subcmd::Review { .. }) => Some("review"),
             Some(Subcmd::Update { .. }) => Some("update"),
             _ => None,
-        }
-    }
-
-    fn ado_uses_repo_url(&self) -> bool {
-        let root = self.tui_options.repo_url.is_some();
-        match &self.command {
-            Some(Subcmd::Ado(command)) => root || command.options.repo_url.is_some(),
-            Some(Subcmd::Tui(command)) => match &command.command {
-                Some(TuiSubcmd::Ado(ado)) => {
-                    root || command.options.repo_url.is_some() || ado.options.repo_url.is_some()
-                }
-                _ => false,
-            },
-            _ => false,
         }
     }
 }
@@ -462,16 +535,20 @@ fn non_empty_theme_name(s: &str) -> Result<String, String> {
     }
 }
 
-/// Reject `--repo-url` values that don't parse as a GitHub remote URL so the
-/// failure is surfaced at startup rather than when the PR tab is opened.
+/// Reject `--repo-url` values that don't parse as a supported forge remote URL
+/// (GitHub, GitLab, Gitea, Bitbucket, Azure DevOps, or Gerrit) so the failure is
+/// surfaced at startup rather than when the PR tab is opened.
 fn parse_repo_url(s: &str) -> Result<String, String> {
-    if crate::forge::github::gh::parse_github_remote_url(s).is_some() {
+    if crate::forge::parse_any_remote_url(s).is_some() {
         Ok(s.to_string())
     } else {
         Err(format!(
-            "--repo-url value '{s}' is not a recognized GitHub URL. \
-             Expected forms: https://github.com/owner/repo, git@github.com:owner/repo, \
-             or ssh://git@github.com/owner/repo"
+            "--repo-url value '{s}' is not a recognized GitHub, GitLab, Gitea, Bitbucket, \
+             Azure DevOps, or Gerrit URL. Expected forms like: https://github.com/owner/repo, \
+             git@gitlab.com:owner/repo, https://gitea.com/owner/repo, \
+             https://bitbucket.org/workspace/repo, \
+             https://dev.azure.com/org/project/_git/repo, or \
+             https://gerrit.example.com/my/project"
         ))
     }
 }
@@ -516,6 +593,83 @@ mod tests {
 
     fn parse_for_test(args: &[&str]) -> Result<CliArgs, clap::Error> {
         Cli::try_parse_from(args).and_then(Cli::try_into_args)
+    }
+
+    #[test]
+    fn should_parse_line_with_file() {
+        let parsed = parse_for_test(&["tuicr", "--file", "README.md", "--line", "42"])
+            .expect("parse should succeed");
+        assert_eq!(parsed.file_path.as_deref(), Some("README.md"));
+        assert_eq!(parsed.start_line, Some(42));
+    }
+
+    #[test]
+    fn should_parse_line_with_path_filter() {
+        let parsed = parse_for_test(&["tuicr", "-w", "-p", "src/cli.rs", "--line", "7"])
+            .expect("parse should succeed");
+        assert_eq!(parsed.path_filter.as_deref(), Some("src/cli.rs"));
+        assert_eq!(parsed.start_line, Some(7));
+    }
+
+    #[test]
+    fn should_parse_line_after_tui_subcommand() {
+        let parsed = parse_for_test(&["tuicr", "tui", "--file", "a.md", "--line", "3"])
+            .expect("parse should succeed");
+        assert_eq!(parsed.start_line, Some(3));
+    }
+
+    #[test]
+    fn should_reject_line_without_file_or_path() {
+        let err = parse_for_test(&["tuicr", "--line", "42"]).expect_err("parse should fail");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--line requires --file or --path"));
+    }
+
+    #[test]
+    fn should_reject_line_with_pr_subcommand() {
+        for args in [
+            &["tuicr", "pr", "125", "-p", "src/cli.rs", "--line", "3"][..],
+            &[
+                "tuicr",
+                "tui",
+                "pr",
+                "125",
+                "-p",
+                "src/cli.rs",
+                "--line",
+                "3",
+            ][..],
+        ] {
+            let err = parse_for_test(args).expect_err("parse should fail");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+            assert!(
+                err.to_string()
+                    .contains("--line cannot be used with `tuicr pr`")
+            );
+        }
+    }
+
+    #[test]
+    fn should_let_a_later_line_override_an_earlier_one() {
+        let parsed = parse_for_test(&[
+            "tuicr", "--line", "3", "tui", "--file", "a.md", "--line", "9",
+        ])
+        .expect("parse should succeed");
+        assert_eq!(parsed.start_line, Some(9));
+    }
+
+    #[test]
+    fn should_reject_line_zero() {
+        let err = parse_for_test(&["tuicr", "--file", "a.md", "--line", "0"])
+            .expect_err("parse should fail");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn should_reject_line_with_review_command() {
+        let err = parse_for_test(&["tuicr", "--line", "3", "review", "list"])
+            .expect_err("parse should fail");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
     }
 
     #[test]
@@ -827,17 +981,20 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_github_repo_override_for_azure_command() {
-        let error = parse_for_test(&[
+    fn should_accept_azure_repo_override_for_azure_command() {
+        let parsed = parse_for_test(&[
             "tuicr",
             "ado",
             "125",
             "--repo-url",
-            "https://github.com/owner/repo",
+            "https://dev.azure.com/org/project/_git/repo",
         ])
-        .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
-        assert!(error.to_string().contains("GitHub-only"));
+        .unwrap();
+        assert_eq!(parsed.pr_target_kind, PullRequestTargetKind::AzureDevOps);
+        assert_eq!(
+            parsed.repo_url.as_deref(),
+            Some("https://dev.azure.com/org/project/_git/repo")
+        );
     }
 
     #[test]
@@ -956,7 +1113,32 @@ mod tests {
         let err =
             parse_for_test(&["tuicr", "--repo-url", "not-a-url"]).expect_err("parse should fail");
         assert_eq!(err.kind(), ErrorKind::ValueValidation);
-        assert!(err.to_string().contains("not a recognized GitHub URL"));
+        assert!(
+            err.to_string()
+                .contains("not a recognized GitHub, GitLab, Gitea, Bitbucket, Azure"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn should_accept_repo_url_for_every_supported_forge() {
+        // `--repo-url` used to validate against GitHub only, which silently
+        // rejected GitLab, Bitbucket, Azure DevOps, and Gerrit remotes.
+        for url in [
+            "https://github.com/slatedb/slatedb.git",
+            "https://gitlab.com/owner/repo.git",
+            "https://bitbucket.org/example-workspace/repo.git",
+            "git@bitbucket.org:example-workspace/repo.git",
+            "https://dev.azure.com/org/project/_git/repo",
+            "https://gitea.com/owner/repo.git",
+            "git@gitea.example.com:owner/repo.git",
+            "https://gerrit.example.com/my/project",
+            "ssh://reviewer@review.example.com:29418/my/project",
+        ] {
+            let parsed = parse_for_test(&["tuicr", "--repo-url", url])
+                .unwrap_or_else(|err| panic!("{url} should parse: {err}"));
+            assert_eq!(parsed.repo_url, Some(url.to_string()));
+        }
     }
 
     #[test]
@@ -969,6 +1151,72 @@ mod tests {
     fn should_leave_repo_url_none_when_not_provided() {
         let parsed = parse_for_test(&["tuicr"]).expect("parse should succeed");
         assert_eq!(parsed.repo_url, None);
+    }
+
+    #[test]
+    fn should_reject_conflicting_remote_and_repo_url_across_command_levels() {
+        for args in [
+            vec![
+                "tuicr",
+                "pr",
+                "382",
+                "--remote",
+                "upstream",
+                "--repo-url",
+                "https://github.com/owner/repo",
+            ],
+            vec![
+                "tuicr",
+                "--remote",
+                "upstream",
+                "tui",
+                "pr",
+                "382",
+                "--repo-url",
+                "https://github.com/owner/repo",
+            ],
+            vec![
+                "tuicr",
+                "--repo-url",
+                "https://github.com/owner/repo",
+                "tui",
+                "--remote",
+                "upstream",
+                "mr",
+                "382",
+            ],
+        ] {
+            let err = parse_for_test(&args).expect_err("conflicting repository selectors");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn should_use_innermost_remote_option() {
+        let parsed = parse_for_test(&[
+            "tuicr",
+            "--remote",
+            "origin",
+            "tui",
+            "--remote",
+            "upstream",
+            "pr",
+            "382",
+            "--remote",
+            "staging-upstream",
+        ])
+        .expect("parse should succeed");
+        assert_eq!(parsed.remote.as_deref(), Some("staging-upstream"));
+    }
+
+    #[test]
+    fn should_reject_remote_for_non_tui_commands() {
+        for command in [vec!["review", "list"], vec!["update"]] {
+            let mut args = vec!["tuicr", "--remote", "upstream"];
+            args.extend(command);
+            let err = parse_for_test(&args).expect_err("TUI option on non-TUI command");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

@@ -5,14 +5,37 @@ use std::path::PathBuf;
 use crate::error::{Result, TuicrError};
 use crate::forge::remote_comments::RemoteReviewThread;
 use crate::forge::submit::SubmitEvent;
-use crate::model::{DiffLine, FileStatus};
+use crate::model::{DiffLine, FilePatch, FileStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgeKind {
     GitHub,
     GitLab,
+    /// Gitea, reached through the `tea` CLI.
+    Gitea,
+    /// Bitbucket Cloud only. Data Center speaks an unrelated REST 1.0 API and
+    /// is rejected during remote-URL parsing.
+    Bitbucket,
+    #[serde(rename = "azure_dev_ops", alias = "azure_devops")]
     AzureDevOps,
+    /// Self-hosted Gerrit Code Review. A Gerrit *change* takes the place of a
+    /// pull request and its numeric change number is the PR number.
+    Gerrit,
+}
+
+impl ForgeKind {
+    /// Brand name as users expect to see it, for messages and export headers.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ForgeKind::GitHub => "GitHub",
+            ForgeKind::GitLab => "GitLab",
+            ForgeKind::Gitea => "Gitea",
+            ForgeKind::Bitbucket => "Bitbucket",
+            ForgeKind::AzureDevOps => "Azure DevOps",
+            ForgeKind::Gerrit => "Gerrit",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +139,88 @@ impl ForgeRepository {
         }
     }
 
+    /// Gitea repositories are always `<owner>/<repo>` — no nested groups.
+    pub fn gitea(
+        host: impl Into<String>,
+        owner: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ForgeKind::Gitea,
+            host: host.into(),
+            owner: owner.into(),
+            name: name.into(),
+            azure_devops: None,
+        }
+    }
+
+    /// `owner` carries the Bitbucket Cloud workspace.
+    pub fn bitbucket(
+        host: impl Into<String>,
+        owner: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: ForgeKind::Bitbucket,
+            host: host.into(),
+            owner: owner.into(),
+            name: name.into(),
+            azure_devops: None,
+        }
+    }
+
+    /// Build an Azure DevOps repository coordinate.
+    ///
+    /// Azure repos live under `organization/project/repository` — one level
+    /// deeper than GitHub/GitLab. We pack `organization/project` into `owner`
+    /// (the same trick GitLab uses for nested subgroups) and keep `name` as the
+    /// bare repository. `crate::forge::azure::az::azure_coords` splits `owner`
+    /// back into `(organization, project)`.
+    pub fn azure(
+        host: impl Into<String>,
+        owner: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        let host = host.into();
+        let owner = owner.into();
+        let (organization, project) = owner.split_once('/').unwrap_or((&owner, ""));
+        Self::azure_devops(
+            &host,
+            organization,
+            format!("https://{host}/{organization}"),
+            project,
+            name,
+        )
+    }
+
+    /// Build a Gerrit repository coordinate from a project path.
+    ///
+    /// Gerrit has no owner/repo split: a project is a single path such as
+    /// `myrepo` or `platform/frameworks/base`. We keep the last segment in
+    /// `name` and the parent path in `owner` — the same packing Azure DevOps
+    /// uses for `org/project`, so PR slugs round-trip through
+    /// [`crate::slug::PrSlug`]. A single-segment project has no parent, and an
+    /// empty `owner` would produce the unparseable slug `ge:/repo/pr/1`, so it
+    /// falls back to the host. [`crate::forge::gerrit::api::gerrit_project`]
+    /// reverses the packing.
+    pub fn gerrit(host: impl Into<String>, project: impl Into<String>) -> Self {
+        let host = host.into();
+        let project = project.into();
+        let (owner, name) = match project.rsplit_once('/') {
+            Some((parent, last)) if !parent.is_empty() && !last.is_empty() => {
+                (parent.to_string(), last.to_string())
+            }
+            _ => (host.clone(), project),
+        };
+        Self {
+            kind: ForgeKind::Gerrit,
+            host,
+            owner,
+            name,
+            azure_devops: None,
+        }
+    }
+
     pub fn slug(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }
@@ -129,7 +234,21 @@ impl ForgeRepository {
                 identity.organization, identity.project, self.name
             );
         }
-        if self.host == "github.com" || self.host == "gitlab.com" {
+        if self.kind == ForgeKind::Gerrit {
+            // `owner` mirrors the host for single-segment projects, so the
+            // generic `host/owner/name` shape would repeat it.
+            return format!(
+                "{}/{}",
+                self.host,
+                crate::forge::gerrit::api::gerrit_project(self)
+            );
+        }
+        if self.host == "github.com"
+            || self.host == "gitlab.com"
+            || self.host == "bitbucket.org"
+            || self.host == "dev.azure.com"
+            || self.host == "gitea.com"
+        {
             self.slug()
         } else {
             format!("{}/{}", self.host, self.slug())
@@ -264,6 +383,20 @@ pub struct PullRequestDetails {
     pub head_ref_name: String,
     pub base_ref_name: String,
     pub head_sha: String,
+    /// The commit the displayed patch's **old side** lives at — the merge
+    /// base, not the base branch tip.
+    ///
+    /// For three-dot PR diffs, `ForgeContextProvider`, PR editor snapshots,
+    /// and the `pr_range_sha_pair` fallback parent all need this revision.
+    /// Backends that natively report a branch tip correct it via
+    /// `ForgeBackend::resolve_diff_base_sha`, applied once in `fetch_pr_data`.
+    ///
+    /// One consumer wants this field for a second reason: GitLab embeds it as
+    /// `base_sha` in inline-comment position payloads (`glab.rs`). Those two
+    /// meanings coincide today only because GitLab's `diff_refs.base_sha` is
+    /// already the merge base. A backend where the diff's old-side revision
+    /// and the comment-position anchor differ must not reuse this field for
+    /// both — split them rather than picking one and hoping.
     pub base_sha: String,
     pub body: String,
     pub updated_at: Option<DateTime<Utc>>,
@@ -555,11 +688,21 @@ pub trait ForgeBackend {
         let details = self.get_pull_request(target)?;
         Ok(PullRequestInfo::from_details(details))
     }
-    fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<String>;
+    fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<Vec<FilePatch>>;
     /// Fetch the requested file lines from the forge for context expansion.
     /// Implementations may optimize by reading from a local checkout when
     /// available; the trait does not require that path.
     fn fetch_file_lines(&self, request: ForgeFileLinesRequest) -> Result<Vec<DiffLine>>;
+    /// Return the whole file at the revision described by `request`, exactly as
+    /// stored: unlike [`Self::fetch_file_lines`], tabs are not expanded, so the
+    /// result is safe to write back out as a file. `start_line` and `end_line`
+    /// are ignored. The default errors; backends able to read a revision
+    /// override it.
+    fn fetch_file_content(&self, _request: ForgeFileLinesRequest) -> Result<String> {
+        Err(TuicrError::Forge(
+            "this backend cannot read file contents".to_string(),
+        ))
+    }
     /// Return the total number of lines in a file at the revision described by
     /// `request`. The `start_line` and `end_line` fields of the request are
     /// ignored. Default returns `Ok(0)`; real forge backends override this.
@@ -634,7 +777,21 @@ pub trait ForgeBackend {
         pr: &PullRequestDetails,
         start_sha: &str,
         end_sha: &str,
-    ) -> Result<String>;
+    ) -> Result<Vec<FilePatch>>;
+    /// Resolve the commit the PR's displayed diff is actually taken *from*.
+    ///
+    /// Forge PR diffs are three-dot: the old side is the merge base of the
+    /// base branch and the head, not the tip of the base branch. Backends
+    /// whose `base_sha` already *is* the merge base (GitLab's
+    /// `diff_refs.base_sha`) keep this default and report "no refinement
+    /// needed"; backends that report a branch tip override it so the old
+    /// side of context expansion and editor snapshots lines up with the patch.
+    ///
+    /// Best-effort: `None` on any failure leaves `base_sha` untouched, which
+    /// is the pre-existing behavior.
+    fn resolve_diff_base_sha(&self, _pr: &PullRequestDetails) -> Option<String> {
+        None
+    }
     /// Optional path to a local checkout the backend may consult as an
     /// optimization. The default returns `None`; callers must never treat
     /// this path as the source of truth for PR contents.

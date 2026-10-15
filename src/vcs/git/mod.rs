@@ -2,6 +2,7 @@ mod cli;
 pub mod context;
 pub mod diff;
 mod libgit2;
+pub(crate) mod raw;
 pub mod repository;
 pub mod staging;
 
@@ -159,16 +160,18 @@ impl GitBackend {
         Self::discover_from(&cwd, preference, whitespace_mode)
     }
 
-    fn discover_from(
+    pub(crate) fn discover_from(
         cwd: &Path,
         preference: GitBackendPreference,
         whitespace_mode: DiffWhitespaceMode,
     ) -> Result<Self> {
-        // libgit2 doesn't support reftable or split index repositories, so we fallback to cli
+        // libgit2 doesn't support reftable, split index, or SHA-256 repositories.
         // TODO: remove reftable fallback logic when libgit2 supports it as part of https://github.com/libgit2/libgit2/issues/5352
         // TODO: remove split index fallback logic when libgit2 supports it as part of https://github.com/libgit2/libgit2/issues/6132
-        let use_cli =
-            preference == GitBackendPreference::Cli || uses_reftable(cwd) || uses_split_index(cwd);
+        let use_cli = preference == GitBackendPreference::Cli
+            || uses_reftable(cwd)
+            || uses_split_index(cwd)
+            || uses_sha256(cwd);
 
         if use_cli {
             return Ok(Self::Cli(GitCliBackend::discover_from(
@@ -177,7 +180,7 @@ impl GitBackend {
             )?));
         }
 
-        let backend = Self::Libgit2(Libgit2Backend::discover_from(cwd, whitespace_mode)?);
+        let backend = Self::Libgit2(Libgit2Backend::discover_from(cwd, whitespace_mode.clone())?);
         let repo_mode = GitRepoMode::detect(&backend.info().root_path)?;
         if repo_mode.is_sparse_checkout() && !backend.supports_sparse_checkout() {
             return Ok(Self::Cli(GitCliBackend::discover_from(
@@ -190,15 +193,25 @@ impl GitBackend {
     }
 }
 
+/// Read a named remote's fetch URL, including Git's `insteadOf` rewrites.
+pub(super) fn remote_url(repo_root: &Path, name: &str) -> Result<String> {
+    run_git_command(repo_root, &["remote", "get-url", "--", name])
+}
+
 fn run_git_command(workdir: &Path, args: &[&str]) -> Result<String> {
     // `-c commit.gpgsign=false` is a no-op for the read-only `config`/`init`
     // calls this makes in production, but it keeps the test-only `commit`
     // calls below from prompting contributors with commit signing enabled
     // globally to sign throwaway commits in temp repos.
-    let full_args: Vec<&str> = ["-c", "commit.gpgsign=false"]
-        .into_iter()
-        .chain(args.iter().copied())
-        .collect();
+    let full_args: Vec<&str> = [
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "init.defaultRefFormat=files",
+    ]
+    .into_iter()
+    .chain(args.iter().copied())
+    .collect();
     run_command_output(
         "git",
         Some(workdir),
@@ -226,6 +239,11 @@ fn git_fsmonitor_config_enabled(value: &str) -> bool {
         || (!value.is_empty() && !matches!(value, "false" | "0" | "no" | "off"))
 }
 
+fn uses_sha256(cwd: &Path) -> bool {
+    run_git_command(cwd, &["rev-parse", "--show-object-format"])
+        .is_ok_and(|format| format.trim() == "sha256")
+}
+
 fn uses_reftable(cwd: &Path) -> bool {
     run_git_command(cwd, &["config", "--get", "extensions.refStorage"])
         .ok()
@@ -246,6 +264,10 @@ impl VcsBackend for GitBackend {
             Self::Libgit2(backend) => backend.info(),
             Self::Cli(backend) => backend.info(),
         }
+    }
+
+    fn remote_url(&self, name: &str) -> Result<String> {
+        remote_url(&self.info().root_path, name)
     }
 
     fn startup_warnings(&self) -> Vec<String> {
@@ -393,8 +415,85 @@ impl VcsBackend for GitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forge::{resolve_remote_repository, traits::ForgeRepository};
+    use git2::Repository;
     use std::fs;
     use tempfile::tempdir;
+
+    fn init_repo_with_origin(url: &str) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.remote("origin", url).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolves_named_remote_fetch_url_from_subdirectory() {
+        let dir = init_repo_with_origin("https://github.com/owner/repo");
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.remote("staging-upstream", "git@github.com:org/repo-staging.git")
+            .unwrap();
+        repo.remote_set_pushurl(
+            "staging-upstream",
+            Some("https://github.com/contributor/repo-staging.git"),
+        )
+        .unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+
+        for preference in [GitBackendPreference::Libgit2, GitBackendPreference::Cli] {
+            let backend =
+                GitBackend::discover_from(&nested, preference, DiffWhitespaceMode::Normal).unwrap();
+            assert_eq!(
+                resolve_remote_repository(&backend, "staging-upstream").unwrap(),
+                ForgeRepository::github("github.com", "org", "repo-staging")
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_remote_url_rewrites_without_using_push_rewrites() {
+        let dir = init_repo_with_origin("https://github.com/owner/repo");
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.remote("staging", "tuicr-test:group/repo.git").unwrap();
+        let mut config = repo.config().unwrap();
+        config
+            .set_str("url.https://gitlab.com/.insteadOf", "tuicr-test:")
+            .unwrap();
+        config
+            .set_str("url.https://github.com/.pushInsteadOf", "tuicr-test:")
+            .unwrap();
+        let backend = GitBackend::discover_from(
+            dir.path(),
+            GitBackendPreference::Libgit2,
+            DiffWhitespaceMode::Normal,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_remote_repository(&backend, "staging").unwrap(),
+            ForgeRepository::gitlab("gitlab.com", "group", "repo")
+        );
+    }
+
+    #[test]
+    fn rejects_unusable_named_remotes_instead_of_falling_back_to_origin() {
+        let dir = init_repo_with_origin("https://github.com/owner/repo");
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.remote("invalid", "not-a-url").unwrap();
+        let backend = GitBackend::discover_from(
+            dir.path(),
+            GitBackendPreference::Libgit2,
+            DiffWhitespaceMode::Normal,
+        )
+        .unwrap();
+        for name in ["missing", "invalid", "--all"] {
+            assert!(matches!(
+                resolve_remote_repository(&backend, name),
+                Err(TuicrError::Forge(_))
+            ));
+        }
+    }
 
     #[test]
     fn derives_git_repo_mode_from_config() {
@@ -518,6 +617,146 @@ mod tests {
             matches!(backend, GitBackend::Cli(_)),
             "split-index repo should use Git CLI backend, not libgit2"
         );
+    }
+
+    fn setup_object_format_repo(format: &str) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        run_git_command(dir.path(), &["init", &format!("--object-format={format}")]).unwrap();
+        setup_standard_repo(dir.path());
+        dir
+    }
+
+    #[test]
+    fn sha256_default_discovery_from_root_and_subdirectory_uses_cli() {
+        let dir = setup_object_format_repo("sha256");
+        for path in [dir.path().to_path_buf(), dir.path().join("src")] {
+            let backend = GitBackend::discover_from(
+                &path,
+                GitBackendPreference::Libgit2,
+                DiffWhitespaceMode::Normal,
+            )
+            .expect("SHA-256 repositories should open via the Git CLI");
+            assert!(matches!(backend, GitBackend::Cli(_)));
+            assert_eq!(backend.get_recent_commits(0, 10).unwrap()[0].id.len(), 64);
+        }
+    }
+
+    fn assert_root_diff_for_object_formats(target: &str) {
+        for format in ["sha1", "sha256"] {
+            let dir = setup_object_format_repo(format);
+            let backend = GitBackend::discover_from(
+                dir.path(),
+                GitBackendPreference::Cli,
+                DiffWhitespaceMode::Normal,
+            )
+            .unwrap();
+            let highlighter = SyntaxHighlighter::default();
+            let explicit = backend.resolve_revision_range("HEAD").unwrap();
+            let files = match target {
+                "explicit" => backend.get_commit_range_diff(&explicit, &highlighter),
+                "list" => backend.get_commit_range_diff(
+                    &ResolvedRevisionRange::from_owned_commit_ids(
+                        explicit.commit_ids.to_vec(),
+                        super::super::traits::RevisionDiffTarget::CommitList,
+                    ),
+                    &highlighter,
+                ),
+                "worktree" => {
+                    backend.get_working_tree_with_commits_diff(&explicit.commit_ids, &highlighter)
+                }
+                _ => unreachable!(),
+            }
+            .unwrap_or_else(|error| panic!("{format} {target} root diff failed: {error}"));
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].new_path, Some(PathBuf::from("src/file.txt")));
+            assert_eq!(files[0].status, FileStatus::Added);
+            assert!(
+                files[0]
+                    .hunks
+                    .iter()
+                    .flat_map(|h| &h.lines)
+                    .any(|l| l.content.contains("one"))
+            );
+        }
+    }
+
+    #[test]
+    fn sha256_ranges_worktree_changes_and_context_keep_full_commit_ids() {
+        let dir = setup_object_format_repo("sha256");
+        let root = dir.path();
+        let first = run_git_command(root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        fs::write(root.join("src/file.txt"), "one\ntwo\n").unwrap();
+        run_git_command(root, &["add", "."]).unwrap();
+        run_git_command(root, &["commit", "-m", "second"]).unwrap();
+        let second = run_git_command(root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let backend = GitBackend::discover_from(
+            root,
+            GitBackendPreference::Libgit2,
+            DiffWhitespaceMode::Normal,
+        )
+        .unwrap();
+        let highlighter = SyntaxHighlighter::default();
+        let range = backend
+            .resolve_revision_range(&format!("{first}..{second}"))
+            .unwrap();
+        assert_eq!(range.commit_ids.as_ref(), std::slice::from_ref(&second));
+        assert_eq!(
+            backend
+                .get_commits_info(&[first.clone(), second.clone()])
+                .unwrap()
+                .len(),
+            2
+        );
+        let files = backend.get_commit_range_diff(&range, &highlighter).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, FileStatus::Modified);
+        let context = backend
+            .fetch_context_lines(
+                Path::new("src/file.txt"),
+                FileStatus::Modified,
+                Some(&second),
+                1,
+                2,
+            )
+            .unwrap();
+        assert_eq!(context.len(), 2);
+        assert!(context[1].content.contains("two"));
+        fs::write(root.join("src/file.txt"), "one\ntwo\nstaged\n").unwrap();
+        run_git_command(root, &["add", "."]).unwrap();
+        fs::write(root.join("src/file.txt"), "one\ntwo\nstaged\nunstaged\n").unwrap();
+        assert_eq!(backend.get_staged_diff(&highlighter).unwrap().len(), 1);
+        assert_eq!(backend.get_unstaged_diff(&highlighter).unwrap().len(), 1);
+        assert_eq!(
+            backend.get_working_tree_diff(&highlighter).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            run_git_command(root, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim(),
+            second
+        );
+    }
+
+    #[test]
+    fn sha256_root_commit_explicit_diff() {
+        assert_root_diff_for_object_formats("explicit");
+    }
+
+    #[test]
+    fn sha256_root_commit_list_diff() {
+        assert_root_diff_for_object_formats("list");
+    }
+
+    #[test]
+    fn sha256_root_commit_with_worktree_diff() {
+        assert_root_diff_for_object_formats("worktree");
     }
 
     fn setup_standard_repo(root: &Path) {

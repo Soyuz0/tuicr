@@ -46,6 +46,8 @@ tuicr ado "https://dev.azure.com/ORG/PROJECT/_git/REPOSITORY/pullrequest/125"
 ```
 
 `ado` is explicit and does not change the existing `pr` or `mr` meanings.
+All three detect Azure PR URLs and support `--repo-url` or `--remote` to choose
+the repository explicitly. Diff loading still needs its matching local clone.
 The Pull Requests selector auto-detects Azure remotes and lists active PRs.
 Press `r` to switch between all active PRs and PRs where the current identity
 is a reviewer.
@@ -67,6 +69,8 @@ https://ORG.visualstudio.com/PROJECT/_git/REPOSITORY
 
 Organization, project, and repository path components are percent-decoded for
 Azure CLI and percent-encoded independently in persisted `ado:` session slugs.
+Upstream's `az:` slug prefix is accepted as an alias; this fork continues to emit
+`ado:` so existing saved PR reviews keep their identity.
 
 ## Diff Loading
 

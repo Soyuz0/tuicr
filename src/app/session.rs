@@ -21,38 +21,64 @@ impl App {
         }
     }
 
-    pub(in crate::app) fn reset_persisted_session_tracking(&mut self) {
-        self.session_path = crate::persistence::storage::session_path(&self.session).ok();
-        self.session_file_state = self
-            .session_path
+    pub(in crate::app) fn reset_persisted_session_tracking(&mut self) -> Result<()> {
+        let path = crate::persistence::storage::session_path(&self.session).ok();
+        let state = path
             .as_deref()
             .filter(|path| path.exists())
             .and_then(|path| SessionFileState::from_path(path).ok());
-        self.persisted_session_snapshot = self.session.clone();
+        let load_path = path.clone();
+        let current = self.session.clone();
+        self.observe_persisted_session(path, state, || {
+            match load_path.as_deref().filter(|path| path.exists()) {
+                Some(path) => crate::persistence::storage::load_session(path),
+                None => Ok(current),
+            }
+        })?;
         if let Err(e) = self.ensure_ephemeral_session_file() {
             self.set_warning(format!("Failed to initialize review session file: {e}"));
         }
+        Ok(())
     }
 
-    fn mark_session_saved(&mut self, path: PathBuf, saved: ReviewSession) {
+    fn mark_session_saved(&mut self, path: PathBuf, saved: ReviewSession) -> Result<()> {
         self.session = saved.clone();
-        self.persisted_session_snapshot = saved;
-        self.session_path = Some(path.clone());
-        self.session_file_state = SessionFileState::from_path(&path).ok();
+        let state = SessionFileState::from_path(&path).ok();
+        self.observe_persisted_session(Some(path), state, || Ok(saved))?;
         self.dirty = false;
+        Ok(())
     }
 
-    pub fn ensure_ephemeral_session_file(&mut self) -> Result<Option<PathBuf>> {
-        let path = match self.session_path.clone() {
-            Some(path) => path,
+    fn observe_persisted_session(
+        &mut self,
+        path: Option<PathBuf>,
+        state: Option<SessionFileState>,
+        load: impl FnOnce() -> Result<ReviewSession>,
+    ) -> Result<()> {
+        self.session_path = path;
+        self.session_file_state = state;
+        self.persisted_session_snapshot = load()?;
+        Ok(())
+    }
+
+    fn session_path_or_resolve(&mut self) -> Result<PathBuf> {
+        match self.session_path.clone() {
+            Some(path) => Ok(path),
             None => {
                 let path = crate::persistence::storage::session_path(&self.session)?;
                 self.session_path = Some(path.clone());
-                path
+                Ok(path)
             }
-        };
+        }
+    }
+
+    pub fn ensure_ephemeral_session_file(&mut self) -> Result<Option<PathBuf>> {
+        let path = self.session_path_or_resolve()?;
 
         if path.exists() {
+            if self.session.pr_session_key.is_some() {
+                crate::persistence::storage::reindex_session(&self.session)?;
+            }
             if self.ephemeral_session_paths.contains(&path) {
                 let saved_path = self.save_current_session_merging_external()?;
                 return Ok(Some(saved_path));
@@ -120,10 +146,30 @@ impl App {
                 merged.updated_at = Utc::now();
                 Ok((merged, ()))
             })?;
-        self.mark_session_saved(path.clone(), saved);
+        self.mark_session_saved(path.clone(), saved)?;
         self.mark_current_session_active_at(&path);
         self.rebuild_annotations();
         Ok(path)
+    }
+
+    pub(in crate::app) fn persist_diff_reconciliation(
+        &mut self,
+        diff_files: &[DiffFile],
+    ) -> Result<()> {
+        let identity = self.session.clone();
+        let base = self.persisted_session_snapshot.clone();
+        let (path, saved, ()) =
+            crate::persistence::storage::save_session_by_identity(&identity, |persisted| {
+                let mut saved = persisted.unwrap_or_else(|| base.clone());
+                saved.reconcile_diff_files(diff_files);
+                saved.updated_at = Utc::now();
+                Ok((saved, ()))
+            })?;
+        Self::merge_external_session_changes(&mut self.session, &base, &saved);
+        let state = SessionFileState::from_path(&path).ok();
+        self.observe_persisted_session(Some(path.clone()), state, || Ok(saved))?;
+        self.mark_current_session_active_at(&path);
+        Ok(())
     }
 
     fn mark_current_session_active_at(&mut self, path: &Path) {
@@ -151,9 +197,8 @@ impl App {
             return false;
         }
 
-        match self.reload_persisted_session_if_changed(false) {
-            Ok(0) => false,
-            Ok(_) => true,
+        match self.reload_persisted_session(false) {
+            Ok(reload) => reload.changed > 0,
             Err(err) => {
                 self.set_warning(format!("Review reload failed: {err}"));
                 true
@@ -173,26 +218,26 @@ impl App {
             || self.pr_submit_rx.is_some()
     }
 
+    /// Merge external edits to the persisted session. Returns how many
+    /// comments were added.
     pub fn reload_persisted_session_if_changed(&mut self, force: bool) -> Result<usize> {
-        let path = match self.session_path.clone() {
-            Some(path) => path,
-            None => match crate::persistence::storage::session_path(&self.session) {
-                Ok(path) => {
-                    self.session_path = Some(path.clone());
-                    path
-                }
-                Err(_) => return Ok(0),
-            },
+        Ok(self.reload_persisted_session(force)?.added)
+    }
+
+    fn reload_persisted_session(&mut self, force: bool) -> Result<PersistedReload> {
+        let path = match self.session_path_or_resolve() {
+            Ok(path) => path,
+            Err(_) => return Ok(PersistedReload::default()),
         };
 
         if !path.exists() {
             self.session_file_state = None;
-            return Ok(0);
+            return Ok(PersistedReload::default());
         }
 
         let state = SessionFileState::from_path(&path)?;
         if !force && self.session_file_state == Some(state) {
-            return Ok(0);
+            return Ok(PersistedReload::default());
         }
 
         let latest = crate::persistence::storage::load_session(&path)?;
@@ -202,13 +247,15 @@ impl App {
             &self.persisted_session_snapshot,
             &latest,
         );
-        self.persisted_session_snapshot = latest;
-        self.session_file_state = Some(state);
+        self.observe_persisted_session(Some(path), Some(state), || Ok(latest))?;
         if changed > 0 {
             self.rebuild_annotations();
         }
         let after_count = Self::comment_count(&self.session);
-        Ok(after_count.saturating_sub(before_count))
+        Ok(PersistedReload {
+            added: after_count.saturating_sub(before_count),
+            changed,
+        })
     }
 
     pub(in crate::app) fn merge_external_session_changes(
@@ -373,18 +420,18 @@ impl App {
                 return true;
             }
 
-            let mut emptied_line = None;
+            let mut removed_from_line = None;
             for (line, comments) in &mut review.line_comments {
                 if let Some(index) = comments.iter().position(|comment| comment.id == id) {
                     comments.remove(index);
-                    if comments.is_empty() {
-                        emptied_line = Some(*line);
-                    }
+                    removed_from_line = Some((*line, comments.is_empty()));
                     break;
                 }
             }
-            if let Some(line) = emptied_line {
-                review.line_comments.remove(&line);
+            if let Some((line, emptied)) = removed_from_line {
+                if emptied {
+                    review.line_comments.remove(&line);
+                }
                 return true;
             }
         }
@@ -566,11 +613,13 @@ impl App {
     ) -> Result<crate::forge::pr_open::OpenedPullRequest> {
         self.save_current_session_merging_external()?;
         let previous_session = self.session.clone();
+        let mut fresh_session = opened.session.clone();
+        self.seed_configured_visibility(&mut fresh_session);
         let session = match Self::load_pr_session_for_opened(&opened)? {
             Some(session) => session,
             None => Self::reviewed_state_carried_forward(
                 &previous_session,
-                opened.session.clone(),
+                fresh_session,
                 &opened.diff_files,
             ),
         };
@@ -670,4 +719,14 @@ impl App {
             })
             .collect()
     }
+}
+
+/// What [`App::reload_persisted_session`] merged from disk.
+#[derive(Debug, Default, Clone, Copy)]
+struct PersistedReload {
+    /// Comments added by another writer.
+    added: usize,
+    /// Every merged change, including external deletions and edits, which
+    /// need a redraw even though they add nothing.
+    changed: usize,
 }

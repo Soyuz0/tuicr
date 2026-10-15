@@ -527,6 +527,7 @@ mod tests {
             counterpart_line: None,
             start_line: Some(7),
             start_side: Some(GhSide::Right),
+            range_anchors: None,
             old_path: None,
             file_level: false,
             body: "comment".to_string(),

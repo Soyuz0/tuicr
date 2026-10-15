@@ -24,7 +24,7 @@ pub fn parse_azure_devops_remote_url(remote_url: &str) -> Option<ForgeRepository
         return repository_from_ssh_path(path);
     }
 
-    let rest = strip_prefix_ignore_ascii_case(original, "https://")?;
+    let rest = strip_prefix_ignore_ascii_case(original, "https://").unwrap_or(original);
     let (authority, path) = rest.split_once('/')?;
     let host = authority
         .rsplit_once('@')
@@ -121,7 +121,11 @@ fn repository_from_visual_studio_path(
     path: &str,
 ) -> Option<ForgeRepository> {
     let parts = decode_path(path)?;
-    let [project, git_segment, repository] = parts.as_slice() else {
+    let parts = match parts.as_slice() {
+        [collection, rest @ ..] if collection.eq_ignore_ascii_case("DefaultCollection") => rest,
+        _ => parts.as_slice(),
+    };
+    let [project, git_segment, repository] = parts else {
         return None;
     };
     if git_segment != "_git" {

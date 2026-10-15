@@ -20,7 +20,7 @@ use crate::forge::traits::{
     PullRequestListQuery, PullRequestListScope, PullRequestReviewMetadata, PullRequestReviewRecord,
     PullRequestTarget, ReviewSubmissionOutcome,
 };
-use crate::model::DiffLine;
+use crate::model::{DiffLine, FilePatch};
 use crate::process::{run_command_output, run_command_output_bytes_with_stdin};
 use crate::vcs::slice_context_lines;
 
@@ -492,7 +492,7 @@ where
         pr: &PullRequestDetails,
         start_sha: &str,
         end_sha: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<FilePatch>> {
         let root = self
             .local_checkout
             .as_deref()
@@ -538,19 +538,30 @@ where
         // `end_sha`, so the merge base is `start_sha` and this is equivalent to
         // the two-dot form.
         let range = format!("{start_sha}...{end_sha}");
-        run_git(
-            root,
-            &[
+        let output = run_command_output_bytes_with_stdin(
+            &git_executable(),
+            Some(root),
+            [
                 "diff",
                 "--no-ext-diff",
+                "--raw",
+                "-z",
+                "--patch",
                 "--binary",
                 "--no-color",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
                 &range,
             ],
+            &[],
         )
-        .map_err(|error| TuicrError::Forge(format!("Azure DevOps local Git diff failed: {error}")))
+        .map_err(|error| {
+            TuicrError::Forge(format!(
+                "Azure DevOps local Git diff failed: {}",
+                error.stderr
+            ))
+        })?;
+        crate::vcs::git::raw::parse_raw_patch_output(&output)
     }
 
     /// Resolve the merge base that the diff's `a/` side actually refers to.
@@ -665,34 +676,33 @@ where
                 )));
             }
         }
-        let mut details = pull_request.into_details(&repository)?;
-        // Azure reports the target branch tip as the base; the diff is actually
-        // taken from the merge base. Record the merge base so `base_sha` names
-        // the revision the diff's `a/` side really is, matching GitLab's
-        // `diff_refs.base_sha` semantics.
-        if let Some(merge_base) = self.resolve_merge_base(&details) {
-            details.base_sha = merge_base;
-        }
-        Ok(details)
+        pull_request.into_details(&repository)
     }
 
-    fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<String> {
+    fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<Vec<FilePatch>> {
         self.immutable_diff(pr, &pr.base_sha, &pr.head_sha)
+    }
+
+    fn resolve_diff_base_sha(&self, pr: &PullRequestDetails) -> Option<String> {
+        self.resolve_merge_base(pr)
     }
 
     fn fetch_file_lines(&self, request: ForgeFileLinesRequest) -> Result<Vec<DiffLine>> {
         if request.start_line == 0 || request.start_line > request.end_line {
             return Ok(Vec::new());
         }
-        let content = self
-            .local_content(&request)
-            .map(Ok)
-            .unwrap_or_else(|| self.fetch_item(&request))?;
+        let content = self.fetch_file_content(request.clone())?;
         Ok(slice_context_lines(
             &content,
             request.start_line,
             request.end_line,
         ))
+    }
+
+    fn fetch_file_content(&self, request: ForgeFileLinesRequest) -> Result<String> {
+        self.local_content(&request)
+            .map(Ok)
+            .unwrap_or_else(|| self.fetch_item(&request))
     }
 
     fn file_line_count(&self, request: ForgeFileLinesRequest) -> Result<u32> {
@@ -815,7 +825,7 @@ where
         pr: &PullRequestDetails,
         start_sha: &str,
         end_sha: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<FilePatch>> {
         self.immutable_diff(pr, start_sha, end_sha)
     }
 
@@ -1414,7 +1424,8 @@ mod tests {
     /// reversed changes. On a real 40-file PR that produced 167 files.
     #[cfg(unix)]
     #[test]
-    fn pr_diff_excludes_target_branch_commits_after_divergence() {
+    fn pr_diff_preserves_exact_paths_and_excludes_target_branch_commits() {
+        let _lock = crate::process::TEST_ENV_LOCK.lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let checkout = directory.path().join("checkout");
         std::fs::create_dir(&checkout).unwrap();
@@ -1446,10 +1457,15 @@ mod tests {
 
         // Shared history, then the branch and the target diverge.
         let root = commit(None, &[("shared.txt", "shared\n")]);
-        // The PR touches only `feature.txt`.
+        // Git appends a delimiter tab to the space-containing name's display
+        // header, and quotes the literal tab. Neither may change file identity.
         let head = commit(
             Some(root),
-            &[("shared.txt", "shared\n"), ("feature.txt", "feature\n")],
+            &[
+                ("shared.txt", "shared\n"),
+                ("deep-research-report (28).md", "feature\n"),
+                ("literal\tname.txt", "tabbed name\n"),
+            ],
         );
         // Meanwhile the target branch gains an unrelated file and edits another.
         let target = commit(
@@ -1468,17 +1484,18 @@ mod tests {
 
         let diff = backend.get_pull_request_diff(&pr).unwrap();
         let changed: Vec<&str> = diff
-            .lines()
-            .filter_map(|line| line.strip_prefix("+++ b/"))
+            .iter()
+            .map(|file| file.display_path().unwrap().to_str().unwrap())
             .collect();
         assert_eq!(
             changed,
-            ["feature.txt"],
-            "only the PR's own change may appear; got diff:\n{diff}"
+            ["deep-research-report (28).md", "literal\tname.txt"],
+            "only the PR's own change may appear; got diff:\n{diff:?}"
         );
         assert!(
-            !diff.contains("other.txt") && !diff.contains("changed on target"),
-            "target-branch commits must not leak into the PR diff:\n{diff}"
+            diff.iter()
+                .all(|file| !file.patch.contains("changed on target")),
+            "target-branch commits must not leak into the PR diff:\n{diff:?}"
         );
 
         // `base_sha` must name the merge base, so base-side context expansion
@@ -1487,6 +1504,18 @@ mod tests {
             backend.resolve_merge_base(&pr).as_deref(),
             Some(root.to_string().as_str())
         );
+
+        let files = crate::vcs::diff_parser::parse_file_patches(
+            diff,
+            &crate::syntax::SyntaxHighlighter::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            files[0].display_path(),
+            Path::new("deep-research-report (28).md")
+        );
+        assert_eq!(files[1].display_path(), Path::new("literal\tname.txt"));
+        assert_eq!(files[0].hunks[0].lines[0].content, "feature");
     }
 
     /// End-to-end check of the batched path against real `git cat-file --batch`
@@ -1834,6 +1863,7 @@ if [ "$1" = "fetch" ]; then
   touch "$TUICR_GIT_STATE"
 fi
 if [ "$1" = "diff" ]; then
+  printf ':100644 100644 aaaaaaa bbbbbbb M\000file.txt\000\000'
   printf 'diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n'
 fi
 "#,
@@ -1884,7 +1914,9 @@ fi
             restore_env("TUICR_GIT_STATE", previous_state);
         }
 
-        assert!(diff.contains("diff --git a/file.txt b/file.txt"));
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].display_path(), Some(Path::new("file.txt")));
+        assert!(diff[0].patch.contains("diff --git a/file.txt b/file.txt"));
         let log = fs::read_to_string(log).unwrap();
         let calls = log
             .lines()
@@ -1915,6 +1947,9 @@ fi
             [
                 "diff",
                 "--no-ext-diff",
+                "--raw",
+                "-z",
+                "--patch",
                 "--binary",
                 "--no-color",
                 "--src-prefix=a/",

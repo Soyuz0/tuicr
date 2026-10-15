@@ -266,7 +266,9 @@ fn generate_markdown(
 ) -> String {
     let mut md = String::new();
 
-    if let Some(slug) = session_slug {
+    // The slug names the session an agent should write comments back into.
+    // `session_header = false` drops it for agents that read it as noise.
+    if let Some(slug) = session_slug.filter(|_| export.session_header()) {
         let _ = writeln!(md, "## Session: {slug}");
         let _ = writeln!(md);
     }
@@ -470,11 +472,7 @@ fn generate_markdown(
             if local_section_written {
                 let _ = writeln!(md);
             }
-            let forge = match pr.key.repository.kind {
-                crate::forge::traits::ForgeKind::GitHub => "GitHub",
-                crate::forge::traits::ForgeKind::GitLab => "GitLab",
-                crate::forge::traits::ForgeKind::AzureDevOps => "Azure DevOps",
-            };
+            let forge = pr.key.repository.kind.display_name();
             let remote_header = export.remote_comments_header().replace("{forge}", forge);
             if !remote_header.is_empty() {
                 let _ = writeln!(md, "{remote_header}");
@@ -873,6 +871,30 @@ mod tests {
         assert!(
             markdown.contains("## Session: agavra/tuicr@main/worktree"),
             "expected slug header in:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn should_omit_session_slug_header_when_disabled_by_config() {
+        let session = create_test_session();
+        let diff_source = DiffSource::WorkingTree;
+        let export = ExportConfig {
+            session_header: Some(false),
+            ..ExportConfig::default()
+        };
+
+        let markdown = generate_markdown(
+            &session,
+            &diff_source,
+            &comment_types(),
+            &export,
+            &[],
+            Some("agavra/tuicr@main/worktree"),
+        );
+
+        assert!(
+            !markdown.contains("## Session:"),
+            "expected no slug header in:\n{markdown}"
         );
     }
 

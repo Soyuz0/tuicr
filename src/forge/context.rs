@@ -238,7 +238,7 @@ mod tests {
         ForgeFileSide, PagedPullRequests, PullRequestDetails, PullRequestListQuery,
         PullRequestTarget,
     };
-    use crate::model::LineOrigin;
+    use crate::model::{FilePatch, LineOrigin};
     use std::cell::RefCell;
 
     struct CapturingForge {
@@ -253,7 +253,10 @@ mod tests {
         fn get_pull_request(&self, _target: PullRequestTarget) -> Result<PullRequestDetails> {
             unimplemented!()
         }
-        fn get_pull_request_diff(&self, _pr: &PullRequestDetails) -> Result<String> {
+        fn get_pull_request_diff(
+            &self,
+            _pr: &PullRequestDetails,
+        ) -> Result<Vec<crate::model::FilePatch>> {
             unimplemented!()
         }
         fn fetch_file_lines(&self, request: ForgeFileLinesRequest) -> Result<Vec<DiffLine>> {
@@ -277,7 +280,7 @@ mod tests {
             _pr: &PullRequestDetails,
             _start_sha: &str,
             _end_sha: &str,
-        ) -> Result<String> {
+        ) -> Result<Vec<crate::model::FilePatch>> {
             unimplemented!()
         }
         fn create_review(
@@ -302,7 +305,7 @@ mod tests {
         fn get_pull_request(&self, _target: PullRequestTarget) -> Result<PullRequestDetails> {
             unimplemented!()
         }
-        fn get_pull_request_diff(&self, _pr: &PullRequestDetails) -> Result<String> {
+        fn get_pull_request_diff(&self, _pr: &PullRequestDetails) -> Result<Vec<FilePatch>> {
             unimplemented!()
         }
         fn fetch_file_lines(&self, _request: ForgeFileLinesRequest) -> Result<Vec<DiffLine>> {
@@ -331,7 +334,7 @@ mod tests {
             _pr: &PullRequestDetails,
             _start_sha: &str,
             _end_sha: &str,
-        ) -> Result<String> {
+        ) -> Result<Vec<FilePatch>> {
             unimplemented!()
         }
         fn create_review(

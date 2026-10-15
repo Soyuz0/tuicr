@@ -1,5 +1,17 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+struct PrDisplayOptions {
+    show_checks: bool,
+    show_comments: bool,
+    comments_visibility: Option<crate::forge::remote_comments::PrCommentsVisibility>,
+}
+
+struct PrTarget<'a> {
+    value: &'a str,
+    kind: crate::forge::traits::PullRequestTargetKind,
+}
+
 impl App {
     pub fn new(
         theme: Theme,
@@ -11,14 +23,21 @@ impl App {
         // selector. Errors here surface before TUI startup like other
         // startup failures.
         if let Some(target) = options.pr_target {
-            return Self::new_from_pr_target(
+            return Self::new_from_pr_target_with_pr_display_options(
                 theme,
                 comment_type_configs,
                 output_to_stdout,
-                target,
-                options.pr_target_kind,
+                PrTarget {
+                    value: target,
+                    kind: options.pr_target_kind,
+                },
                 options.repo_url_override.clone(),
                 options.commit_selection,
+                PrDisplayOptions {
+                    show_checks: options.show_pr_checks,
+                    show_comments: options.show_pr_comments,
+                    comments_visibility: options.pr_comments_visibility,
+                },
             );
         }
 
@@ -124,7 +143,10 @@ impl App {
         }
 
         let vcs = crate::profile::time("startup.detect_vcs", || {
-            detect_vcs(options.git_backend_preference, options.diff_whitespace_mode)
+            detect_vcs(
+                options.git_backend_preference,
+                options.diff_whitespace_mode.clone(),
+            )
         })?;
         let vcs_info = vcs.info().clone();
         let highlighter =
@@ -196,7 +218,8 @@ impl App {
                     Vec::new(),
                     options.path_filter,
                     options.repo_url_override.clone(),
-                )?;
+                )?
+                .with_vcs_open_options(options.vcs_open_options());
 
                 app.range_diff_files = Some(app.diff_files.clone());
                 app.commit_list = all_commits.clone();
@@ -257,7 +280,8 @@ impl App {
                 Vec::new(),
                 options.path_filter,
                 options.repo_url_override.clone(),
-            )?;
+            )?
+            .with_vcs_open_options(options.vcs_open_options());
 
             // Set up inline commit selector for multi-commit reviews
             if review_commits.len() > 1 {
@@ -314,7 +338,8 @@ impl App {
                 Vec::new(),
                 options.path_filter,
                 options.repo_url_override.clone(),
-            )?;
+            )?
+            .with_vcs_open_options(options.vcs_open_options());
 
             Ok(app)
         } else {
@@ -384,12 +409,20 @@ impl App {
                 commit_list,
                 options.path_filter,
                 options.repo_url_override.clone(),
-            )?;
+            )?
+            .with_vcs_open_options(options.vcs_open_options());
 
             app.has_more_commit = commits.len() >= VISIBLE_COMMIT_COUNT;
             app.visible_commit_count = app.commit_list.len();
             Ok(app)
         }
+    }
+
+    /// Records how `detect_vcs` opened the backend, so the diff-watch worker
+    /// can open its own the same way.
+    fn with_vcs_open_options(mut self, vcs_open_options: VcsOpenOptions) -> Self {
+        self.vcs_open_options = vcs_open_options;
+        self
     }
 
     /// Shared constructor: all `App::new` paths converge here.
@@ -412,6 +445,7 @@ impl App {
         path_filter: Option<&str>,
         repo_url_override: Option<ForgeRepository>,
     ) -> Result<Self> {
+        let persisted_session_snapshot = session.clone();
         // Ensure all diff files are registered in the session. Persisted PR
         // subsets hydrate through the full PR diff first; keep subset-specific
         // hunk keys alive until the selected diff is loaded.
@@ -426,6 +460,12 @@ impl App {
             commit_list.len()
         };
 
+        // PR sources arrive with a synthetic `forge:host/owner/repo` root, so
+        // there is no on-disk root to record here. `new_from_pr_target` fills
+        // it in from the launch directory after this returns.
+        let local_repo_root = (!matches!(diff_source, DiffSource::PullRequest(_)))
+            .then(|| vcs_info.root_path.clone());
+
         let comment_types = Self::resolve_comment_types(comment_type_configs);
         let default_comment_type = Self::first_comment_type(&comment_types);
         let session_path = crate::persistence::storage::session_path(&session).ok();
@@ -433,12 +473,11 @@ impl App {
             .as_deref()
             .filter(|path| path.exists())
             .and_then(|path| SessionFileState::from_path(path).ok());
-        let persisted_session_snapshot = session.clone();
-
         let mut app = Self {
             theme,
             vcs,
             vcs_info,
+            local_repo_root,
             session,
             persisted_session_snapshot,
             session_path,
@@ -446,26 +485,47 @@ impl App {
             review_watch_interval: Some(Duration::from_millis(DEFAULT_REVIEW_WATCH_INTERVAL_MS)),
             next_review_watch_at: Instant::now()
                 + Duration::from_millis(DEFAULT_REVIEW_WATCH_INTERVAL_MS),
+            diff_watch_interval: None,
+            next_diff_watch_at: Instant::now(),
+            last_diff_watch_error: None,
+            diff_watch_reload: None,
+            vcs_open_options: VcsOpenOptions::default(),
             ephemeral_session_paths: HashSet::new(),
             diff_files,
             diff_source,
             pending_editor_target: None,
+            editor_override: None,
+            editor_launches: Vec::new(),
             input_mode,
             focused_panel: FocusedPanel::Diff,
             diff_view_mode: DiffViewMode::Unified,
             relative_line_numbers: false,
+            wrap_style: WrapStyle::default(),
+            cursor_side: LineSide::New,
             file_list_state: FileListState::default(),
             comment_navigator_state: CommentNavigatorState::default(),
             diff_state: DiffState::default(),
             help_state: HelpState::default(),
+            summary_state: SummaryState::default(),
+            file_filter: FileTreeFilter::default(),
+            theme_picker: ThemePickerState::default(),
             command_buffer: String::new(),
             command_completion: None,
+            command_return_mode: InputMode::Normal,
             search_buffer: String::new(),
             last_search_pattern: None,
+            diff_search_pattern: None,
+            search_matches: Vec::new(),
+            search_matches_stale: false,
+            search_highlight_visible: false,
+            search_highlight_enabled: true,
             search_return_mode: InputMode::Normal,
+            overlay_return_mode: InputMode::Normal,
             comment_buffer: String::new(),
             comment_cursor: 0,
+            comment_preferred_column: None,
             comment_vim_enabled: false,
+            q_quits: false,
             comment_tab_width: 4,
             comment_vim_editor: None,
             comment_vim_command: None,
@@ -495,6 +555,8 @@ impl App {
             pr_list_viewport_height: 0,
             pr_list_inner_area: None,
             pr_filter_draft: None,
+            sessions_tab: crate::app::sessions_tab::SessionsTab::default(),
+            sessions_list_viewport_height: 0,
             pr_load_rx: None,
             pr_open_state: None,
             pr_open_rx: None,
@@ -514,6 +576,8 @@ impl App {
             pr_submit_rx: None,
             current_pr_head: None,
             pr_info: None,
+            show_pr_checks: false,
+            show_pr_comments: true,
             should_quit: false,
             dirty: false,
             quit_warned: false,
@@ -521,8 +585,11 @@ impl App {
             pending_confirm: None,
             supports_keyboard_enhancement: false,
             show_file_list: true,
+            compact_folders: false,
             is_pristine_mode: false,
             is_single_file_view: false,
+            revealed_reviewed_file: None,
+            revealed_reviewed_hunk: None,
             primed_walk_next: false,
             primed_walk_prev: false,
             down_released_since_arm: false,
@@ -543,12 +610,14 @@ impl App {
             expanded_bottom: HashMap::new(),
             file_line_count_cache: HashMap::new(),
             line_annotations: Vec::new(),
+            colored_hunks: HashSet::new(),
             output_to_stdout,
             pending_stdout_output: None,
             comment_cursor_screen_pos: None,
             comment_input_annotation_offset: None,
             update_info: None,
             pending_count: None,
+            pending_start_line: None,
             review_commits: Vec::new(),
             pr_commits: Vec::new(),
             pr_last_reviewed_commit_index: None,
@@ -557,6 +626,7 @@ impl App {
             show_commit_selector: false,
             commit_order: CommitOrder::default(),
             commit_selection_start: CommitSelectionStart::default(),
+            initial_comments_visibility: None,
             commit_diff_cache: HashMap::new(),
             range_diff_files: None,
             saved_inline_selection: None,
@@ -580,7 +650,7 @@ impl App {
     /// Lazily called during startup — running this synchronously is fine
     /// because it only reads local config, never the network.
     fn detect_forge_repository(&mut self) {
-        // `--repo-url` short-circuits detection: the user has told us
+        // An explicit repository override short-circuits detection: the user has told us
         // exactly which repo to target, so skip both the local-remote
         // probe and the `gh api` parent lookup that runs on PR-tab entry.
         if let Some(override_repo) = self.repo_url_override.clone() {
@@ -758,25 +828,60 @@ impl App {
         repo_url_override: Option<ForgeRepository>,
         commit_selection: CommitSelectionStart,
     ) -> Result<Self> {
+        Self::new_from_pr_target_with_pr_display_options(
+            theme,
+            comment_type_configs,
+            output_to_stdout,
+            PrTarget {
+                value: target,
+                kind: target_kind,
+            },
+            repo_url_override,
+            commit_selection,
+            PrDisplayOptions {
+                show_checks: false,
+                show_comments: true,
+                comments_visibility: None,
+            },
+        )
+    }
+
+    fn new_from_pr_target_with_pr_display_options(
+        theme: Theme,
+        comment_type_configs: Option<Vec<CommentTypeConfig>>,
+        output_to_stdout: bool,
+        target: PrTarget<'_>,
+        repo_url_override: Option<ForgeRepository>,
+        commit_selection: CommitSelectionStart,
+        display_options: PrDisplayOptions,
+    ) -> Result<Self> {
+        use crate::forge::azure_devops::remote::parse_pull_request_target_azure_devops;
+        use crate::forge::bitbucket::bkt::parse_pull_request_target_bitbucket;
+        use crate::forge::gerrit::api::parse_pull_request_target_gerrit;
+        use crate::forge::gitea::tea::parse_pull_request_target_gitea;
         use crate::forge::github::gh::parse_pull_request_target;
         use crate::forge::gitlab::glab::parse_pull_request_target_gitlab;
         use crate::forge::pr_open::open_pull_request;
         use crate::forge::traits::ForgeKind;
         use crate::forge::traits::PullRequestTargetKind;
 
-        // Try GitHub-style target first (numeric, GitHub URL, owner/repo#N).
-        // If it embeds a GitLab URL, the GitLab parser picks it up.
+        let PrTarget {
+            value: target,
+            kind: target_kind,
+        } = target;
         let parsed = match target_kind {
-            PullRequestTargetKind::Auto => parse_pull_request_target(target)
+            PullRequestTargetKind::Auto => parse_pull_request_target_bitbucket(target)
+                .or_else(|_| parse_pull_request_target_gitea(target))
+                .or_else(|_| parse_pull_request_target_azure_devops(target))
+                .or_else(|_| parse_pull_request_target_gerrit(target))
+                .or_else(|_| parse_pull_request_target(target))
                 .or_else(|_| parse_pull_request_target_gitlab(target))?,
-            PullRequestTargetKind::AzureDevOps => {
-                crate::forge::azure_devops::remote::parse_pull_request_target_azure_devops(target)?
-            }
+            PullRequestTargetKind::AzureDevOps => parse_pull_request_target_azure_devops(target)?,
         };
 
         // Resolution order when the target lacks an explicit repo
         // (`tuicr pr 125`):
-        //   1. `--repo-url` override (explicit user intent; no I/O)
+        //   1. resolved `--repo-url` or `--remote` override
         //   2. canonical of the local `origin` (gh api parent lookup —
         //      so `tuicr pr 125` from a fork checkout opens the PR on
         //      the upstream, matching the PR-tab behavior)
@@ -787,17 +892,6 @@ impl App {
         let detected_repo = local_repo_root
             .as_deref()
             .and_then(crate::forge::detect_forge_repository);
-        if target_kind == PullRequestTargetKind::AzureDevOps
-            && detected_repo
-                .as_ref()
-                .is_some_and(|repo| repo.kind != ForgeKind::AzureDevOps)
-            && parsed.repository.is_none()
-        {
-            return Err(TuicrError::Forge(
-                "tuicr ado <number> requires an Azure Repos checkout. A full PR URL can disambiguate the repository, but diff loading still requires its matching checkout."
-                    .to_string(),
-            ));
-        }
 
         // Canonical resolution (fork parent lookup) only works for GitHub.
         let canonical_repo = detected_repo.as_ref().and_then(|origin| {
@@ -831,6 +925,15 @@ impl App {
                 TuicrError::Forge(message.to_string())
             })?;
 
+        if target_kind == PullRequestTargetKind::AzureDevOps
+            && target_repo.kind != ForgeKind::AzureDevOps
+        {
+            return Err(TuicrError::Forge(
+                "tuicr ado requires an Azure DevOps repository; use an Azure remote, --repo-url, or a full Azure PR URL"
+                    .to_string(),
+            ));
+        }
+
         // Use the local checkout for `.tuicrignore` only when it matches the
         // PR's target repository — using a foreign repo's checkout would
         // mis-filter the PR diff.
@@ -838,14 +941,24 @@ impl App {
             .as_deref()
             .and_then(|root| crate::forge::local_checkout_for_repo(root, &target_repo));
 
-        let backend = create_forge_backend(&target_repo, local_checkout_for_target.clone());
+        let backend = create_forge_backend(
+            &target_repo,
+            local_checkout_for_target.clone(),
+            display_options.show_checks,
+            display_options.show_comments,
+        );
         let highlighter = theme.syntax_highlighter();
-        let opened = open_pull_request(
+        let mut opened = open_pull_request(
             backend.as_ref(),
             parsed,
             local_checkout_for_target.as_deref(),
             highlighter,
         )?;
+        // Seed before the persisted-session restore, which replaces the
+        // fresh session wholesale, so a saved visibility always wins.
+        if let Some(visibility) = display_options.comments_visibility {
+            opened.session.remote_comments_visibility = visibility;
+        }
         let opened = Self::opened_pr_with_persisted_session(opened)?;
 
         let pr_source = PullRequestDiffSource::from_details(&opened.details);
@@ -879,7 +992,13 @@ impl App {
             None,
             repo_url_override,
         )?;
+        app.show_pr_checks = display_options.show_checks;
+        app.show_pr_comments = display_options.show_comments;
 
+        // `build` sees the PR's synthetic root, so record the real launch
+        // directory here — PRs opened later from the PR tab resolve their
+        // local checkout from it.
+        app.local_repo_root = local_repo_root;
         // Wire the forge backend so context expansion routes through it.
         app.forge_backend = Some(backend);
         app.forge_repository = Some(target_repo);

@@ -1,6 +1,15 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long after launch a windowed editor's exit still counts as a launch
+/// failure worth reporting.
+///
+/// A launcher that cannot reach its application dies within a moment. An
+/// editor that exits later was in the user's hands, and its exit code is not
+/// something tuicr should interrupt the review with.
+const LAUNCH_FAILURE_WINDOW: Duration = Duration::from_secs(5);
 
 /// Source location tuicr can hand off to an external editor.
 ///
@@ -8,10 +17,15 @@ use std::process::{Command, ExitStatus};
 /// suspend/resume code does not need to know about repository-relative paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorTarget {
-    /// Absolute path to the local worktree file.
+    /// Absolute path handed to the editor: the local worktree file, or in PR
+    /// review a read-only snapshot of the reviewed revision.
     pub path: PathBuf,
     /// One-based source line to request from editors that support it.
     pub line: Option<u32>,
+    /// What the status bar calls the opened file. A snapshot lives at a
+    /// temp-dir path nobody wants to read, so the App supplies the repository
+    /// path here, plus the revision when it is not the worktree's.
+    pub label: String,
 }
 
 /// Fully expanded editor invocation.
@@ -27,13 +41,14 @@ pub struct EditorCommand {
 }
 
 impl EditorCommand {
-    /// Builds an invocation from `$EDITOR`.
+    /// Builds an invocation from the configured editor.
+    /// Builds an invocation from `$EDITOR` or the config `editor` override.
     ///
     /// An unset, empty, or unparsable value falls back to `vi` so the caller
     /// always gets a concrete command to run.
-    pub fn from_env(target: &EditorTarget) -> Self {
-        let editor = std::env::var("EDITOR").unwrap_or_default();
-        Self::from_editor(&editor, target)
+    pub fn from_env(editor_override: Option<&str>, target: &EditorTarget) -> Self {
+        let env_editor = std::env::var("EDITOR").unwrap_or_default();
+        Self::from_editor(&resolve_editor(editor_override, &env_editor), target)
     }
 
     /// Builds an invocation from an editor command string.
@@ -75,6 +90,148 @@ impl EditorCommand {
     pub fn run(&self) -> std::io::Result<std::process::ExitStatus> {
         Command::new(&self.program).args(&self.args).status()
     }
+
+    /// Runs the prepared editor command with stdin/stdout/stderr re-attached
+    /// to the controlling terminal at `/dev/tty`.
+    ///
+    /// Needed when tuicr was launched with `--stdout`: its own stdout is a
+    /// file or pipe, and a terminal editor spawned via `.status()` would
+    /// inherit that non-TTY stdout and refuse to render (e.g. vim's
+    /// "Output is not to a terminal" warning). The TUI itself already draws
+    /// on `/dev/tty` in that mode, so pointing the editor at the same device
+    /// is safe.
+    ///
+    /// On non-Unix targets `/dev/tty` doesn't exist, so this falls back to
+    /// [`Self::run`].
+    pub fn run_on_tty(&self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            let stdin = OpenOptions::new().read(true).open("/dev/tty")?;
+            let stdout = OpenOptions::new().write(true).open("/dev/tty")?;
+            let stderr = OpenOptions::new().write(true).open("/dev/tty")?;
+            Command::new(&self.program)
+                .args(&self.args)
+                .stdin(Stdio::from(stdin))
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr))
+                .status()
+        }
+        #[cfg(not(unix))]
+        {
+            self.run()
+        }
+    }
+
+    /// Spawns the prepared editor command without waiting for it to exit.
+    ///
+    /// Standard streams are detached so a chatty editor cannot write over the
+    /// TUI, which stays on screen for the whole handoff. The caller polls the
+    /// returned handle so the finished process gets cleaned up.
+    pub fn spawn_detached(&self) -> std::io::Result<EditorLaunch> {
+        let child = Command::new(&self.program)
+            .args(&self.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(EditorLaunch {
+            child,
+            started: Instant::now(),
+        })
+    }
+
+    /// Whether this invocation needs the terminal tuicr is drawn on.
+    pub fn surface(&self) -> EditorSurface {
+        // An explicit wait flag means the user wants tuicr to block until the
+        // file is closed, so the terminal has to be handed over either way.
+        let waits = self
+            .args
+            .iter()
+            .any(|arg| arg == "-w" || arg == "--wait" || arg == "--block");
+        if !waits && is_windowed_editor(&self.program) {
+            EditorSurface::Gui
+        } else {
+            EditorSurface::Terminal
+        }
+    }
+}
+
+/// A windowed editor that was launched and may still be open.
+#[derive(Debug)]
+pub struct EditorLaunch {
+    child: Child,
+    started: Instant,
+}
+
+impl EditorLaunch {
+    /// Cleans up the editor process if it has exited.
+    ///
+    /// Blocking editors report a bad exit status through `EditorError::Exit`;
+    /// this is the equivalent for editors tuicr does not wait on.
+    pub fn poll(&mut self) -> LaunchState {
+        match self.child.try_wait() {
+            Ok(None) => LaunchState::Running,
+            Ok(Some(status))
+                if !status.success() && self.started.elapsed() < LAUNCH_FAILURE_WINDOW =>
+            {
+                LaunchState::FailedToLaunch(status)
+            }
+            Ok(Some(_)) | Err(_) => LaunchState::Exited,
+        }
+    }
+}
+
+/// Where a launched editor has got to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchState {
+    /// Still open.
+    Running,
+    /// Gone, with nothing worth reporting.
+    Exited,
+    /// Died soon enough after launch that it never reached the user.
+    FailedToLaunch(ExitStatus),
+}
+
+/// Where an editor draws itself once launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorSurface {
+    /// Takes over the terminal; tuicr must suspend for the duration.
+    Terminal,
+    /// Opens its own window; tuicr keeps drawing.
+    Gui,
+}
+
+/// Whether a program is a known editor that opens its own window.
+///
+/// Unrecognized editors are assumed to be terminal editors: suspending for a
+/// GUI editor costs a flicker, while not suspending for a terminal editor
+/// leaves two programs fighting over the same screen.
+fn is_windowed_editor(program: &str) -> bool {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    matches!(
+        name,
+        "code"
+            | "code-insiders"
+            | "codium"
+            | "cursor"
+            | "windsurf"
+            | "zed"
+            | "subl"
+            | "sublime_text"
+            | "mate"
+            | "idea"
+            | "webstorm"
+            | "goland"
+            | "pycharm"
+            | "clion"
+            | "rustrover"
+            | "phpstorm"
+            | "rubymine"
+    )
 }
 
 /// Line-navigation syntax family for a recognized editor executable.
@@ -88,13 +245,20 @@ enum EditorFamily {
     Plain,
 }
 
+fn resolve_editor(editor_override: Option<&str>, env_editor: &str) -> String {
+    editor_override
+        .filter(|editor| !editor.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| env_editor.to_string())
+}
+
 fn editor_family(program: &str) -> EditorFamily {
     let name = Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(program);
     match name {
-        "vi" | "vim" | "nvim" | "nano" | "emacs" | "emacsclient" => EditorFamily::PlusLine,
+        "vi" | "vim" | "nvim" | "nano" | "emacs" | "emacsclient" | "hx" => EditorFamily::PlusLine,
         "code" | "code-insiders" | "codium" | "cursor" => EditorFamily::GotoLine,
         _ => EditorFamily::Plain,
     }
@@ -118,16 +282,31 @@ fn status_label(status: &ExitStatus) -> String {
         .unwrap_or_else(|| "signal".to_string())
 }
 
-/// Opens `target` in the user's editor.
+/// Runs `command` to completion in the terminal.
 ///
 /// The caller owns terminal restoration before displaying any returned error.
-pub fn run_editor(target: &EditorTarget) -> Result<(), EditorError> {
-    let command = EditorCommand::from_env(target);
+pub fn run_editor(command: &EditorCommand) -> Result<(), EditorError> {
     match command.run() {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(EditorError::Exit(status)),
         Err(err) => Err(EditorError::Launch(err)),
     }
+}
+
+/// Runs `command` with stdin/stdout/stderr wired to `/dev/tty` instead of
+/// tuicr's inherited stdio. Used when tuicr was launched with `--stdout` so
+/// the editor still sees a terminal even though tuicr's own stdout is a file.
+pub fn run_editor_on_tty(command: &EditorCommand) -> Result<(), EditorError> {
+    match command.run_on_tty() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(EditorError::Exit(status)),
+        Err(err) => Err(EditorError::Launch(err)),
+    }
+}
+
+/// Hands `command` to a windowed editor without waiting for it to exit.
+pub fn launch_editor(command: &EditorCommand) -> Result<EditorLaunch, EditorError> {
+    command.spawn_detached().map_err(EditorError::Launch)
 }
 
 #[cfg(test)]
@@ -138,6 +317,7 @@ mod tests {
         EditorTarget {
             path: PathBuf::from("/repo/src/main.rs"),
             line,
+            label: "src/main.rs".to_string(),
         }
     }
 
@@ -151,11 +331,32 @@ mod tests {
 
     #[test]
     fn plus_line_editors_receive_line_before_path() {
-        for editor in ["vi", "vim", "nvim", "nano"] {
+        for editor in ["vi", "vim", "nvim", "nano", "hx"] {
             let command = EditorCommand::from_editor(editor, &target(Some(42)));
             assert_eq!(command.program, editor);
             assert_eq!(args(&command), vec!["+42", "/repo/src/main.rs"]);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_on_tty_runs_true_and_reports_success() {
+        // /bin/true exits 0 immediately without reading stdin, so this
+        // exercises the /dev/tty wiring path without needing a real editor.
+        // CI and other headless runners have no controlling terminal, so
+        // /dev/tty returns ENXIO — skip cleanly in that case rather than
+        // fail on a machine that literally cannot exercise this code path.
+        if std::fs::File::open("/dev/tty").is_err() {
+            return;
+        }
+        let command = EditorCommand {
+            program: "true".to_string(),
+            args: Vec::new(),
+        };
+        let status = command
+            .run_on_tty()
+            .expect("run_on_tty must open /dev/tty and spawn");
+        assert!(status.success(), "true should exit 0");
     }
 
     #[test]
@@ -198,9 +399,119 @@ mod tests {
     }
 
     #[test]
+    fn windowed_editors_do_not_claim_the_terminal() {
+        for editor in [
+            "code",
+            "cursor",
+            "zed",
+            "subl",
+            "/usr/local/bin/code-insiders",
+        ] {
+            let command = EditorCommand::from_editor(editor, &target(Some(42)));
+            assert_eq!(command.surface(), EditorSurface::Gui, "{editor}");
+        }
+    }
+
+    #[test]
+    fn terminal_and_unknown_editors_claim_the_terminal() {
+        for editor in ["vim", "nvim", "nano", "emacs", "helix", "kak"] {
+            let command = EditorCommand::from_editor(editor, &target(Some(42)));
+            assert_eq!(command.surface(), EditorSurface::Terminal, "{editor}");
+        }
+    }
+
+    #[test]
+    fn wait_flag_keeps_windowed_editors_blocking() {
+        for editor in ["code --wait", "code -w", "zed --wait"] {
+            let command = EditorCommand::from_editor(editor, &target(Some(42)));
+            assert_eq!(command.surface(), EditorSurface::Terminal, "{editor}");
+        }
+    }
+
+    #[test]
+    fn launching_a_missing_program_fails_immediately() {
+        let command = EditorCommand {
+            program: "tuicr-no-such-editor".to_string(),
+            args: vec![OsString::from("/repo/src/main.rs")],
+        };
+        assert!(matches!(
+            launch_editor(&command),
+            Err(EditorError::Launch(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    fn shell_command(script: &str) -> EditorCommand {
+        EditorCommand {
+            program: "/bin/sh".to_string(),
+            args: vec![OsString::from("-c"), OsString::from(script)],
+        }
+    }
+
+    /// Polls until the editor is no longer running, so the assertions do not
+    /// race the child's exit.
+    #[cfg(unix)]
+    fn poll_until_settled(launch: &mut EditorLaunch) -> LaunchState {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match launch.poll() {
+                LaunchState::Running if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                state => return state,
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_editor_that_dies_on_launch_reports_its_status() {
+        let mut launch = launch_editor(&shell_command("exit 3")).expect("spawn");
+        let LaunchState::FailedToLaunch(status) = poll_until_settled(&mut launch) else {
+            panic!("expected a launch failure");
+        };
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(
+            EditorError::Exit(status).to_string(),
+            "Editor exited with status 3"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successful_editor_is_cleaned_up_without_a_message() {
+        let mut launch = launch_editor(&shell_command("exit 0")).expect("spawn");
+        assert_eq!(poll_until_settled(&mut launch), LaunchState::Exited);
+    }
+
+    #[test]
     fn empty_editor_falls_back_to_vi() {
         let command = EditorCommand::from_editor("", &target(None));
         assert_eq!(command.program, "vi");
         assert_eq!(args(&command), vec!["/repo/src/main.rs"]);
+    }
+
+    #[test]
+    fn config_override_wins_over_env() {
+        assert_eq!(
+            resolve_editor(Some("from-config"), "from-env"),
+            "from-config"
+        );
+    }
+
+    #[test]
+    fn env_is_used_without_config_override() {
+        assert_eq!(resolve_editor(None, "from-env"), "from-env");
+    }
+
+    #[test]
+    fn blank_config_override_falls_back_to_env() {
+        assert_eq!(resolve_editor(Some("  "), "from-env"), "from-env");
+    }
+
+    #[test]
+    fn missing_env_and_config_fall_back_to_vi() {
+        let command = EditorCommand::from_editor(&resolve_editor(None, ""), &target(None));
+        assert_eq!(command.program, "vi");
     }
 }

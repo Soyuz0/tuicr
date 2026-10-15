@@ -35,22 +35,31 @@ impl AzCommandRunner for SystemAzRunner {
     }
 
     fn run_with_input_file(&self, args: &[String], input: &[u8]) -> AzCommandResult<String> {
-        let mut file = tempfile::Builder::new()
+        let file = tempfile::Builder::new()
             .prefix("tuicr-az-")
             .tempfile()
             .map_err(io_error)?;
-        file.write_all(input).map_err(io_error)?;
-        file.flush().map_err(io_error)?;
-        let path = file.path().to_str().ok_or_else(|| AzCommandError::Failed {
-            status: None,
-            output: "temporary Azure request path is not valid UTF-8".to_string(),
-        })?;
-
-        let mut arguments = without_option(args, "--in-file");
-        arguments.push("--in-file".to_string());
-        arguments.push(path.to_string());
-        self.run(&arguments)
+        run_with_input_file(self, args, input, file)
     }
+}
+
+fn run_with_input_file(
+    runner: &impl AzCommandRunner,
+    args: &[String],
+    input: &[u8],
+    mut file: tempfile::NamedTempFile,
+) -> AzCommandResult<String> {
+    file.write_all(input).map_err(io_error)?;
+    file.flush().map_err(io_error)?;
+    let path = file.path().to_str().ok_or_else(|| AzCommandError::Failed {
+        status: None,
+        output: "temporary Azure request path is not valid UTF-8".to_string(),
+    })?;
+
+    let mut arguments = without_option(args, "--in-file");
+    arguments.push("--in-file".to_string());
+    arguments.push(path.to_string());
+    runner.run(&arguments)
 }
 
 /// Strip human-readable preamble lines that Azure CLI writes to **stdout**
@@ -448,11 +457,17 @@ fi
             let input_directory = directory.path().join("input path \u{2603}");
             fs::create_dir(&input_directory).unwrap();
             let _az = EnvGuard::set("TUICR_AZ_BIN", &executable);
-            let _temp = EnvGuard::set("TMPDIR", &input_directory);
-
-            let output = SystemAzRunner
-                .run_with_input_file(&["invoke".to_string()], b"body with spaces")
+            let file = tempfile::Builder::new()
+                .prefix("tuicr-az-")
+                .tempfile_in(&input_directory)
                 .unwrap();
+            let output = run_with_input_file(
+                &SystemAzRunner,
+                &["invoke".to_string()],
+                b"body with spaces",
+                file,
+            )
+            .unwrap();
             assert!(output.contains("INPUT=[body with spaces]"));
             let path = output
                 .lines()

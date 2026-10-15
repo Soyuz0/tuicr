@@ -35,7 +35,7 @@ impl App {
         self.vcs = Box::new(PrNoopVcs::new(self.vcs_info.clone()));
         self.session = session;
         self.diff_files = diff_files;
-        self.reset_persisted_session_tracking();
+        self.reset_persisted_session_tracking()?;
         self.diff_source = DiffSource::PullRequest(Box::new(pr_source));
         self.forge_backend = Some(backend);
         self.forge_repository = Some(key.repository.clone());
@@ -49,6 +49,9 @@ impl App {
         // refreshed by future `gh pr view` calls in PR 6.
         self.current_pr_head = Some(details.head_sha.clone());
         self.input_mode = InputMode::Normal;
+        // A prompt raised on the selector (e.g. a Sessions-tab delete) while
+        // the PR was loading belongs to a screen that is now gone.
+        self.pending_confirm = None;
         self.focused_panel = FocusedPanel::Diff;
         self.clear_expanded_gaps();
         self.commit_list.clear();
@@ -325,8 +328,15 @@ impl App {
         let pr_number = current.key.number;
         let head_sha = current.key.head_sha.clone();
         let base_sha = current.base_sha.clone();
+        let show_pr_checks = self.show_pr_checks;
+        let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
-            let backend = create_forge_backend(&repository, local_checkout);
+            let backend = create_forge_backend(
+                &repository,
+                local_checkout,
+                show_pr_checks,
+                show_pr_comments,
+            );
             let details = crate::forge::traits::PullRequestDetails {
                 repository: repository.clone(),
                 number: pr_number,
@@ -387,8 +397,8 @@ impl App {
         self.pr_range_reload_state = None;
 
         match result {
-            Ok(patch) => {
-                if let Err(e) = self.finish_pr_range_reload(&request, &patch) {
+            Ok(patches) => {
+                if let Err(e) = self.finish_pr_range_reload(&request, patches) {
                     self.set_error(format!("Range diff failed: {e}"));
                 }
             }
@@ -401,27 +411,28 @@ impl App {
     pub(in crate::app) fn finish_pr_range_reload(
         &mut self,
         request: &PrRangeReloadRequest,
-        patch: &str,
+        patches: Vec<crate::model::FilePatch>,
     ) -> Result<()> {
-        use crate::vcs::diff_parser::{DiffFormat, parse_unified_diff};
+        use crate::vcs::diff_parser::parse_file_patches;
 
         let highlighter = self.theme.syntax_highlighter();
-        let parsed = match parse_unified_diff(patch, DiffFormat::GitStyle, highlighter) {
+        let local_checkout = self
+            .forge_backend
+            .as_deref()
+            .and_then(|b| b.local_checkout_path());
+        // Filter before parsing so an ignored large file is never
+        // highlighted, exactly as in `prepare_open_pr`.
+        let patches = match local_checkout.as_deref() {
+            Some(root) => crate::tuicrignore::filter_file_patches(root, patches),
+            None => patches,
+        };
+        let parsed = match parse_file_patches(patches, highlighter) {
             Ok(files) => files,
             Err(TuicrError::NoChanges) => Vec::new(),
             Err(e) => return Err(e),
         };
 
-        let local_checkout = self
-            .forge_backend
-            .as_deref()
-            .and_then(|b| b.local_checkout_path());
-        let files = match local_checkout.as_deref() {
-            Some(root) => crate::tuicrignore::filter_diff_files(root, parsed),
-            None => parsed,
-        };
-
-        self.diff_files = files;
+        self.diff_files = parsed;
         self.clear_expanded_gaps();
         // Range diffs can hide hunks that are still reviewed in the broader
         // PR session, so registration must not prune them.
@@ -481,8 +492,15 @@ impl App {
 
         let repository = current.key.repository.clone();
         let pr_number = current.key.number;
+        let show_pr_checks = self.show_pr_checks;
+        let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
-            let backend = create_forge_backend(&repository, local_checkout);
+            let backend = create_forge_backend(
+                &repository,
+                local_checkout,
+                show_pr_checks,
+                show_pr_comments,
+            );
             let target =
                 PullRequestTarget::with_repository(repository, pr_number, pr_number.to_string());
             let outcome = fetch_pr_data(backend.as_ref(), target).map_err(|e| e.to_string());
@@ -515,10 +533,10 @@ impl App {
             return;
         }
         match result {
-            Ok((details, patch, commits, review_metadata, pr_info)) => {
+            Ok((details, patches, commits, review_metadata, pr_info)) => {
                 if let Err(e) = self.finish_pr_reload(
                     details,
-                    patch,
+                    patches,
                     commits,
                     review_metadata,
                     pr_info,
@@ -536,7 +554,7 @@ impl App {
     pub(in crate::app) fn finish_pr_reload(
         &mut self,
         details: crate::forge::traits::PullRequestDetails,
-        patch: String,
+        patches: Vec<crate::model::FilePatch>,
         commits: Vec<crate::forge::traits::PullRequestCommit>,
         review_metadata: crate::forge::traits::PullRequestReviewMetadata,
         pr_info: crate::forge::traits::PullRequestInfo,
@@ -551,7 +569,7 @@ impl App {
         let highlighter = self.theme.syntax_highlighter();
         let opened = prepare_open_pr(
             details,
-            &patch,
+            patches,
             commits,
             review_metadata,
             pr_info,
@@ -563,7 +581,12 @@ impl App {
         if head_changed {
             let details_for_threads = opened.details.clone();
             let opened = self.opened_pr_with_new_head_session(opened)?;
-            let backend = create_forge_backend(&request.repository, local_checkout.clone());
+            let backend = create_forge_backend(
+                &request.repository,
+                local_checkout.clone(),
+                self.show_pr_checks,
+                self.show_pr_comments,
+            );
             let previous_message = self.message.clone();
             self.enter_pr_diff_mode(backend, opened)?;
             self.spawn_pr_threads_fetch(&details_for_threads, local_checkout);
@@ -575,6 +598,10 @@ impl App {
                 &opened.commits,
                 &opened.review_metadata,
             );
+            // Keep the active base in sync even when the head has not changed.
+            if let DiffSource::PullRequest(pr) = &mut self.diff_source {
+                pr.base_sha = opened.details.base_sha.clone();
+            }
             self.diff_files = opened.diff_files;
             self.pr_info = Some(opened.pr_info);
             self.clear_expanded_gaps();
@@ -594,6 +621,12 @@ impl App {
         } else if let Some(anchor) = &request.anchor {
             self.restore_pr_cursor_to_anchor(anchor);
         }
+        // A reload can shrink the diff; a stale cursor left past the new end
+        // (same-head branch, or a restored overview line captured from the
+        // taller old diff) makes the next `cursor_down` clamp upward and
+        // panic. Clamp into the current bounds.
+        self.diff_state.cursor_line = self.diff_state.cursor_line.min(self.max_cursor_line());
+        self.ensure_cursor_visible();
         Ok(())
     }
 
@@ -612,7 +645,12 @@ impl App {
             .forge_backend
             .as_deref()
             .and_then(|backend| backend.local_checkout_path());
-        let backend = create_forge_backend(&current.key.repository, local_checkout.clone());
+        let backend = create_forge_backend(
+            &current.key.repository,
+            local_checkout.clone(),
+            self.show_pr_checks,
+            self.show_pr_comments,
+        );
         self.reload_pull_request_with_backend(backend, local_checkout)
     }
 
@@ -661,6 +699,10 @@ impl App {
                 &opened.commits,
                 &opened.review_metadata,
             );
+            // Keep the active base in sync even when the head has not changed.
+            if let DiffSource::PullRequest(pr) = &mut self.diff_source {
+                pr.base_sha = opened.details.base_sha.clone();
+            }
             self.diff_files = opened.diff_files;
             self.pr_info = Some(opened.pr_info);
             self.clear_expanded_gaps();
@@ -671,6 +713,10 @@ impl App {
             self.expand_all_dirs();
             self.rebuild_annotations();
         }
+
+        // Same-head reload keeps the old cursor; clamp it into the (possibly
+        // shorter) new diff so a following `cursor_down` can't underflow.
+        self.diff_state.cursor_line = self.diff_state.cursor_line.min(self.max_cursor_line());
 
         Ok(head_changed)
     }
@@ -696,6 +742,8 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.pr_load_rx = Some(rx);
 
+        let show_pr_checks = self.show_pr_checks;
+        let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
             // Canonical resolution (fork parent lookup) is GitHub-only.
             let canonical = if skip_resolution || origin.kind != ForgeKind::GitHub {
@@ -706,7 +754,7 @@ impl App {
                 let runner = SystemGhRunner;
                 resolve_canonical_repository(&origin, override_repo.as_ref(), &runner)
             };
-            let backend = create_forge_backend(&canonical, None);
+            let backend = create_forge_backend(&canonical, None, show_pr_checks, show_pr_comments);
             let query =
                 PullRequestListQuery::first_page_with_scope(canonical.clone(), PR_PAGE_SIZE, scope);
             let result = backend
@@ -730,8 +778,10 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.pr_load_rx = Some(rx);
 
+        let show_pr_checks = self.show_pr_checks;
+        let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
-            let backend = create_forge_backend(&repository, None);
+            let backend = create_forge_backend(&repository, None, show_pr_checks, show_pr_comments);
             let query = PullRequestListQuery {
                 repository,
                 already_loaded,
@@ -772,9 +822,19 @@ impl App {
                     self.pr_tab.apply_canonical(canonical.clone());
                     self.forge_repository = Some(canonical);
                     self.canonical_resolved = true;
+                    let error = result.as_ref().err().cloned();
                     self.pr_tab.apply_initial_load(result);
+                    if let Some(error) = error {
+                        self.set_error(error);
+                    }
                 }
-                PrLoadEvent::LoadMore(result) => self.pr_tab.apply_load_more(result),
+                PrLoadEvent::LoadMore(result) => {
+                    let error = result.as_ref().err().cloned();
+                    self.pr_tab.apply_load_more(result);
+                    if let Some(error) = error {
+                        self.set_error(error);
+                    }
+                }
             }
         }
         self.pr_tab.clamp_cursor();
@@ -823,21 +883,53 @@ impl App {
         let Some(summary) = self.pr_tab.cursor_pr().cloned() else {
             return false;
         };
-        self.spawn_pr_open(&summary);
+        self.spawn_pr_open(&summary.repository, summary.number);
         true
+    }
+
+    /// The local clone backing `repo`, when tuicr was launched inside one of
+    /// its checkouts.
+    ///
+    /// Resolves against `local_repo_root`, not `vcs_info.root_path`: PR mode
+    /// swaps the latter for the synthetic `forge:host/owner/repo` identity, so
+    /// using it would find no checkout for every PR opened after the first
+    /// (issue #591 — Azure DevOps then fails the open outright, since it has
+    /// no unified-diff API and reads the diff from the clone).
+    ///
+    /// The repo match still gates the result, so a foreign checkout is never
+    /// used to filter or expand another repository's PR.
+    pub(in crate::app) fn local_checkout_for(
+        &self,
+        repo: &crate::forge::traits::ForgeRepository,
+    ) -> Option<std::path::PathBuf> {
+        let root = self.local_repo_root.as_deref()?;
+        crate::forge::local_checkout_for_repo(root, repo)
+    }
+
+    /// Reopen a persisted PR review from the Sessions tab.
+    ///
+    /// Routes through the same background fetch as the Pull Requests tab: a PR
+    /// diff comes from the forge, not the checkout, and re-fetching also picks
+    /// up commits pushed since the review was saved. `load_pr_session` then
+    /// reattaches the stored comments by head SHA.
+    pub fn resume_pr_session(&mut self, key: &crate::forge::traits::PrSessionKey) {
+        if self.pr_open_state.is_some() {
+            return;
+        }
+        self.spawn_pr_open(&key.repository, key.number);
     }
 
     /// Kick off the background fetch for a PR open. The main thread keeps
     /// rendering and pumping events; the resulting `PrOpenEvent::Done` is
     /// drained in `poll_pr_open_events` where parsing happens and PR mode
     /// is entered.
-    fn spawn_pr_open(&mut self, summary: &crate::forge::traits::PullRequestSummary) {
+    fn spawn_pr_open(&mut self, repository: &crate::forge::traits::ForgeRepository, number: u64) {
         use crate::forge::pr_open::fetch_pr_data;
         use crate::forge::traits::PullRequestTarget;
 
         let request = PrOpenRequest {
-            repository: summary.repository.clone(),
-            pr_number: summary.number,
+            repository: repository.clone(),
+            pr_number: number,
             started_at: Instant::now(),
         };
         self.pr_open_state = Some(request.clone());
@@ -845,12 +937,20 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.pr_open_rx = Some(rx);
 
-        let summary_repo = summary.repository.clone();
-        let pr_number = summary.number;
-        let local_checkout =
-            crate::forge::local_checkout_for_repo(&self.vcs_info.root_path, &summary_repo);
+        let summary_repo = repository.clone();
+        let pr_number = number;
+        // Resolve the local checkout up front so Azure DevOps can source its
+        // diff from the clone when opening a PR from the selector.
+        let local_checkout = self.local_checkout_for(repository);
+        let show_pr_checks = self.show_pr_checks;
+        let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
-            let backend = create_forge_backend(&summary_repo, local_checkout);
+            let backend = create_forge_backend(
+                &summary_repo,
+                local_checkout,
+                show_pr_checks,
+                show_pr_comments,
+            );
             let target =
                 PullRequestTarget::with_repository(summary_repo, pr_number, pr_number.to_string());
             let outcome = fetch_pr_data(backend.as_ref(), target).map_err(|e| e.to_string());
@@ -889,10 +989,10 @@ impl App {
                     return;
                 }
                 match result {
-                    Ok((details, patch, commits, review_metadata, pr_info)) => {
+                    Ok((details, patches, commits, review_metadata, pr_info)) => {
                         if let Err(e) = self.finish_pr_open(
                             details,
-                            patch,
+                            patches,
                             commits,
                             review_metadata,
                             pr_info,
@@ -912,14 +1012,14 @@ impl App {
         }
     }
 
-    /// Main-thread half of the PR open: parse the patch, build the
+    /// Main-thread half of the PR open: parse the structured patches, build the
     /// session, and enter PR diff mode. Mirrors what the previous synchronous
     /// `open_pr_with_backend` did, but the network fetch has already
     /// happened on the background thread.
     fn finish_pr_open(
         &mut self,
         details: crate::forge::traits::PullRequestDetails,
-        patch: String,
+        patches: Vec<crate::model::FilePatch>,
         commits: Vec<crate::forge::traits::PullRequestCommit>,
         review_metadata: crate::forge::traits::PullRequestReviewMetadata,
         pr_info: crate::forge::traits::PullRequestInfo,
@@ -927,20 +1027,25 @@ impl App {
     ) -> Result<()> {
         use crate::forge::pr_open::prepare_open_pr;
 
-        let local_checkout =
-            crate::forge::local_checkout_for_repo(&self.vcs_info.root_path, &request.repository);
+        let local_checkout = self.local_checkout_for(&request.repository);
         let highlighter = self.theme.syntax_highlighter();
-        let opened = prepare_open_pr(
+        let mut opened = prepare_open_pr(
             details.clone(),
-            &patch,
+            patches,
             commits,
             review_metadata,
             pr_info,
             local_checkout.as_deref(),
             highlighter,
         )?;
+        self.seed_configured_visibility(&mut opened.session);
         let opened = Self::opened_pr_with_persisted_session(opened)?;
-        let backend = create_forge_backend(&request.repository, local_checkout.clone());
+        let backend = create_forge_backend(
+            &request.repository,
+            local_checkout.clone(),
+            self.show_pr_checks,
+            self.show_pr_comments,
+        );
         let previous_message = self.message.clone();
         self.enter_pr_diff_mode(backend, opened)?;
         // Kick the remote-thread fetch off on a fresh background thread.
@@ -974,9 +1079,16 @@ impl App {
         let repository = details.repository.clone();
         let pr_number = details.number;
         let head_sha = details.head_sha.clone();
+        let show_pr_checks = self.show_pr_checks;
+        let show_pr_comments = self.show_pr_comments;
 
         std::thread::spawn(move || {
-            let backend = create_forge_backend(&repository, local_checkout);
+            let backend = create_forge_backend(
+                &repository,
+                local_checkout,
+                show_pr_checks,
+                show_pr_comments,
+            );
             let threads = backend
                 .list_review_threads(&details_clone)
                 .map_err(|e| e.to_string());
@@ -1037,7 +1149,8 @@ impl App {
                 let mut threads_loaded = false;
                 match threads {
                     Ok(t) => {
-                        self.forge_review_threads = t;
+                        self.forge_review_threads =
+                            crate::forge::remote_comments::dedupe_threads(t);
                         threads_loaded = true;
                     }
                     Err(e) => {
@@ -1082,6 +1195,18 @@ impl App {
         self.session.remote_comments_visibility = visibility;
         self.rebuild_annotations();
         true
+    }
+
+    /// Seed a fresh PR session with the configured `pr_comments_visibility`
+    /// default. Callers seed before the persisted-session restore, which
+    /// replaces the fresh session wholesale, so a saved visibility wins.
+    pub(in crate::app) fn seed_configured_visibility(
+        &self,
+        session: &mut crate::model::ReviewSession,
+    ) {
+        if let Some(visibility) = self.initial_comments_visibility {
+            session.remote_comments_visibility = visibility;
+        }
     }
 
     /// Abort an in-flight PR open. Drops the receiver so the eventual
@@ -1187,9 +1312,16 @@ impl App {
         let pr_number = details.number;
         let head_sha = details.head_sha.clone();
         let sent_thread_id = thread_id.clone();
+        let show_pr_checks = self.show_pr_checks;
+        let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
             // Build the backend inside the thread; `&App` must not cross it.
-            let backend = create_forge_backend(&repository, local_checkout);
+            let backend = create_forge_backend(
+                &repository,
+                local_checkout,
+                show_pr_checks,
+                show_pr_comments,
+            );
             let result = backend
                 .set_review_thread_resolved(&details, &sent_thread_id, resolved)
                 .map_err(|error| error.to_string());
@@ -1296,12 +1428,13 @@ impl App {
             summary.number.to_string(),
         );
         let highlighter = self.theme.syntax_highlighter();
-        let opened = open_pull_request(
+        let mut opened = open_pull_request(
             backend.as_ref(),
             target,
             local_checkout.as_deref(),
             highlighter,
         )?;
+        self.seed_configured_visibility(&mut opened.session);
         let opened = Self::opened_pr_with_persisted_session(opened)?;
         // Sync thread + summary fetch — tests assert on
         // `app.forge_review_threads`/`forge_review_summaries` immediately
@@ -1313,7 +1446,7 @@ impl App {
             .list_review_summaries(&opened.details)
             .unwrap_or_default();
         self.enter_pr_diff_mode(backend, opened)?;
-        self.forge_review_threads = threads;
+        self.forge_review_threads = crate::forge::remote_comments::dedupe_threads(threads);
         self.forge_review_summaries = summaries;
         self.prune_locked_comments();
         self.rebuild_annotations();

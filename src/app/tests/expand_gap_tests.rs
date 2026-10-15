@@ -133,6 +133,225 @@ fn hunk_diff_line(app: &App, file_idx: usize, hunk_idx: usize) -> usize {
         .expect("missing hunk diff annotation")
 }
 
+fn assert_hunk_jumps_follow_rendered_headers(app: &mut App) {
+    let headers: Vec<_> = app
+        .line_annotations
+        .iter()
+        .enumerate()
+        .filter_map(|(row, line)| matches!(line, AnnotatedLine::HunkHeader { .. }).then_some(row))
+        .collect();
+    assert!(headers.len() >= 2);
+    assert_eq!(app.hunk_positions(), headers);
+    for pair in headers.windows(2) {
+        app.diff_state.cursor_line = pair[0];
+        app.next_hunk();
+        assert_eq!(app.diff_state.cursor_line, pair[1]);
+        app.prev_hunk();
+        assert_eq!(app.diff_state.cursor_line, pair[0]);
+    }
+}
+
+#[test]
+fn hunk_navigation_tracks_expanded_and_collapsed_context() {
+    for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+        for single in [false, true] {
+            let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 5), make_hunk(50, 5)]);
+            let mut app = build_app_with_files(vec![file], 100);
+            app.diff_view_mode = mode;
+            app.is_single_file_view = single;
+            app.rebuild_annotations();
+            let gap = GapId {
+                file_idx: 0,
+                hunk_idx: 1,
+            };
+            for (direction, count) in [
+                (ExpandDirection::Down, Some(20)),
+                (ExpandDirection::Up, Some(10)),
+                (ExpandDirection::Both, None),
+            ] {
+                app.expand_gap(gap.clone(), direction, count).unwrap();
+                assert_hunk_jumps_follow_rendered_headers(&mut app);
+            }
+            app.collapse_gap(gap);
+            assert_hunk_jumps_follow_rendered_headers(&mut app);
+        }
+    }
+}
+
+#[test]
+fn hunk_navigation_counts_paired_changes_and_wrapped_comments() {
+    for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+        let mut first = make_hunk(1, 2);
+        first.lines = vec![
+            DiffLine {
+                origin: LineOrigin::Deletion,
+                content: "before".into(),
+                old_lineno: Some(1),
+                new_lineno: None,
+                highlighted_spans: None,
+            },
+            DiffLine {
+                origin: LineOrigin::Addition,
+                content: "after".into(),
+                old_lineno: None,
+                new_lineno: Some(1),
+                highlighted_spans: None,
+            },
+            DiffLine {
+                origin: LineOrigin::Context,
+                content: "unchanged".into(),
+                old_lineno: Some(2),
+                new_lineno: Some(2),
+                highlighted_spans: None,
+            },
+        ];
+        let file = make_file_with_hunks("test.rs", vec![first, make_hunk(50, 5)]);
+        let mut app = build_app_with_files(vec![file], 100);
+        app.diff_view_mode = mode;
+        app.diff_state.viewport_width = 40;
+        let path = app.diff_files[0].display_path().clone();
+        app.session.get_file_mut(&path).unwrap().add_line_comment(
+            1,
+            Comment::new(
+                "A long comment that wraps over several rendered rows.\nAnother line.".into(),
+                CommentType::from_id("note"),
+                Some(LineSide::New),
+            ),
+        );
+        app.session
+            .get_file_mut(&path)
+            .unwrap()
+            .add_file_comment(Comment::new(
+                "file comment\nsecond line".into(),
+                CommentType::from_id("note"),
+                None,
+            ));
+        app.rebuild_annotations();
+        assert_hunk_jumps_follow_rendered_headers(&mut app);
+    }
+}
+
+#[test]
+fn hunk_navigation_renders_the_target_after_scrolling_expanded_context() {
+    use ratatui::{Terminal, backend::TestBackend};
+    for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+        let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 5), make_hunk(50, 5)]);
+        let mut app = build_app_with_files(vec![file], 100);
+        app.diff_view_mode = mode;
+        app.expand_gap(
+            GapId {
+                file_idx: 0,
+                hunk_idx: 1,
+            },
+            ExpandDirection::Both,
+            None,
+        )
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        let draw = |terminal: &mut Terminal<TestBackend>, app: &mut App| {
+            terminal
+                .draw(|frame| crate::ui::render(frame, app))
+                .unwrap();
+        };
+        draw(&mut terminal, &mut app);
+        app.diff_state.cursor_line = 1;
+        app.next_hunk();
+        draw(&mut terminal, &mut app);
+        assert!(app.diff_state.scroll_offset > 0);
+        assert!(
+            app.diff_row_to_annotation
+                .contains(&app.diff_state.cursor_line)
+        );
+        assert!(matches!(
+            app.line_annotations[app.diff_state.cursor_line],
+            AnnotatedLine::HunkHeader {
+                file_idx: 0,
+                hunk_idx: 1
+            }
+        ));
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("@@ -50,5 +50,5 @@"), "{mode:?}: {screen}");
+        app.prev_hunk();
+        draw(&mut terminal, &mut app);
+        assert!(
+            app.diff_row_to_annotation
+                .contains(&app.diff_state.cursor_line)
+        );
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("@@ -1,5 +1,5 @@"), "{mode:?}: {screen}");
+    }
+}
+
+#[test]
+fn hunk_navigation_crosses_asymmetric_files_with_hidden_middle_file() {
+    for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+        let files = vec![
+            make_file_with_hunks("a.rs", vec![make_hunk(1, 5), make_hunk(50, 5)]),
+            make_file_with_hunks("hidden.rs", vec![make_hunk(1, 5)]),
+            make_file_with_hunks("z.rs", vec![make_hunk(30, 3)]),
+        ];
+        let mut app = build_app_with_files(files, 100);
+        app.diff_view_mode = mode;
+        let hidden = app.diff_files[1].display_path().clone();
+        app.session.get_file_mut(&hidden).unwrap().reviewed = true;
+        app.set_show_reviewed(false);
+        let last_path = app.diff_files[2].display_path().clone();
+        app.session
+            .get_file_mut(&last_path)
+            .unwrap()
+            .add_file_comment(Comment::new(
+                "first line\nsecond line".into(),
+                CommentType::from_id("note"),
+                None,
+            ));
+        app.is_single_file_view = true;
+        app.rebuild_annotations();
+        app.diff_state.cursor_line = app
+            .line_annotations
+            .iter()
+            .position(|line| {
+                matches!(
+                    line,
+                    AnnotatedLine::HunkHeader {
+                        file_idx: 0,
+                        hunk_idx: 1
+                    }
+                )
+            })
+            .unwrap();
+        app.next_hunk();
+        assert_eq!(app.diff_state.current_file_idx, 2);
+        assert!(matches!(
+            app.line_annotations[app.diff_state.cursor_line],
+            AnnotatedLine::HunkHeader {
+                file_idx: 2,
+                hunk_idx: 0
+            }
+        ));
+        app.prev_hunk();
+        assert_eq!(app.diff_state.current_file_idx, 0);
+        assert!(matches!(
+            app.line_annotations[app.diff_state.cursor_line],
+            AnnotatedLine::HunkHeader {
+                file_idx: 0,
+                hunk_idx: 1
+            }
+        ));
+    }
+}
+
 #[test]
 fn should_cycle_forward_through_review_file_and_line_comments() {
     let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3)]);
@@ -1344,7 +1563,7 @@ fn should_update_current_file_when_navigating_to_remote_comment() {
 
     assert!(matches!(
         app.line_annotations.get(app.diff_state.cursor_line),
-        Some(AnnotatedLine::RemoteThreadLine { thread_idx: 0 })
+        Some(AnnotatedLine::RemoteThreadLine { thread_idx: 0, .. })
     ));
     assert_eq!(app.diff_state.current_file_idx, 1);
 
@@ -1392,7 +1611,7 @@ fn should_rebuild_single_file_annotations_when_navigating_to_outdated_remote_com
 
     assert!(matches!(
         app.line_annotations.get(app.diff_state.cursor_line),
-        Some(AnnotatedLine::RemoteThreadLine { thread_idx: 0 })
+        Some(AnnotatedLine::RemoteThreadLine { thread_idx: 0, .. })
     ));
     assert_eq!(app.diff_state.current_file_idx, 1);
     assert!(
@@ -1462,4 +1681,113 @@ fn should_not_show_eof_gap_for_deleted_files() {
 
     // and: total_lines must match annotations
     assert_eq!(app.total_lines(), app.line_annotations.len());
+}
+
+/// A hunk whose new-side numbering is offset from the old side, so a jump
+/// that picks the wrong side lands on a different row.
+fn make_shifted_hunk(new_start: u32, count: u32, shift: u32) -> DiffHunk {
+    let lines = (0..count)
+        .map(|i| DiffLine {
+            origin: LineOrigin::Context,
+            content: format!("hunk line {}", new_start + i),
+            old_lineno: Some(new_start + i + shift),
+            new_lineno: Some(new_start + i),
+            highlighted_spans: None,
+        })
+        .collect();
+    DiffHunk {
+        header: format!("@@ -{},{count} +{new_start},{count} @@", new_start + shift),
+        lines,
+        old_start: new_start + shift,
+        old_count: count,
+        new_start,
+        new_count: count,
+    }
+}
+
+#[test]
+fn should_defer_start_line_until_the_viewport_is_measured() {
+    // given: `--line 30` queued before any render has measured the viewport
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 60)]);
+    let mut app = build_app_with_files(vec![file], 60);
+    app.pending_start_line = Some(30);
+    app.diff_state.viewport_height = 0;
+
+    // when: applied before the first render
+    // then: nothing moves and the request stays queued
+    assert!(!app.apply_pending_start_line());
+    assert_eq!(app.pending_start_line, Some(30));
+
+    // when: a render has set the viewport height
+    app.diff_state.viewport_height = 20;
+    assert!(app.apply_pending_start_line());
+
+    // then: the cursor is on line 30 and the request was consumed
+    assert_eq!(cursor_new_lineno(&app), Some(30));
+    assert_eq!(app.pending_start_line, None);
+    assert!(!app.apply_pending_start_line());
+}
+
+#[test]
+fn should_center_the_start_line_in_the_viewport() {
+    // given: a 60-line file and a 20-row viewport
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 60)]);
+    let mut app = build_app_with_files(vec![file], 60);
+    app.pending_start_line = Some(30);
+    app.diff_state.viewport_height = 20;
+
+    // when
+    assert!(app.apply_pending_start_line());
+
+    // then: the cursor row sits half a viewport below the top
+    let cursor = app.diff_state.cursor_line;
+    assert_eq!(cursor - app.diff_state.scroll_offset, 10);
+}
+
+#[test]
+fn should_resolve_the_start_line_on_the_new_side() {
+    // given: new-side lines 1..=60 are old-side lines 41..=100
+    let file = make_file_with_hunks("test.rs", vec![make_shifted_hunk(1, 60, 40)]);
+    let mut app = build_app_with_files(vec![file], 100);
+    app.pending_start_line = Some(45);
+    app.diff_state.viewport_height = 20;
+
+    // when
+    assert!(app.apply_pending_start_line());
+
+    // then: new-side line 45, not old-side line 45 (new-side line 5)
+    assert_eq!(cursor_new_lineno(&app), Some(45));
+}
+
+#[test]
+fn should_defer_start_line_while_a_modal_is_open() {
+    // given: the commit selector is open
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 60)]);
+    let mut app = build_app_with_files(vec![file], 60);
+    app.pending_start_line = Some(12);
+    app.diff_state.viewport_height = 20;
+    app.input_mode = InputMode::CommitSelect;
+
+    // then: the request waits
+    assert!(!app.apply_pending_start_line());
+    assert_eq!(app.pending_start_line, Some(12));
+
+    // when: the modal closes
+    app.input_mode = InputMode::Normal;
+
+    // then: the jump applies
+    assert!(app.apply_pending_start_line());
+    assert_eq!(cursor_new_lineno(&app), Some(12));
+}
+
+#[test]
+fn should_defer_start_line_while_there_are_no_annotations() {
+    // given: a measured viewport but no diff rows yet
+    let mut app = build_app_with_files(Vec::new(), 0);
+    app.pending_start_line = Some(5);
+    app.diff_state.viewport_height = 20;
+
+    // then: no jump, and the request is kept for when rows exist
+    assert!(!app.apply_pending_start_line());
+    assert_eq!(app.pending_start_line, Some(5));
 }

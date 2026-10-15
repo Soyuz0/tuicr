@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use super::comment::Comment;
+use super::comment::{Comment, LineSide};
 use super::diff_types::{DiffFile, FileStatus};
 use crate::forge::remote_comments::PrCommentsVisibility;
 use crate::forge::traits::PrSessionKey;
@@ -12,6 +12,22 @@ use crate::forge::traits::PrSessionKey;
 pub enum ClearScope {
     CommentsOnly,
     CommentsAndReviewed,
+}
+
+pub(crate) enum CommentLocation {
+    Review {
+        index: usize,
+    },
+    File {
+        path: PathBuf,
+        index: usize,
+    },
+    Line {
+        path: PathBuf,
+        line: u32,
+        side: LineSide,
+        index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +139,10 @@ pub struct ReviewSession {
 }
 
 impl ReviewSession {
+    fn file_review_is_invalidated(review: &FileReview, content_hash: u64) -> bool {
+        review.reviewed && review.content_hash != Some(content_hash)
+    }
+
     pub fn new(
         repo_path: PathBuf,
         base_commit: String,
@@ -163,13 +183,12 @@ impl ReviewSession {
     /// reviewed but its content changed, causing reviewed status to be reset.
     pub fn add_file(&mut self, path: PathBuf, status: FileStatus, content_hash: u64) -> bool {
         if let Some(review) = self.files.get_mut(&path) {
-            let old_hash = review.content_hash;
+            let invalidated = Self::file_review_is_invalidated(review, content_hash);
             review.content_hash = Some(content_hash);
-            if review.reviewed && old_hash != Some(content_hash) {
+            if invalidated {
                 review.reviewed = false;
-                return true;
             }
-            return false;
+            return invalidated;
         }
         self.files
             .insert(path.clone(), FileReview::new(path, status, content_hash));
@@ -188,6 +207,23 @@ impl ReviewSession {
         invalidated
     }
 
+    pub(crate) fn reconcile_diff_files(&mut self, diff_files: &[DiffFile]) {
+        for file in diff_files {
+            self.add_diff_file(file);
+        }
+    }
+
+    pub(crate) fn invalidated_diff_file_count(&self, diff_files: &[DiffFile]) -> usize {
+        diff_files
+            .iter()
+            .filter(|file| {
+                self.files.get(file.display_path()).is_some_and(|review| {
+                    Self::file_review_is_invalidated(review, file.content_hash)
+                })
+            })
+            .count()
+    }
+
     /// Register a transient filtered diff without dropping hunk keys that
     /// belong to the broader persisted review scope.
     pub fn add_diff_file_preserving_hunks(&mut self, file: &DiffFile) -> bool {
@@ -198,8 +234,94 @@ impl ReviewSession {
         self.files.get_mut(path)
     }
 
+    pub(crate) fn remove_comment(&mut self, location: &CommentLocation) -> bool {
+        match location {
+            CommentLocation::Review { index } => {
+                if self
+                    .review_comments
+                    .get(*index)
+                    .is_some_and(|comment| !comment.is_locked())
+                {
+                    self.review_comments.remove(*index);
+                    return true;
+                }
+            }
+            CommentLocation::File { path, index } => {
+                if let Some(review) = self.get_file_mut(path)
+                    && review
+                        .file_comments
+                        .get(*index)
+                        .is_some_and(|comment| !comment.is_locked())
+                {
+                    review.file_comments.remove(*index);
+                    return true;
+                }
+            }
+            CommentLocation::Line {
+                path,
+                line,
+                side,
+                index,
+            } => {
+                if let Some(review) = self.get_file_mut(path)
+                    && let Some(comments) = review.line_comments.get_mut(line)
+                    && comments.get(*index).is_some_and(|comment| {
+                        !comment.is_locked() && comment.side.unwrap_or(LineSide::New) == *side
+                    })
+                {
+                    comments.remove(*index);
+                    if comments.is_empty() {
+                        review.line_comments.remove(line);
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub(crate) fn find_comment_by_id(&self, comment_id: &str) -> Option<CommentLocation> {
+        for (index, comment) in self.review_comments.iter().enumerate() {
+            if comment.id == comment_id {
+                return Some(CommentLocation::Review { index });
+            }
+        }
+        for (path, review) in &self.files {
+            for (index, comment) in review.file_comments.iter().enumerate() {
+                if comment.id == comment_id {
+                    return Some(CommentLocation::File {
+                        path: path.clone(),
+                        index,
+                    });
+                }
+            }
+            for (line, comments) in &review.line_comments {
+                for (index, comment) in comments.iter().enumerate() {
+                    if comment.id == comment_id {
+                        return Some(CommentLocation::Line {
+                            path: path.clone(),
+                            line: *line,
+                            side: comment.side.unwrap_or(LineSide::New),
+                            index,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn has_comments(&self) -> bool {
         !self.review_comments.is_empty() || self.files.values().any(|f| f.comment_count() > 0)
+    }
+
+    pub fn comment_count(&self) -> usize {
+        self.review_comments.len()
+            + self
+                .files
+                .values()
+                .map(|f| f.comment_count())
+                .sum::<usize>()
     }
 
     pub fn clear_comments(&mut self, scope: ClearScope) -> (usize, usize) {
@@ -331,6 +453,116 @@ mod tests {
         let file = session.files.get(&path).unwrap();
         assert!(file.file_comments.is_empty());
         assert!(file.line_comments.is_empty());
+    }
+
+    #[test]
+    fn should_find_review_level_comment_by_id() {
+        let mut session = test_session();
+        let first = Comment::new("first".to_string(), CommentType::from_id("note"), None);
+        let second = Comment::new("second".to_string(), CommentType::from_id("note"), None);
+        let second_id = second.id.clone();
+        session.review_comments.push(first);
+        session.review_comments.push(second);
+
+        let location = session.find_comment_by_id(&second_id);
+
+        assert!(matches!(
+            location,
+            Some(CommentLocation::Review { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn should_find_file_level_comment_by_id() {
+        let mut session = test_session();
+        let path = PathBuf::from("src/main.rs");
+        session.add_file(path.clone(), FileStatus::Modified, SOME_HASH);
+        let comment = Comment::new("note".to_string(), CommentType::from_id("note"), None);
+        let comment_id = comment.id.clone();
+        let file = session.get_file_mut(&path).unwrap();
+        file.add_file_comment(comment);
+
+        let location = session.find_comment_by_id(&comment_id).unwrap();
+
+        let CommentLocation::File {
+            path: found_path,
+            index,
+        } = location
+        else {
+            panic!("expected file-level comment location");
+        };
+        assert_eq!(found_path, path);
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn should_find_line_level_comment_by_id_with_side() {
+        let mut session = test_session();
+        let path = PathBuf::from("src/main.rs");
+        session.add_file(path.clone(), FileStatus::Modified, SOME_HASH);
+        let comment = Comment::new(
+            "note".to_string(),
+            CommentType::from_id("note"),
+            Some(LineSide::Old),
+        );
+        let comment_id = comment.id.clone();
+        let file = session.get_file_mut(&path).unwrap();
+        file.add_line_comment(42, comment);
+
+        let location = session.find_comment_by_id(&comment_id).unwrap();
+
+        let CommentLocation::Line {
+            path: found_path,
+            line,
+            side,
+            index,
+        } = location
+        else {
+            panic!("expected line-level comment location");
+        };
+        assert_eq!(found_path, path);
+        assert_eq!(line, 42);
+        assert_eq!(side, LineSide::Old);
+        assert_eq!(index, 0);
+    }
+
+    #[test]
+    fn should_return_none_for_unknown_comment_id() {
+        let mut session = test_session();
+        session.review_comments.push(Comment::new(
+            "note".to_string(),
+            CommentType::from_id("note"),
+            None,
+        ));
+
+        assert!(session.find_comment_by_id("no-such-id").is_none());
+    }
+
+    #[test]
+    fn should_count_review_level_and_file_and_line_comments() {
+        let mut session = test_session();
+        assert_eq!(session.comment_count(), 0);
+
+        session.review_comments.push(Comment::new(
+            "note".to_string(),
+            CommentType::from_id("note"),
+            None,
+        ));
+
+        let path = PathBuf::from("src/main.rs");
+        session.add_file(path.clone(), FileStatus::Modified, SOME_HASH);
+        let file = session.get_file_mut(&path).unwrap();
+        file.add_file_comment(Comment::new(
+            "comment".to_string(),
+            CommentType::from_id("note"),
+            None,
+        ));
+        file.add_line_comment(
+            10,
+            Comment::new("line".to_string(), CommentType::from_id("note"), None),
+        );
+
+        assert_eq!(session.comment_count(), 3);
     }
 
     #[test]

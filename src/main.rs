@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -11,24 +11,49 @@ use crossterm::{
 
 use tuicr::app::{self, App, AppStartupOptions, FocusedPanel, InputMode};
 use tuicr::cli::parse_cli_args;
-use tuicr::editor::{EditorError, EditorTarget};
+use tuicr::config::IgnoreWhitespaceConfig;
+use tuicr::editor::{EditorCommand, EditorError, EditorLaunch, EditorSurface, EditorTarget};
 use tuicr::handler::{
     handle_command_action, handle_comment_action, handle_comment_navigator_action,
     handle_commit_select_action, handle_commit_selector_action, handle_confirm_action,
     handle_diff_action, handle_file_list_action, handle_help_action, handle_mouse_event,
     handle_search_action, handle_submit_action_picker_action, handle_submit_confirm_action,
-    handle_submit_resolver_action, handle_visual_action,
+    handle_submit_resolver_action, handle_summary_action, handle_theme_picker_action,
+    handle_visual_action,
 };
-use tuicr::input::{Action, map_key_to_action, map_target_filter_mode};
+use tuicr::input::{
+    Action, map_file_tree_mode_with_q_quits, map_file_tree_prompt_mode,
+    map_key_to_action_with_q_quits, map_target_filter_mode, map_theme_picker_filter_mode,
+};
 use tuicr::terminal_state::{TerminalFeatures, TerminalSession};
 use tuicr::theme::resolve_theme_with_config;
-use tuicr::vcs::{DiffWhitespaceMode, GitBackendPreference};
+use tuicr::vcs::{DiffWhitespaceMode, GitBackendPreference, WhitespaceAutoPolicy};
 use tuicr::{config, handler, profile, ui, update};
 
 /// Timeout for the "press Ctrl+C again to exit" feature
 const CTRL_C_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Hide the file list by default on narrow terminals.
 const MIN_WIDTH_FOR_FILE_LIST: u16 = 100;
+
+/// Upper bound on events consumed between two repaints. High enough that a whole
+/// trackpad gesture collapses into one frame, low enough that held-key
+/// auto-repeat still shows progress instead of sitting on a stale frame.
+const EVENT_DRAIN_LIMIT: usize = 32;
+
+/// How long the loop may wait for the next event after already consuming
+/// `drained` of them: the first blocks so an idle TUI costs nothing, later ones
+/// are only taken if already queued. `None` ends the burst.
+fn event_drain_timeout(drained: usize) -> Option<Duration> {
+    match drained {
+        0 => Some(Duration::from_millis(50)),
+        n if n < EVENT_DRAIN_LIMIT => Some(Duration::ZERO),
+        _ => None,
+    }
+}
+
+fn should_probe_keyboard_enhancement(output_to_stdout: bool, stdin_is_terminal: bool) -> bool {
+    !output_to_stdout && stdin_is_terminal
+}
 
 fn main() -> anyhow::Result<()> {
     profile::init_from_env();
@@ -59,10 +84,13 @@ fn main() -> anyhow::Result<()> {
     // Check keyboard enhancement support before enabling raw mode.
     // Skip when --stdout is used because the probe writes escape sequences to stdout,
     // which would leak into the captured export output.
-    let keyboard_enhancement_supported = if cli_args.output_to_stdout {
-        false
-    } else {
+    let keyboard_enhancement_supported = if should_probe_keyboard_enhancement(
+        cli_args.output_to_stdout,
+        io::stdin().is_terminal(),
+    ) {
         matches!(supports_keyboard_enhancement(), Ok(true))
+    } else {
+        false
     };
 
     // --path implies --working-tree unless -r is explicitly provided
@@ -141,15 +169,29 @@ fn main() -> anyhow::Result<()> {
             .as_ref()
             .and_then(|cfg| cfg.backend.as_deref()),
     );
-    let diff_whitespace_mode = if config_outcome
-        .config
-        .as_ref()
-        .and_then(|cfg| cfg.ignore_whitespace)
-        .unwrap_or(false)
-    {
-        DiffWhitespaceMode::IgnoreAll
-    } else {
-        DiffWhitespaceMode::Normal
+    let diff_whitespace_mode = match config_outcome.config.as_ref() {
+        Some(cfg) => match cfg.ignore_whitespace {
+            Some(IgnoreWhitespaceConfig::Auto) => DiffWhitespaceMode::Auto(
+                WhitespaceAutoPolicy::with_overrides(cfg.ignore_whitespace_overrides.clone()),
+            ),
+            Some(IgnoreWhitespaceConfig::Bool(true)) => DiffWhitespaceMode::IgnoreAll,
+            Some(IgnoreWhitespaceConfig::Bool(false)) | None => DiffWhitespaceMode::Normal,
+        },
+        None => DiffWhitespaceMode::Normal,
+    };
+
+    let repo_url_override = match cli_args.remote.as_deref() {
+        Some(name) => {
+            let vcs = tuicr::vcs::GitBackend::discover(
+                git_backend_preference,
+                diff_whitespace_mode.clone(),
+            )?;
+            Some(tuicr::forge::resolve_remote_repository(&vcs, name)?)
+        }
+        None => cli_args
+            .repo_url
+            .as_deref()
+            .and_then(tuicr::forge::parse_any_remote_url),
     };
 
     let commit_order = match config_outcome
@@ -168,6 +210,15 @@ fn main() -> anyhow::Result<()> {
         Some("oldest") => app::CommitSelectionStart::Oldest,
         _ => app::CommitSelectionStart::All,
     };
+    let pr_comments_visibility = match config_outcome
+        .config
+        .as_ref()
+        .and_then(|cfg| cfg.pr_comments_visibility.as_deref())
+    {
+        Some("all") => Some(tuicr::forge::remote_comments::PrCommentsVisibility::All),
+        Some("hide") => Some(tuicr::forge::remote_comments::PrCommentsVisibility::Hide),
+        _ => None,
+    };
 
     let mut app = match profile::time("startup.app_init", || {
         App::new(
@@ -183,15 +234,23 @@ fn main() -> anyhow::Result<()> {
                 path_filter: cli_args.path_filter.as_deref(),
                 file_path: cli_args.file_path.as_deref(),
                 all_files: cli_args.all_files,
+                show_pr_checks: config_outcome
+                    .config
+                    .as_ref()
+                    .and_then(|cfg| cfg.show_pr_checks)
+                    .unwrap_or(false),
+                show_pr_comments: config_outcome
+                    .config
+                    .as_ref()
+                    .and_then(|cfg| cfg.show_pr_comments)
+                    .unwrap_or(true),
+                pr_comments_visibility,
                 git_backend_preference,
                 diff_whitespace_mode,
                 commit_selection,
                 pr_target: cli_args.pr_target.as_deref(),
                 pr_target_kind: cli_args.pr_target_kind,
-                repo_url_override: cli_args
-                    .repo_url
-                    .as_deref()
-                    .and_then(tuicr::forge::github::gh::parse_github_remote_url),
+                repo_url_override,
             },
         )
     }) {
@@ -206,6 +265,8 @@ fn main() -> anyhow::Result<()> {
                     app.leader_key = leader;
                 }
                 app.comment_vim_enabled = cfg.comment_vim.unwrap_or(false);
+                app.q_quits = cfg.q_quits.unwrap_or(false);
+                app.editor_override = cfg.editor.clone();
                 if let Some(w) = cfg.comment_tab_width {
                     app.comment_tab_width = w;
                 }
@@ -246,6 +307,7 @@ fn main() -> anyhow::Result<()> {
     // re-selections during the session (target selector, PR reload) honor it.
     app.commit_order = commit_order;
     app.commit_selection_start = commit_selection;
+    app.pending_start_line = cli_args.start_line;
 
     if let Err(e) = app.ensure_ephemeral_session_file() {
         startup_warnings.push(format!("Failed to initialize review session file: {e}"));
@@ -277,6 +339,10 @@ fn main() -> anyhow::Result<()> {
 
     // Apply config-driven defaults
     if let Some(ref cfg) = config_outcome.config {
+        app.show_pr_checks = cfg.show_pr_checks.unwrap_or(false);
+        app.show_pr_comments = cfg.show_pr_comments.unwrap_or(true);
+        app.initial_comments_visibility = pr_comments_visibility;
+        app.set_compact_folders(cfg.compact_folders.unwrap_or(false));
         if cfg.show_file_list == Some(false) {
             app.show_file_list = false;
             app.focused_panel = FocusedPanel::Diff;
@@ -289,6 +355,12 @@ fn main() -> anyhow::Result<()> {
                 app.focused_panel = FocusedPanel::Diff;
             }
         }
+        // Start with files already marked reviewed hidden. `init_` rather than
+        // `set_` so startup leaves no status message behind; `H` /
+        // `:set reviewed!` toggle from here.
+        if cfg.show_reviewed == Some(false) {
+            app.init_show_reviewed(false);
+        }
         // Pristine mode has no diff, so side-by-side would render two
         // identical panes. Honor the config for every other mode.
         if cfg.diff_view.as_deref() == Some("side-by-side") && !app.is_pristine_mode {
@@ -296,6 +368,9 @@ fn main() -> anyhow::Result<()> {
         }
         if let Some(wrap) = cfg.wrap {
             app.diff_state.wrap_lines = wrap;
+        }
+        if cfg.wrap_style.as_deref() == Some("gutter") {
+            app.wrap_style = app::WrapStyle::Gutter;
         }
         app.relative_line_numbers = cfg.relative_line_numbers.unwrap_or(false);
         // Open in single-file view when the user opts in. Pristine
@@ -308,11 +383,17 @@ fn main() -> anyhow::Result<()> {
         if cfg.cursor_line == Some(false) {
             app.cursor_line_highlight = false;
         }
+        if cfg.search_highlight == Some(false) {
+            app.search_highlight_enabled = false;
+        }
         if let Some(scroll_offset) = cfg.scroll_offset {
             app.scroll_offset = scroll_offset;
         }
         if let Some(interval_ms) = cfg.review_watch_interval_ms {
             app.set_review_watch_interval_ms(interval_ms as u64);
+        }
+        if let Some(interval_ms) = cfg.diff_watch_interval_ms {
+            app.set_diff_watch_interval_ms(interval_ms as u64);
         }
     }
 
@@ -377,7 +458,9 @@ fn main() -> anyhow::Result<()> {
         app.poll_pr_threads_events();
         app.poll_pr_resolve_events();
         app.poll_pr_submit_events();
+        needs_redraw |= app.poll_editor_launches();
         needs_redraw |= app.poll_persisted_session_changes();
+        needs_redraw |= app.poll_diff_watch_changes();
         needs_redraw |= pr_pending;
 
         if needs_redraw {
@@ -390,12 +473,28 @@ fn main() -> anyhow::Result<()> {
             terminal.draw(|frame| {
                 ui::render(frame, &mut app);
             })?;
+            // `--line` needs the viewport measured by the render above. When
+            // it moves the cursor, repaint inside the same synchronized
+            // update so the unpositioned frame is never presented.
+            if app.apply_pending_start_line() {
+                terminal.draw(|frame| {
+                    ui::render(frame, &mut app);
+                })?;
+            }
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             needs_redraw = false;
         }
 
-        // Handle events
-        if event::poll(Duration::from_millis(100))? {
+        // Handle events. Every already-queued event is consumed before the next
+        // repaint: a trackpad gesture or held key delivers events faster than a
+        // terminal presents frames, and the intermediate frames are never seen.
+        // `drained` caps a burst so continuous input still repaints.
+        let mut drained = 0;
+        while !app.should_quit
+            && let Some(timeout) = event_drain_timeout(drained)
+            && event::poll(timeout)?
+        {
+            drained += 1;
             // Set before reading so the many `continue` paths below (leader
             // keys, zz/ZZ, dd, {count}G, …) still schedule a redraw on the
             // next iteration even though they short-circuit past the match.
@@ -506,13 +605,26 @@ fn main() -> anyhow::Result<()> {
                     if pending_d {
                         pending_d = false;
                         if key.code == crossterm::event::KeyCode::Char('d') {
-                            if app.cursor_on_locked_comment() {
-                                app.set_message(
-                                    "Comment already pushed to GitHub — read only in tuicr",
+                            // In the target selector `dd` deletes the saved
+                            // review under the cursor, not a comment.
+                            if app.input_mode == InputMode::CommitSelect {
+                                handler::handle_commit_select_action(
+                                    &mut app,
+                                    Action::SessionsTabDelete,
                                 );
+                                continue;
+                            }
+                            if app.cursor_on_locked_comment() {
+                                let forge = app.forge_display_name();
+                                app.set_message(format!(
+                                    "Comment already pushed to {forge} — read only in tuicr"
+                                ));
                             } else if !app.delete_comment_at_cursor() {
                                 if app.cursor_on_remote_thread() {
-                                    app.set_message("GitHub comment — read only in tuicr");
+                                    let forge = app.forge_display_name();
+                                    app.set_message(format!(
+                                        "{forge} comment — read only in tuicr"
+                                    ));
                                 } else {
                                     app.set_message("No comment at cursor");
                                 }
@@ -531,13 +643,11 @@ fn main() -> anyhow::Result<()> {
                                 continue;
                             }
                             crossterm::event::KeyCode::Char('h') => {
-                                if app.show_file_list {
-                                    app.focused_panel = app::FocusedPanel::FileList;
-                                }
+                                app.focus_pane_left();
                                 continue;
                             }
                             crossterm::event::KeyCode::Char('l') => {
-                                app.focused_panel = app::FocusedPanel::Diff;
+                                app.focus_pane_right();
                                 continue;
                             }
                             crossterm::event::KeyCode::Char('k') => {
@@ -571,6 +681,10 @@ fn main() -> anyhow::Result<()> {
                                 app.toggle_single_file_view();
                                 continue;
                             }
+                            crossterm::event::KeyCode::Char('n') => {
+                                app.relative_line_numbers = !app.relative_line_numbers;
+                                continue;
+                            }
                             _ => {}
                         }
                         // Otherwise fall through to normal handling
@@ -589,12 +703,35 @@ fn main() -> anyhow::Result<()> {
                     // route through the filter-specific key map so typed
                     // characters update the filter buffer rather than driving
                     // commit-list navigation.
-                    let mut action =
-                        if app.input_mode == InputMode::CommitSelect && app.pr_filter_editing() {
-                            map_target_filter_mode(key)
-                        } else {
-                            map_key_to_action(key, app.input_mode, app.leader_key)
-                        };
+                    let mut action = if app.input_mode == InputMode::CommitSelect
+                        && app.pr_filter_editing()
+                    {
+                        map_target_filter_mode(key)
+                    } else if app.input_mode == InputMode::Normal && app.file_tree_prompt_editing()
+                    {
+                        // An open file-tree prompt (`i`/`e`/`/`) captures all
+                        // input until Enter/Esc, like the PR filter above.
+                        map_file_tree_prompt_mode(key)
+                    } else if app.input_mode == InputMode::ThemePicker
+                        && app.theme_picker_filtering()
+                    {
+                        // The theme picker's `/` filter draft captures all
+                        // input until Enter/Esc, same shape as the two above.
+                        map_theme_picker_filter_mode(key)
+                    } else if app.input_mode == InputMode::Normal
+                        && app.focused_panel == FocusedPanel::FileList
+                    {
+                        // The tree claims i/e/I/E and `/` for filtering; the
+                        // diff keeps its own meanings for those keys.
+                        map_file_tree_mode_with_q_quits(key, app.leader_key, app.q_quits)
+                    } else {
+                        map_key_to_action_with_q_quits(
+                            key,
+                            app.input_mode,
+                            app.leader_key,
+                            app.q_quits,
+                        )
+                    };
 
                     // Handle pending command setters (these work in any mode)
                     match action {
@@ -675,8 +812,24 @@ fn main() -> anyhow::Result<()> {
 
                     dispatch_action(&mut app, action);
                     if let Some(target) = app.take_pending_editor_target() {
-                        match run_editor_from_tui(&mut terminal, &target) {
-                            Ok(Ok(())) => {
+                        match run_editor_from_tui(
+                            &mut terminal,
+                            &target,
+                            app.editor_override.as_deref(),
+                            app.output_to_stdout,
+                        ) {
+                            // The editor is still open, so there is nothing to
+                            // pick up yet; the user reloads once they are done.
+                            Ok(Ok(EditorOutcome::Detached(launch))) => {
+                                app.track_editor_launch(launch);
+                                let hint = if app.diff_source.includes_worktree_changes() {
+                                    " (:e to reload)"
+                                } else {
+                                    ""
+                                };
+                                app.set_message(format!("Opened {}{hint}", target.label));
+                            }
+                            Ok(Ok(EditorOutcome::Finished)) => {
                                 if app.diff_source.includes_worktree_changes() {
                                     match app.reload_diff_files() {
                                         Ok((count, invalidated)) => {
@@ -687,7 +840,7 @@ fn main() -> anyhow::Result<()> {
                                             };
                                             app.set_message(format!(
                                                 "Opened {} and reloaded {count} files{invalidated_suffix}",
-                                                target.path.display()
+                                                target.label
                                             ));
                                         }
                                         Err(err) => {
@@ -697,7 +850,7 @@ fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                 } else {
-                                    app.set_message(format!("Opened {}", target.path.display()));
+                                    app.set_message(format!("Opened {}", target.label));
                                 }
                             }
                             Ok(Err(err)) => app.set_error(err.to_string()),
@@ -744,6 +897,15 @@ fn main() -> anyhow::Result<()> {
         eprintln!("Warning: failed to clear active review session marker: {e}");
     }
 
+    // Always report how the review ended, even with zero comments, so a
+    // human or agent watching the pane can tell "reviewed everything, had
+    // nothing to flag" apart from "quit without looking".
+    let reviewed = app.session.reviewed_count();
+    let total = app.session.files.len();
+    let comments = app.session.comment_count();
+    let comment_word = if comments == 1 { "comment" } else { "comments" };
+    eprintln!("tuicr-summary: reviewed {reviewed}/{total} files, {comments} {comment_word} added");
+
     // Print pending stdout output if --stdout was used
     if let Some(output) = app.pending_stdout_output {
         print!("{output}");
@@ -754,7 +916,8 @@ fn main() -> anyhow::Result<()> {
 
 fn dispatch_action(app: &mut App, action: Action) {
     match app.input_mode {
-        InputMode::Help => handle_help_action(app, action),
+        InputMode::Help | InputMode::MessageDetails => handle_help_action(app, action),
+        InputMode::Summary => handle_summary_action(app, action),
         InputMode::Command => handle_command_action(app, action),
         InputMode::Search => handle_search_action(app, action),
         InputMode::Comment => handle_comment_action(app, action),
@@ -764,6 +927,7 @@ fn dispatch_action(app: &mut App, action: Action) {
         InputMode::SubmitResolver => handle_submit_resolver_action(app, action),
         InputMode::SubmitConfirm => handle_submit_confirm_action(app, action),
         InputMode::SubmitActionPicker => handle_submit_action_picker_action(app, action),
+        InputMode::ThemePicker => handle_theme_picker_action(app, action),
         InputMode::Normal => match app.focused_panel {
             FocusedPanel::FileList => handle_file_list_action(app, action),
             FocusedPanel::Comments => handle_comment_navigator_action(app, action),
@@ -850,12 +1014,69 @@ fn handle_comment_vim_key(app: &mut App, key: crossterm::event::KeyEvent) -> boo
     true
 }
 
+/// How the editor handoff ended, so the caller knows whether the file could
+/// already have been edited.
+enum EditorOutcome {
+    /// A terminal editor ran to completion.
+    Finished,
+    /// A windowed editor was launched and is still open.
+    Detached(EditorLaunch),
+}
+
 fn run_editor_from_tui<W: Write>(
     terminal: &mut TerminalSession<W>,
     target: &EditorTarget,
-) -> anyhow::Result<Result<(), EditorError>> {
+    editor_override: Option<&str>,
+    output_to_stdout: bool,
+) -> anyhow::Result<Result<EditorOutcome, EditorError>> {
+    let command = EditorCommand::from_env(editor_override, target);
+    // Windowed editors never draw on our terminal, so suspending would only
+    // blank the TUI for as long as the editor takes to come up.
+    if command.surface() == EditorSurface::Gui {
+        return Ok(tuicr::editor::launch_editor(&command).map(EditorOutcome::Detached));
+    }
     let suspension = terminal.suspend()?;
-    let editor_result = tuicr::editor::run_editor(target);
+    // When tuicr was launched with `--stdout`, its own stdout is a file or
+    // pipe. A terminal editor spawned via `.status()` would inherit that
+    // non-TTY stdout and refuse to render (e.g. `vim: Output is not to a
+    // terminal`). Re-attach the editor's stdio to `/dev/tty` — the same
+    // device tuicr already renders the TUI on in this mode.
+    let editor_result = if output_to_stdout {
+        tuicr::editor::run_editor_on_tty(&command)
+    } else {
+        tuicr::editor::run_editor(&command)
+    };
     suspension.resume()?;
-    Ok(editor_result)
+    Ok(editor_result.map(|()| EditorOutcome::Finished))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_blocks_once_then_takes_only_queued_events() {
+        assert_eq!(
+            event_drain_timeout(0),
+            Some(Duration::from_millis(50)),
+            "the first poll must block, or an idle TUI spins"
+        );
+        assert_eq!(event_drain_timeout(1), Some(Duration::ZERO));
+        assert_eq!(
+            event_drain_timeout(EVENT_DRAIN_LIMIT - 1),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            event_drain_timeout(EVENT_DRAIN_LIMIT),
+            None,
+            "a capped burst must repaint instead of draining forever"
+        );
+    }
+
+    #[test]
+    fn keyboard_enhancement_probe_requires_interactive_stdin() {
+        assert!(should_probe_keyboard_enhancement(false, true));
+        assert!(!should_probe_keyboard_enhancement(false, false));
+        assert!(!should_probe_keyboard_enhancement(true, true));
+    }
 }

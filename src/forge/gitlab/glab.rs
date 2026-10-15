@@ -6,23 +6,25 @@ use chrono::{DateTime, Utc};
 use sha1::{Digest, Sha1};
 
 use crate::error::{Result, TuicrError};
+use crate::forge::local_git::read_blob;
 use crate::forge::remote_comments::RemoteReviewThread;
 use crate::forge::traits::{
     ForgeBackend, ForgeFileLinesRequest, ForgeRepository, GhCreateReviewResponse,
     PagedPullRequests, PullRequestCommit, PullRequestDetails, PullRequestListQuery,
     PullRequestListScope, PullRequestReviewMetadata, PullRequestReviewRecord, PullRequestTarget,
 };
-use crate::model::DiffLine;
+use crate::model::{DiffLine, FilePatch, LineOrigin};
 use crate::process::{
     CommandOutputError, CommandOutputErrorKind, run_command_output, run_command_output_with_stdin,
 };
+use crate::vcs::git::raw::run_git_diff;
 use crate::vcs::slice_context_lines;
 
 use super::models::{
-    GlabApprovalState, GlabCommit, GlabDiscussion, GlabMrDetails, GlabMrSummary, GlabMrVersion,
-    GlabUser,
+    GlabApprovalState, GlabCommit, GlabDiff, GlabDiscussion, GlabMrDetails, GlabMrSummary,
+    GlabMrVersion, GlabUser,
 };
-use crate::forge::submit::{GhSide, SubmitEvent};
+use crate::forge::submit::{DiffAnchor, GhSide, SubmitEvent};
 use crate::forge::traits::CreateReviewRequest;
 
 const DEFAULT_GITLAB_HOST: &str = "gitlab.com";
@@ -81,30 +83,8 @@ impl From<CommandOutputError> for GlabCommandError {
     }
 }
 
-/// Read a git blob from a checkout at `repo_root` using `git show <sha>:<path>`.
-/// Returns `None` if the object is missing or the command fails for any reason.
-fn read_blob_with_repo(repo_root: &Path, sha: &str, path: &Path) -> Option<String> {
-    let spec = format!("{}:{}", sha, path.to_string_lossy());
-    let exists = run_command_output(
-        "git",
-        Some(repo_root),
-        ["cat-file", "-e", spec.as_str()]
-            .iter()
-            .map(|s| OsStr::new(*s)),
-    );
-    if exists.is_err() {
-        return None;
-    }
-    run_command_output(
-        "git",
-        Some(repo_root),
-        ["show", spec.as_str()].iter().map(|s| OsStr::new(*s)),
-    )
-    .ok()
-}
-
 /// Return `Some(diff)` when both SHAs exist locally, via `git diff <start>..<end>`.
-fn local_range_diff(repo_root: &Path, start_sha: &str, end_sha: &str) -> Option<String> {
+fn local_range_diff(repo_root: &Path, start_sha: &str, end_sha: &str) -> Option<Vec<FilePatch>> {
     for sha in [start_sha, end_sha] {
         let exists = run_command_output(
             "git",
@@ -116,12 +96,7 @@ fn local_range_diff(repo_root: &Path, start_sha: &str, end_sha: &str) -> Option<
         }
     }
     let range = format!("{start_sha}..{end_sha}");
-    run_command_output(
-        "git",
-        Some(repo_root),
-        ["diff", range.as_str()].iter().map(|s| OsStr::new(*s)),
-    )
-    .ok()
+    run_git_diff(repo_root, &[range.as_str()]).ok()
 }
 
 /// Percent-encode `owner/repo` as `owner%2Frepo` for GitLab project API paths.
@@ -382,31 +357,32 @@ where
 
     fn get_pull_request(&self, target: PullRequestTarget) -> Result<PullRequestDetails> {
         let repository = self.resolve_repository(&target)?;
-        let args = vec![
-            "mr".to_string(),
-            "view".to_string(),
-            target.number.to_string(),
-            "--repo".to_string(),
-            Self::repo_arg(&repository),
-            "--output".to_string(),
-            "json".to_string(),
-        ];
-        let output = self.run_glab(args, &repository.host)?;
+        let project = gl_project_path(&repository.owner, &repository.name);
+        let endpoint = format!("projects/{project}/merge_requests/{}", target.number);
+        let output = self.run_api(&repository, endpoint)?;
         let mr: GlabMrDetails = serde_json::from_str(&output)?;
         mr.into_details(&repository)
     }
 
-    fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<String> {
-        let args = vec![
-            "mr".to_string(),
-            "diff".to_string(),
-            pr.number.to_string(),
-            "--repo".to_string(),
-            Self::repo_arg(&pr.repository),
-            "--color=never".to_string(),
-        ];
-        let raw = self.run_glab(args, &pr.repository.host)?;
-        Ok(inject_git_diff_headers(&raw))
+    fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<Vec<FilePatch>> {
+        let project = gl_project_path(&pr.repository.owner, &pr.repository.name);
+        let mut patches = Vec::new();
+        for page in 1..=100 {
+            let endpoint = format!(
+                "projects/{project}/merge_requests/{}/diffs?per_page=100&page={page}",
+                pr.number
+            );
+            let output = self.run_api(&pr.repository, endpoint)?;
+            let rows: Vec<GlabDiff> = serde_json::from_str(&output)?;
+            let received = rows.len();
+            patches.extend(rows.into_iter().map(GlabDiff::into_file_patch));
+            if received < 100 {
+                return Ok(patches);
+            }
+        }
+        Err(TuicrError::Forge(
+            "GitLab merge request diff exceeded 10000 files".into(),
+        ))
     }
 
     fn local_checkout_path(&self) -> Option<PathBuf> {
@@ -432,6 +408,9 @@ where
                 break;
             }
         }
+        // GitLab lists MR commits newest-first; the trait contract is
+        // oldest-first.
+        commits.reverse();
         Ok(commits)
     }
 
@@ -459,7 +438,7 @@ where
         _pr: &PullRequestDetails,
         start_sha: &str,
         end_sha: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<FilePatch>> {
         if let Some(root) = self.local_checkout.as_deref()
             && let Some(diff) = local_range_diff(root, start_sha, end_sha)
         {
@@ -520,35 +499,26 @@ where
         if request.start_line == 0 || request.start_line > request.end_line {
             return Ok(Vec::new());
         }
+        let (start_line, end_line) = (request.start_line, request.end_line);
+        let content = self.fetch_file_content(request)?;
+        Ok(slice_context_lines(&content, start_line, end_line))
+    }
 
-        let local_content = self
+    /// Local blob when the checkout has the PR's SHA, REST otherwise. The PR's
+    /// exact SHAs may or may not be present locally; we silently fall back.
+    fn fetch_file_content(&self, request: ForgeFileLinesRequest) -> Result<String> {
+        match self
             .local_checkout
             .as_deref()
-            .and_then(|root| read_blob_with_repo(root, request.sha(), request.path.as_path()));
-
-        let content = if let Some(content) = local_content {
-            content
-        } else {
-            self.fetch_file_via_api(&request)?
-        };
-
-        Ok(slice_context_lines(
-            &content,
-            request.start_line,
-            request.end_line,
-        ))
+            .and_then(|root| read_blob(root, request.sha(), request.path.as_path()))
+        {
+            Some(content) => Ok(content),
+            None => self.fetch_file_via_api(&request),
+        }
     }
 
     fn file_line_count(&self, request: ForgeFileLinesRequest) -> Result<u32> {
-        let local_content = self
-            .local_checkout
-            .as_deref()
-            .and_then(|root| read_blob_with_repo(root, request.sha(), request.path.as_path()));
-        let content = if let Some(content) = local_content {
-            content
-        } else {
-            self.fetch_file_via_api(&request)?
-        };
+        let content = self.fetch_file_content(request)?;
         Ok(content.lines().count() as u32)
     }
 
@@ -649,14 +619,13 @@ where
             }
             // Multi-line range comments need an explicit `line_range` so
             // GitLab anchors the discussion across the full selection
-            // instead of collapsing to the end line.
-            if let Some(start_line) = comment.start_line {
-                let start_side = comment.start_side.unwrap_or(comment.side);
-                let start_endpoint = gl_range_endpoint(&new_path, start_side, start_line);
-                let end_endpoint = gl_range_endpoint(&new_path, comment.side, comment.line);
+            // instead of collapsing to the end line. Without anchors the
+            // endpoints' line codes cannot be built, so fall back to a
+            // single-line comment on the end line rather than fail the submit.
+            if let Some(anchors) = comment.range_anchors {
                 position["line_range"] = serde_json::json!({
-                    "start": start_endpoint,
-                    "end": end_endpoint,
+                    "start": gl_range_endpoint(&new_path, anchors.start),
+                    "end": gl_range_endpoint(&new_path, anchors.end),
                 });
             }
             let body_json = if is_draft {
@@ -830,6 +799,16 @@ pub fn parse_pull_request_target_gitlab(input: &str) -> Result<PullRequestTarget
     malformed_target(input)
 }
 
+/// How far host recognition may go to decide a remote is GitLab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostLookup {
+    /// Consult `glab`'s configured host and `~/.ssh/config` when the hostname
+    /// alone is inconclusive.
+    WithConfig,
+    /// Recognize GitLab by hostname only — no subprocess, no file read.
+    HostnameOnly,
+}
+
 /// Parse a GitLab remote URL into a `ForgeRepository`.
 ///
 /// Handles SCP-like (`git@gitlab.com:owner/repo.git`), HTTPS
@@ -839,14 +818,37 @@ pub fn parse_pull_request_target_gitlab(input: &str) -> Result<PullRequestTarget
 /// configured as a GitLab host in `glab`'s config file (self-hosted
 /// instances such as `git.example.com`).
 pub fn parse_gitlab_remote_url(remote_url: &str) -> Option<ForgeRepository> {
+    parse_gitlab_remote(remote_url, HostLookup::WithConfig)
+}
+
+/// Like [`parse_gitlab_remote_url`], but recognizes GitLab by hostname alone:
+/// no `glab config get host` subprocess and no `~/.ssh/config` read.
+///
+/// For callers on hot paths — [`crate::slug::resolve_owner_repo`] runs on every
+/// session save — where a process spawn per call is not affordable. The cost is
+/// coverage: a self-hosted instance on a custom domain like `git.example.com`
+/// is not recognized, so it keeps falling back to the caller's generic parser.
+pub fn parse_gitlab_remote_url_by_hostname(remote_url: &str) -> Option<ForgeRepository> {
+    parse_gitlab_remote(remote_url, HostLookup::HostnameOnly)
+}
+
+fn parse_gitlab_remote(remote_url: &str, lookup: HostLookup) -> Option<ForgeRepository> {
     let trimmed = trim_url_suffix(remote_url.trim());
     if trimmed.is_empty() {
         return None;
     }
 
     if let Some((host, path)) = parse_scp_like_remote(trimmed) {
+        if is_gitlab_host(host, lookup) {
+            return gitlab_repository_from_path(host, path);
+        }
+        if lookup == HostLookup::HostnameOnly {
+            return None;
+        }
+        // The remote may name an `~/.ssh/config` alias rather than the real
+        // host, so fall back to what that alias resolves to.
         let resolved = resolve_ssh_hostname(host);
-        if !is_gitlab_host(&resolved) {
+        if !is_gitlab_host(&resolved, lookup) {
             return None;
         }
         return gitlab_repository_from_path(&resolved, path);
@@ -859,19 +861,23 @@ pub fn parse_gitlab_remote_url(remote_url: &str) -> Option<ForgeRepository> {
         .unwrap_or(without_scheme);
     let (host, path) = without_user.split_once('/')?;
     let host = strip_port(host);
-    if !is_gitlab_host(host) {
+    if !is_gitlab_host(host, lookup) {
         return None;
     }
     gitlab_repository_from_path(host, path)
 }
 
 /// Returns `true` when `host` looks like a GitLab instance: either its name
-/// contains "gitlab" (covers `gitlab.com` and most public deployments) or
-/// matches the default host `glab` is configured against (covers self-hosted
-/// instances with custom domains like `git.example.com`).
-fn is_gitlab_host(host: &str) -> bool {
+/// contains "gitlab" (covers `gitlab.com` and most public deployments) or —
+/// under [`HostLookup::WithConfig`] — matches the default host `glab` is
+/// configured against (covers self-hosted instances with custom domains like
+/// `git.example.com`).
+fn is_gitlab_host(host: &str, lookup: HostLookup) -> bool {
     if host.contains("gitlab") {
         return true;
+    }
+    if lookup == HostLookup::HostnameOnly {
+        return false;
     }
 
     glab_default_host().is_some_and(|known| known.eq_ignore_ascii_case(host))
@@ -1011,38 +1017,6 @@ fn strip_git_suffix(value: &str) -> &str {
     value.strip_suffix(".git").unwrap_or(value)
 }
 
-/// Convert a bare unified diff (as output by `glab mr diff`) into git-style
-/// by injecting `diff --git a/X b/X` headers before each `--- ` / `+++ ` pair.
-///
-/// `glab mr diff` emits plain unified diffs without git file headers, but the
-/// tuicr parser requires `diff --git ` to detect file boundaries.
-fn inject_git_diff_headers(diff: &str) -> String {
-    let mut result = String::with_capacity(diff.len() + diff.lines().count() * 64);
-    let mut lines = diff.lines().peekable();
-    while let Some(line) = lines.next() {
-        if let Some(old_raw) = line.strip_prefix("--- ") {
-            // Peek at the next line to get the new path for added files.
-            let new_raw = lines
-                .peek()
-                .and_then(|l| l.strip_prefix("+++ "))
-                .unwrap_or(old_raw);
-            // Determine the canonical path: prefer the non-/dev/null side.
-            let path = if old_raw == "/dev/null" {
-                new_raw
-            } else {
-                old_raw
-            };
-            // Strip a/ or b/ prefix if already present (shouldn't be for glab,
-            // but be defensive).
-            let path = path.trim_start_matches("a/").trim_start_matches("b/");
-            result.push_str(&format!("diff --git a/{path} b/{path}\n"));
-        }
-        result.push_str(line);
-        result.push('\n');
-    }
-    result
-}
-
 fn parse_scp_like_remote(remote_url: &str) -> Option<(&str, &str)> {
     if remote_url.contains("://") {
         return None;
@@ -1147,22 +1121,23 @@ fn gl_line_code(file_path: &str, old_line: u32, new_line: u32) -> String {
 
 /// Build one endpoint of a GitLab `line_range` position entry.
 ///
-/// GitLab expects each endpoint to carry the `type` ("new" / "old"), the
-/// integer line number on that side, and the `line_code` so the server can
-/// anchor the range without re-walking the diff.
-fn gl_range_endpoint(new_path: &str, side: GhSide, line: u32) -> serde_json::Value {
-    match side {
-        GhSide::Right => serde_json::json!({
-            "type": "new",
-            "new_line": line,
-            "line_code": gl_line_code(new_path, 0, line),
-        }),
-        GhSide::Left => serde_json::json!({
-            "type": "old",
-            "old_line": line,
-            "line_code": gl_line_code(new_path, line, 0),
-        }),
+/// The position schema allows an endpoint only `line_code` and `type`; adding
+/// the line number rejects the whole note with `position => ["must be a valid
+/// json schema"]`. `type` names the side a *changed* line belongs to and must
+/// be omitted for context lines, which belong to both.
+fn gl_range_endpoint(path: &str, anchor: DiffAnchor) -> serde_json::Value {
+    let mut endpoint = serde_json::json!({
+        "line_code": gl_line_code(path, anchor.old_line, anchor.new_line),
+    });
+    let line_type = match anchor.origin {
+        LineOrigin::Addition => Some("new"),
+        LineOrigin::Deletion => Some("old"),
+        LineOrigin::Context => None,
+    };
+    if let Some(line_type) = line_type {
+        endpoint["type"] = serde_json::Value::String(line_type.to_string());
     }
+    endpoint
 }
 
 /// Inspect a `glab api graphql` response for logical errors.
@@ -1265,7 +1240,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
-    use crate::forge::submit::{GhSide, InlineComment};
+    use crate::forge::submit::{DiffAnchor, GhSide, InlineComment, RangeAnchors};
     use crate::forge::traits::{
         CreateReviewRequest, ForgeRepository, PullRequestDetails, PullRequestListQuery,
         PullRequestListScope,
@@ -1341,6 +1316,66 @@ mod tests {
                 "--reviewer=@me",
             ]
         );
+    }
+
+    #[test]
+    fn get_pull_request_uses_version_compatible_api_endpoint() {
+        let repo = ForgeRepository::gitlab("gitlab.com", "owner", "repo");
+        let runner = RecordingRunner::new_with_responses(vec![
+            r#"{
+                "iid": 42,
+                "title": "Test MR",
+                "web_url": "https://gitlab.com/owner/repo/-/merge_requests/42",
+                "state": "opened",
+                "source_branch": "feature",
+                "target_branch": "main",
+                "diff_refs": {
+                    "base_sha": "basesha1",
+                    "head_sha": "headsha1",
+                    "start_sha": "startsha1"
+                }
+            }"#
+            .to_string(),
+        ]);
+        let backend = GitLabGlabBackend::with_runner(Some(repo), runner);
+
+        let details = backend
+            .get_pull_request(PullRequestTarget::number(42, "42"))
+            .unwrap();
+
+        assert_eq!(details.number, 42);
+        assert_eq!(details.head_sha, "headsha1");
+        let calls = backend.runner.calls.borrow();
+        assert_eq!(
+            calls[0].0,
+            vec!["api", "projects/owner%2Frepo/merge_requests/42"]
+        );
+        assert!(
+            !calls[0].0.iter().any(|arg| arg == "--output"),
+            "glab 1.36 does not support `mr view --output`"
+        );
+    }
+
+    #[test]
+    fn should_return_commits_oldest_first() {
+        // given — GitLab lists MR commits newest-first
+        let repo = ForgeRepository::gitlab("gitlab.com", "owner", "repo");
+        let pr = make_pr_details(repo.clone());
+        let runner = RecordingRunner::new_with_responses(vec![
+            r#"[
+              {"id":"64ad53963568726a9ed23fd96b6d73203176775d","short_id":"64ad5396","title":"fixup!","author_name":"Radek","committed_date":"2026-08-27T13:49:53Z"},
+              {"id":"e52022cd3bb22302b9775c7281ad27bddcf04f03","short_id":"e52022cd","title":"Edit README.md","author_name":"Radek","committed_date":"2026-08-27T13:48:53Z"}
+            ]"#
+                .to_string(),
+        ]);
+        let backend = GitLabGlabBackend::with_runner(Some(repo), runner);
+
+        // when
+        let commits = backend.list_pull_request_commits(&pr).unwrap();
+
+        // then — the trait contract is chronological
+        let summaries: Vec<&str> = commits.iter().map(|c| c.summary.as_str()).collect();
+        assert_eq!(summaries, vec!["Edit README.md", "fixup!"]);
     }
 
     #[test]
@@ -1463,6 +1498,37 @@ mod tests {
     }
 
     #[test]
+    fn should_fetch_structured_merge_request_diffs_instead_of_injecting_headers() {
+        let repo = ForgeRepository::gitlab("gitlab.com", "owner", "repo");
+        let pr = make_pr_details(repo.clone());
+        let runner = RecordingRunner::new_with_responses(vec![
+            r#"[{
+              "old_path":"日本語 b/and file.sql",
+              "new_path":"日本語 b/and file.sql",
+              "diff":"@@ -1,2 +1 @@\n--- count rows\n SELECT 1;\n"
+            }]"#
+            .to_string(),
+        ]);
+        let backend = GitLabGlabBackend::with_runner(Some(repo), runner);
+
+        let patches = backend.get_pull_request_diff(&pr).unwrap();
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            patches[0].new_path.as_deref(),
+            Some(Path::new("日本語 b/and file.sql"))
+        );
+        let calls = backend.runner.calls.borrow();
+        assert!(
+            calls[0]
+                .0
+                .iter()
+                .any(|arg| arg.contains("/merge_requests/42/diffs?"))
+        );
+        assert!(!calls[0].0.iter().any(|arg| arg == "mr"));
+    }
+
+    #[test]
     fn should_send_inline_comment_as_json_with_integer_line_number() {
         let repo = ForgeRepository::gitlab("gitlab.com", "owner", "repo");
         let pr = make_pr_details(repo.clone());
@@ -1473,6 +1539,7 @@ mod tests {
             counterpart_line: None,
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: None,
             file_level: false,
             body: "nice work".to_string(),
@@ -1535,6 +1602,7 @@ mod tests {
             counterpart_line: None,
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: None,
             file_level: false,
             body: "old code".to_string(),
@@ -1581,6 +1649,18 @@ mod tests {
             counterpart_line: None,
             start_line: Some(25),
             start_side: Some(GhSide::Right),
+            range_anchors: Some(RangeAnchors {
+                start: DiffAnchor {
+                    old_line: 20,
+                    new_line: 25,
+                    origin: LineOrigin::Addition,
+                },
+                end: DiffAnchor {
+                    old_line: 20,
+                    new_line: 30,
+                    origin: LineOrigin::Addition,
+                },
+            }),
             old_path: None,
             file_level: false,
             body: "range comment".to_string(),
@@ -1600,19 +1680,76 @@ mod tests {
         let (_, stdin) = &calls[0];
         let body: serde_json::Value = serde_json::from_str(stdin.as_ref().unwrap()).unwrap();
         let position = &body["position"];
-        assert_eq!(position["line_range"]["start"]["type"], "new");
+        // Endpoints carry the line code built from both counters plus `type`.
+        // A line number here makes GitLab reject the position outright.
         assert_eq!(
-            position["line_range"]["start"]["new_line"],
-            serde_json::Value::Number(25.into())
+            position["line_range"]["start"],
+            serde_json::json!({
+                "type": "new",
+                "line_code": super::gl_line_code("src/lib.rs", 20, 25),
+            })
         );
-        assert_eq!(position["line_range"]["end"]["type"], "new");
         assert_eq!(
-            position["line_range"]["end"]["new_line"],
-            serde_json::Value::Number(30.into())
+            position["line_range"]["end"],
+            serde_json::json!({
+                "type": "new",
+                "line_code": super::gl_line_code("src/lib.rs", 20, 30),
+            })
         );
-        // line_code is required by GitLab to anchor the endpoint.
-        assert!(position["line_range"]["start"]["line_code"].is_string());
-        assert!(position["line_range"]["end"]["line_code"].is_string());
+    }
+
+    #[test]
+    fn should_omit_endpoint_type_for_context_line_in_range() {
+        // A context line belongs to both sides, so declaring a `type` for it
+        // makes GitLab reject the position as an invalid schema.
+        let repo = ForgeRepository::gitlab("gitlab.com", "owner", "repo");
+        let pr = make_pr_details(repo.clone());
+        let inline = InlineComment {
+            path: "src/lib.rs".into(),
+            line: 84,
+            side: GhSide::Right,
+            counterpart_line: Some(70),
+            start_line: Some(78),
+            start_side: Some(GhSide::Right),
+            range_anchors: Some(RangeAnchors {
+                start: DiffAnchor {
+                    old_line: 64,
+                    new_line: 78,
+                    origin: LineOrigin::Addition,
+                },
+                end: DiffAnchor {
+                    old_line: 70,
+                    new_line: 84,
+                    origin: LineOrigin::Context,
+                },
+            }),
+            old_path: None,
+            file_level: false,
+            body: "range ending on context".to_string(),
+            comment_id: "c-range-ctx".to_string(),
+        };
+        let response = r#"{"id":"disc-range-ctx","individual_note":false}"#.to_string();
+        let runner = RecordingRunner::new_with_responses(vec![response]);
+        let backend = GitLabGlabBackend::with_runner(Some(repo), runner);
+        let request = CreateReviewRequest {
+            event: crate::forge::submit::SubmitEvent::Comment,
+            commit_id: "headsha1",
+            body: "",
+            comments: &[inline],
+        };
+        backend.create_review(&pr, request).unwrap();
+        let calls = backend.runner.calls.borrow();
+        let (_, stdin) = &calls[0];
+        let body: serde_json::Value = serde_json::from_str(stdin.as_ref().unwrap()).unwrap();
+        let position = &body["position"];
+        assert_eq!(
+            position["line_range"]["end"],
+            serde_json::json!({ "line_code": super::gl_line_code("src/lib.rs", 70, 84) }),
+            "context endpoints carry only a line code"
+        );
+        // A range ending on a context line must name both sides in the position.
+        assert_eq!(position["old_line"], serde_json::Value::Number(70.into()));
+        assert_eq!(position["new_line"], serde_json::Value::Number(84.into()));
     }
 
     #[test]
@@ -1629,6 +1766,7 @@ mod tests {
             counterpart_line: None,
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: Some("src/old_name.rs".into()),
             file_level: false,
             body: "renamed file comment".to_string(),
@@ -1666,6 +1804,7 @@ mod tests {
             counterpart_line: Some(18), // old_lineno for this context line
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: None,
             file_level: false,
             body: "context comment".to_string(),
@@ -1708,6 +1847,7 @@ mod tests {
             counterpart_line: None,
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: None,
             file_level: false,
             body: "looks good".to_string(),
@@ -1750,6 +1890,7 @@ mod tests {
             counterpart_line: None,
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: None,
             file_level: false,
             body: "please change this".to_string(),
@@ -1829,6 +1970,7 @@ mod tests {
             counterpart_line: None,
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: None,
             file_level: false,
             body: "please change this".to_string(),
@@ -1895,6 +2037,7 @@ mod tests {
             counterpart_line: Some(12),
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: None,
             file_level: false,
             body: "inline draft".to_string(),
@@ -1976,6 +2119,7 @@ mod tests {
             counterpart_line: None,
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: None,
             file_level: false,
             body: "inline draft".to_string(),
@@ -2018,6 +2162,7 @@ mod tests {
             counterpart_line: None,
             start_line: None,
             start_side: None,
+            range_anchors: None,
             old_path: None,
             file_level: false,
             body: "inline comment".to_string(),

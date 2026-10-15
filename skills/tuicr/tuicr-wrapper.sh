@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -e -u -o pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_tuicr-common.sh"
+
 # Configuration - override via environment variables
 TUICR_PANE_POSITION="${TUICR_PANE_POSITION:-top}"    # top or bottom
-TUICR_PANE_SIZE="${TUICR_PANE_SIZE:-80}"              # percentage of screen
+TUICR_PANE_SIZE="${TUICR_PANE_SIZE:-80}"              # percentage of the calling pane
 
 # Colors for output
 RED='\033[0;31m'
@@ -25,20 +27,22 @@ log_error() {
 
 usage() {
   cat << EOF
-Usage: $(basename "$0") [directory]
+Usage: $(basename "$0") [directory] [-- tuicr-args...]
 
 Launch tuicr in a tmux split pane to review changes.
 
 Arguments:
   directory    Git or jj repository directory to review (default: current directory)
+  tuicr-args   Extra arguments passed through to tuicr (e.g. -w, -r <revset>)
 
 Environment variables:
   TUICR_PANE_POSITION   Position of tuicr pane: top or bottom (default: top)
-  TUICR_PANE_SIZE       Size of pane as percentage (default: 80)
+  TUICR_PANE_SIZE       Size of pane as percentage of the calling pane (default: 80)
 
 Examples:
   $(basename "$0")                    # Review changes in current directory
   $(basename "$0") ~/project          # Review changes in ~/project
+  $(basename "$0") . -- -w            # Review uncommitted working-tree changes
   TUICR_PANE_SIZE=70 $(basename "$0") # Use 70% of screen
 EOF
 }
@@ -56,11 +60,6 @@ check_tuicr() {
     return 1
   fi
   return 0
-}
-
-check_tuicr_stdout_support() {
-  # Check if tuicr supports --stdout flag
-  tuicr --help 2>&1 | grep -q -- '--stdout'
 }
 
 check_repo() {
@@ -86,11 +85,22 @@ check_tuicr_running() {
 
 launch_tuicr_pane() {
   local target_dir="$1"
+  shift
+  local tuicr_args=("$@")
 
-  # Get window height and calculate lines (using -l instead of -p to avoid "size missing" error)
-  local window_height
-  window_height=$(tmux display-message -p '#{window_height}')
-  local pane_lines=$(( window_height * TUICR_PANE_SIZE / 100 ))
+  # Split the pane this wrapper runs in, not whichever pane is focused. Without
+  # an explicit target tmux uses the client's active pane — the one the human
+  # is looking at — so an agent's review lands in someone else's pane and
+  # blocks it. tmux sets $TMUX_PANE for every pane it spawns.
+  local caller_pane="${TMUX_PANE:-}"
+  if [[ -z "$caller_pane" ]]; then
+    caller_pane=$(tmux display-message -p '#{pane_id}')
+  fi
+
+  # Get the caller's height and calculate lines (using -l instead of -p to avoid "size missing" error)
+  local pane_height
+  pane_height=$(tmux display-message -p -t "$caller_pane" '#{pane_height}')
+  local pane_lines=$(( pane_height * TUICR_PANE_SIZE / 100 ))
 
   # Build the split-window command
   local split_args=()
@@ -107,7 +117,7 @@ launch_tuicr_pane() {
   # Change to target directory
   split_args+=(-c "$target_dir")
 
-  log_info "Launching tuicr in $TUICR_PANE_POSITION pane (${pane_lines} lines, ${TUICR_PANE_SIZE}%)"
+  log_info "Launching tuicr in $TUICR_PANE_POSITION pane of $caller_pane (${pane_lines} lines, ${TUICR_PANE_SIZE}%)"
   log_info "Directory: $target_dir"
 
   # Create unique channel for wait-for
@@ -115,12 +125,12 @@ launch_tuicr_pane() {
 
   # Check if --stdout is supported and set up output capture
   local output_file=""
-  local tuicr_cmd="tuicr"
+  local tuicr_cmd="tuicr$(tuicr_quote_args "${tuicr_args[@]+"${tuicr_args[@]}"}")"
   local use_stdout=false
 
-  if check_tuicr_stdout_support; then
+  if tuicr_stdout_supported; then
     output_file=$(mktemp /tmp/tuicr-output.XXXXXX)
-    tuicr_cmd="tuicr --stdout > '$output_file'"
+    tuicr_cmd="$tuicr_cmd --stdout > '$output_file'"
     use_stdout=true
     log_info "Using --stdout mode (output will be captured)"
   else
@@ -130,11 +140,18 @@ launch_tuicr_pane() {
   # Create the split pane with tuicr, signal when done
   # Use -d to not switch, -P to print pane info so we can capture the ID
   local new_pane_id
-  new_pane_id=$(tmux split-window -d -P -F '#{pane_id}' "${split_args[@]}" \
+  new_pane_id=$(tmux split-window -d -P -F '#{pane_id}' -t "$caller_pane" "${split_args[@]}" \
     "cd '$target_dir' && $tuicr_cmd; tmux wait-for -S '$wait_channel'")
 
-  # Switch focus to the new tuicr pane
-  tmux select-pane -t "$new_pane_id"
+  # Focus the new pane only when the caller already has focus in its window.
+  # If the human is working in another pane, leave them alone — they will
+  # come back to the agent's pane (e.g. via its notification) and find the
+  # review waiting next to it.
+  if [[ "$(tmux display-message -p -t "$caller_pane" '#{pane_active}')" == "1" ]]; then
+    tmux select-pane -t "$new_pane_id"
+  else
+    log_info "Caller pane is not focused; leaving focus where it is"
+  fi
 
   log_info "tuicr is running in pane $new_pane_id"
   log_info "Waiting for tuicr to exit..."
@@ -144,21 +161,7 @@ launch_tuicr_pane() {
 
   log_info "tuicr finished"
 
-  # Output captured instructions if --stdout was used
-  if [[ "$use_stdout" == true ]] && [[ -f "$output_file" ]]; then
-    if [[ -s "$output_file" ]]; then
-      echo ""
-      echo "=== TUICR INSTRUCTIONS ==="
-      cat "$output_file"
-      echo "=== END TUICR INSTRUCTIONS ==="
-    else
-      log_info "No instructions exported from tuicr"
-      log_info "If you exported to clipboard, paste the instructions here"
-    fi
-    rm -f "$output_file"
-  else
-    log_info "If you exported instructions, they are in your clipboard - paste them here"
-  fi
+  tuicr_report_stdout_output "$use_stdout" "$output_file"
 }
 
 main() {
@@ -173,8 +176,9 @@ main() {
     exit 1
   fi
 
-  # Determine target directory
-  local target_dir="${1:-.}"
+  # Determine target directory, then split off any pass-through tuicr args
+  tuicr_parse_args "$@"
+  local target_dir="$TUICR_TARGET_DIR"
   target_dir=$(cd "$target_dir" && pwd)  # Get absolute path
 
   # Verify it's a git or jj repo
@@ -204,7 +208,7 @@ main() {
   fi
 
   # Launch tuicr in a split pane
-  launch_tuicr_pane "$target_dir"
+  launch_tuicr_pane "$target_dir" "${TUICR_PASSTHROUGH_ARGS[@]+"${TUICR_PASSTHROUGH_ARGS[@]}"}"
 }
 
 main "$@"
